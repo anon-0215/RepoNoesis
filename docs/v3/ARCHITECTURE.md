@@ -33,16 +33,18 @@ Repository Ingestion
 
 ### 3. Tool Layer
 
-首批只读、类型化、带版本/超时/上限的工具：
+M2 已实现静态白名单 `ToolRegistry` 和四个只读、类型化、带版本/协作式超时/上限的工具：
 
-- `search_code_lexical@v1`
-- `search_code_semantic@v1`
-- `search_code_hybrid@v1`
-- `read_source_range@v1`
-- `lookup_symbol@v1`
-- `validate_evidence@v1`
+- `search_code@1`
+- `lookup_symbol@1`
+- `read_source@1`
+- `validate_evidence@1`
 
-M1 固定编排可调用同一服务；M2 才交给 Agent。工具不得执行仓库代码或接受仓库文本中的权限指令。
+`search_code` 包装 M1 hybrid/lexical 降级与 EvidenceBuilder；`lookup_symbol` 读取
+schema v4 `code_chunks` 定义；`read_source` 读取 SQLite `repo_files` 抓取快照；
+`validate_evidence` 复用 M1 CitationValidator。输入 schema 禁止额外字段，
+project/repository/revision 只从服务器上下文绑定。工具不得执行仓库代码、访问
+网络、修改目标仓库或接受仓库文本中的权限指令。
 
 ### 4. Retrieval and Evidence
 
@@ -50,16 +52,22 @@ M1 已实现以代码块为单元的 BM25；语义复用 `SemanticRetriever`；W
 
 ### 5. Agent Core
 
-M2 实现单 Agent 有限状态机：
+M2 已实现请求级单 Agent 有限状态机：
 
 ```text
 Goal -> Plan -> Tool Call -> Observation -> Complete
                      \-> bounded Replan --/
 ```
 
-设计默认值（M2 通过配置与测试再冻结）：最多 8 steps、12 tool calls、2 次 replan；单工具 10 秒、整次 60 秒；总 token 24,000；工具结果最多 200 项/1 MiB。任一预算、取消或超时即停止并返回 partial。规范化参数指纹防重复调用和循环。
+冻结默认值为最多 5 steps、8 tool calls、每步 1 call、同工具 3 calls、连续
+2 步无进展停止；单工具 15 秒、整次 60 秒；Planner 每步/总输出 512/2,048
+估算 token；observation 64 KiB；源码 200 行/32 KiB。任一预算、取消或超时即
+停止并复验已有 Evidence。规范化参数指纹防同参重复与 A→B→A 简单循环。
 
 不保存模型私有思维链，只保存简短决策摘要、工具行动、观察、预算变化和完成原因。
+同步工具采用协作式 timeout/cancellation，不宣称可抢占 Python 同步操作；不创建
+后台线程。正式 `/ask` 默认进入 Agent Core，无 LLM/Planner 失败时回 M1
+deterministic fallback。
 
 ### 6. Learning State
 
@@ -67,9 +75,15 @@ M4 新增版本化状态：repository/project/revision、学习目标、已读�
 
 ### 7. API、前端和可观测性
 
-**代码事实**：`main.py` 当前同步分析并编排 M1 `/ask`；`qa_agent.py` 使用验证 Evidence 回答，缺少显式 M1 依赖的旧内部调用才进入标记为 legacy 的兼容路径；`learning_agent.py` 仍是固定路线；React 仍是 V1 五标签页。
+**代码事实**：`main.py` 当前同步分析并编排 M2 bounded Agent `/ask`；
+`qa_agent.py` 的 `answer_from_evidence()` 是 M1/M2 共用的最终强制校验与回答边界；
+无 LLM 时 Agent Core 进入 M1 确定性降级。`learning_agent.py` 仍是固定路线；
+React 仍是 V1 五标签页。
 
-V3 中 `/ask` 保留旧请求并增加 evidence、校验与降级状态；`qa_agent.py` 演进为基于验证 Evidence 的回答器，旧规则作为明确降级；`learning_agent.py` 到 M4 才接入状态；`main.py` 保持薄路由。前端逐步展示路径、符号、行号、模型、失败、降级和截断。日志只记 ID、耗时、状态、计数和错误类别，不记密钥、完整 Prompt 或完整源码。
+`/ask` 保留旧请求和 M1/旧响应字段，M2 新增 agent schema/mode/status/trace/budget；
+`learning_agent.py` 到 M4 才接入状态；`main.py` 保持薄路由。前端逐步展示路径、
+符号、行号、模型、失败、降级和截断。日志只记 ID、耗时、状态、计数和错误类别，
+不记密钥、完整 Prompt 或完整源码。
 
 ## 数据契约
 

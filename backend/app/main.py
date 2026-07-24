@@ -7,16 +7,21 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-from app.config import get_embedding_settings, get_env_value, load_environment
+from app.config import (
+    get_agent_limits,
+    get_embedding_settings,
+    get_env_value,
+    load_environment,
+)
 from app.database import Database
 from app.services.analyzer import analyze_snapshot
+from app.services.agent_core import run_bounded_agent
 from app.services.code_chunker import extract_python_code_chunks_from_files
 from app.services.embedding_indexer import EmbeddingIndexer
 from app.services.embedding_service import EmbeddingService
 from app.services.github_client import fetch_repository
 from app.services.learning_agent import build_learning_path
 from app.services.llm_client import LLMClient
-from app.services.qa_agent import answer_question
 from app.services.report import generate_report
 
 
@@ -34,6 +39,7 @@ app.add_middleware(
 db = Database()
 llm = LLMClient()
 embedding_service = EmbeddingService(get_embedding_settings())
+agent_limits = get_agent_limits()
 
 
 class AnalyzeRequest(BaseModel):
@@ -92,6 +98,18 @@ class AskResponse(BaseModel):
     grounding_status: Literal["grounded", "insufficient_evidence", "degraded"]
     retrieval_mode: Literal["hybrid", "lexical", "legacy"]
     warnings: list[str]
+    agent_schema_version: Literal[1]
+    agent_mode: Literal["bounded", "deterministic_fallback"]
+    agent_status: Literal[
+        "completed",
+        "insufficient_evidence",
+        "degraded",
+        "budget_exhausted",
+        "cancelled",
+        "failed",
+    ]
+    agent_trace: list[dict[str, Any]]
+    budget_usage: dict[str, Any]
 
 
 @app.get("/api/health")
@@ -205,7 +223,7 @@ def get_learning_path(project_id: str) -> dict[str, Any]:
 @app.post("/api/projects/{project_id}/ask", response_model=AskResponse)
 def ask_project(project_id: str, request: AskRequest) -> dict[str, Any]:
     bundle = _bundle_or_404(project_id)
-    result = answer_question(
+    result = run_bounded_agent(
         request.question,
         bundle,
         llm,
@@ -215,6 +233,7 @@ def ask_project(project_id: str, request: AskRequest) -> dict[str, Any]:
         language=request.language,
         symbol=request.symbol,
         evidence_count=request.evidence_count,
+        limits=agent_limits,
     )
     db.save_chat_answer(project_id, request.question, result["answer"], result["citations"])
     return result

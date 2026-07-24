@@ -4,6 +4,8 @@ from dataclasses import dataclass
 import os
 from pathlib import Path
 
+from app.services.agent_contracts import AgentLimits
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 BACKEND_ROOT = Path(__file__).resolve().parents[1]
@@ -65,6 +67,49 @@ def get_embedding_settings() -> EmbeddingSettings:
     )
 
 
+def get_agent_limits() -> AgentLimits:
+    """Load bounded M2 limits; environment values may only stay in safe ranges."""
+    return AgentLimits(
+        max_agent_steps=_bounded_env_int("AGENT_MAX_STEPS", 5, 1, 8),
+        max_tool_calls=_bounded_env_int("AGENT_MAX_TOOL_CALLS", 8, 1, 12),
+        max_calls_per_step=1,
+        max_same_tool_calls=_bounded_env_int("AGENT_MAX_SAME_TOOL_CALLS", 3, 1, 3),
+        max_no_progress_steps=_bounded_env_int(
+            "AGENT_MAX_NO_PROGRESS_STEPS", 2, 1, 2
+        ),
+        total_deadline_ms=_bounded_env_int(
+            "AGENT_TOTAL_DEADLINE_MS", 60_000, 1_000, 60_000
+        ),
+        default_tool_timeout_ms=_bounded_env_int(
+            "AGENT_TOOL_TIMEOUT_MS", 15_000, 100, 15_000
+        ),
+        max_search_results=_bounded_env_int(
+            "AGENT_MAX_SEARCH_RESULTS", 20, 1, 20
+        ),
+        max_observation_bytes=_bounded_env_int(
+            "AGENT_MAX_OBSERVATION_BYTES", 65_536, 1_024, 65_536
+        ),
+        max_source_read_lines=_bounded_env_int(
+            "AGENT_MAX_SOURCE_READ_LINES", 200, 1, 200
+        ),
+        max_source_read_bytes=_bounded_env_int(
+            "AGENT_MAX_SOURCE_READ_BYTES", 32_768, 1_024, 32_768
+        ),
+        max_accumulated_evidence_context_bytes=_bounded_env_int(
+            "AGENT_MAX_EVIDENCE_CONTEXT_BYTES", 49_152, 1_024, 49_152
+        ),
+        max_planner_output_tokens_per_step=_bounded_env_int(
+            "AGENT_MAX_PLANNER_TOKENS_PER_STEP", 512, 64, 512
+        ),
+        max_total_planner_output_tokens=_bounded_env_int(
+            "AGENT_MAX_TOTAL_PLANNER_TOKENS", 2_048, 64, 2_048
+        ),
+        max_final_answer_tokens=_bounded_env_int(
+            "AGENT_MAX_FINAL_ANSWER_TOKENS", 1_600, 128, 1_600
+        ),
+    )
+
+
 def clamp_embedding_max_length(value: int) -> int:
     return min(EMBEDDING_MAX_LENGTH_MAX, max(EMBEDDING_MAX_LENGTH_MIN, int(value)))
 
@@ -89,6 +134,13 @@ def _env_int(key: str, default: int) -> int:
         return int(value)
     except ValueError:
         return default
+
+
+def _bounded_env_int(key: str, default: int, minimum: int, maximum: int) -> int:
+    value = _env_int(key, default)
+    if value < minimum or value > maximum:
+        return default
+    return value
 
 
 def _env_path(key: str, default: Path) -> Path:

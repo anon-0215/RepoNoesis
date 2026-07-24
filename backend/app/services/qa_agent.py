@@ -78,21 +78,64 @@ def answer_question(
         symbol=symbol,
     )
     built = EvidenceBuilder().build(outcome.results, project)
+    return answer_from_evidence(
+        question,
+        built,
+        llm,
+        database,
+        retrieval_mode=outcome.retrieval_mode,
+        warnings=outcome.warnings,
+    )
+
+
+def answer_from_evidence(
+    question: str,
+    evidence: list[Evidence],
+    llm: LLMClient | None,
+    database: Database,
+    *,
+    retrieval_mode: str,
+    warnings: list[str] | None = None,
+    max_answer_tokens: int | None = None,
+    answer_timeout_seconds: float | None = None,
+) -> dict[str, Any]:
+    """Generate an M1-compatible answer after server-controlled validation.
+
+    Agent observations are deliberately not trusted here. The supplied
+    request-scoped Evidence is validated before generation and once again
+    immediately before the response is built.
+    """
     validator = CitationValidator(database)
-    valid, validation_warnings = validator.validate_all(built)
-    warnings = [*outcome.warnings, *validation_warnings]
+    valid, validation_warnings = validator.validate_all(evidence)
+    warnings = [*(warnings or []), *validation_warnings]
     if not valid:
         return _m1_response(
             answer=INSUFFICIENT_ANSWER,
             evidence=[],
-            retrieval_mode=outcome.retrieval_mode,
+            retrieval_mode=retrieval_mode,
             warnings=warnings,
             grounding_status="insufficient_evidence",
         )
 
     answer: str | None = None
     if llm and llm.available:
-        candidate_answer = _answer_with_grounded_llm(question, valid, llm)
+        candidate_answer = _answer_with_grounded_llm(
+            question,
+            valid,
+            llm,
+            max_tokens=max_answer_tokens,
+            timeout_seconds=answer_timeout_seconds,
+        )
+        if (
+            candidate_answer
+            and max_answer_tokens is not None
+            and _estimated_tokens(candidate_answer) > max_answer_tokens
+        ):
+            candidate_answer = None
+            warnings.append(
+                "The generation model exceeded the final answer token budget; "
+                "used the deterministic grounded response."
+            )
         if candidate_answer and _has_only_valid_references(candidate_answer, valid):
             answer = candidate_answer
         else:
@@ -117,7 +160,7 @@ def answer_question(
         return _m1_response(
             answer=INSUFFICIENT_ANSWER,
             evidence=[],
-            retrieval_mode=outcome.retrieval_mode,
+            retrieval_mode=retrieval_mode,
             warnings=warnings,
             grounding_status="insufficient_evidence",
         )
@@ -125,12 +168,12 @@ def answer_question(
         answer = _deterministic_grounded_answer(valid, llm_available=bool(llm and llm.available))
 
     grounding_status = (
-        "grounded" if outcome.retrieval_mode == "hybrid" else "degraded"
+        "grounded" if retrieval_mode == "hybrid" else "degraded"
     )
     return _m1_response(
         answer=answer,
         evidence=valid,
-        retrieval_mode=outcome.retrieval_mode,
+        retrieval_mode=retrieval_mode,
         warnings=warnings,
         grounding_status=grounding_status,
     )
@@ -189,6 +232,9 @@ def _answer_with_grounded_llm(
     question: str,
     evidence: list[Evidence],
     llm: LLMClient,
+    *,
+    max_tokens: int | None = None,
+    timeout_seconds: float | None = None,
 ) -> str | None:
     source_text = "\n\n".join(
         (
@@ -199,6 +245,11 @@ def _answer_with_grounded_llm(
         )
         for item in evidence
     )
+    chat_arguments: dict[str, Any] = {"temperature": 0.1}
+    if max_tokens is not None:
+        chat_arguments["max_tokens"] = max_tokens
+    if timeout_seconds is not None:
+        chat_arguments["timeout_seconds"] = max(0.1, timeout_seconds)
     return llm.chat(
         [
             {
@@ -223,8 +274,12 @@ def _answer_with_grounded_llm(
                 ),
             },
         ],
-        temperature=0.1,
+        **chat_arguments,
     )
+
+
+def _estimated_tokens(value: str) -> int:
+    return max(1, (len(value) + 3) // 4)
 
 
 def _has_only_valid_references(answer: str, evidence: list[Evidence]) -> bool:

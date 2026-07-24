@@ -23,6 +23,13 @@
 
 ## M2：工具层与有限 Agent Core
 
+**完成状态（2026-07-24）**：已在 `v3-agent-development` 实现静态 Tool
+Registry、`search_code`/`lookup_symbol`/`read_source`/`validate_evidence`、
+结构化 Planner 决策、请求级有限循环、预算/重复/no-progress/协作式
+timeout/cancellation、防 Prompt Injection、最终强制引用校验和正式 `/ask`
+默认接入。schema 保持 v4；没有实现 M3 关系或多跳能力。详细冻结决策见
+`M2_DECISIONS.md`。
+
 **目标与 I/O**：输入用户目标与 M1 Evidence 服务；输出受预算限制的 Agent run、ToolCall、Observation、Step 和验证回答/partial。
 
 **允许修改**：tool registry、只读工具、Agent Core、预算/取消/日志、Pydantic 契约、必要 API/表及状态 UI。
@@ -33,7 +40,9 @@
 
 **量化验收**：100% 在硬上限内终止；重复同参逃逸率 0%；超时/取消 100% 明确状态；冻结任务完成率 >= 80%；引用有效率 100%。
 
-**兼容/回滚/出口**：M1 固定闭环保留；Agent 显式启用；新 trace 表不破坏旧读取；开关关闭即回 M1。预算与审计验收后进 M3。
+**兼容/回滚/出口**：M1 固定闭环保留为无 LLM/Planner 失败降级；正式 `/ask`
+默认经过 Agent Core；trace 仅为请求级 API 摘要，不新增数据库表；旧请求、旧
+citation 和 M1 Evidence 字段保持。完成并提交 M2 后停止，M3 必须另行开始。
 
 ## M3：关系扩展与多跳仓库分析
 
