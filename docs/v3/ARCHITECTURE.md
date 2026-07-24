@@ -29,7 +29,7 @@ Repository Ingestion
 - `database.py`：保留 schema v4 数据，未来显式版本迁移。
 - `embedding_service.py`：隐藏模型后端、设备、文本格式和身份。
 - `embedding_indexer.py`：继续按内容与配置身份增量缓存。
-- `semantic_retriever.py`：M1 通过统一检索层接入，不复制实现。
+- `semantic_retriever.py`：M1 已通过统一检索层接入，不复制实现。
 
 ### 3. Tool Layer
 
@@ -46,7 +46,7 @@ M1 固定编排可调用同一服务；M2 才交给 Agent。工具不得执行�
 
 ### 4. Retrieval and Evidence
 
-词法检索以代码块为单元；语义复用 `SemanticRetriever`；融合策略版本化并保留独立分数、选择原因、去重与裁剪。Validator 以当前 revision 的持久化源码/代码块校验路径、行号、哈希和片段。无有效证据时返回 insufficient，不让 LLM 补写来源。
+M1 已实现以代码块为单元的 BM25；语义复用 `SemanticRetriever`；Weighted RRF 保留独立分数、选择原因、去重与裁剪。Validator 以当前 revision 的 SQLite `repo_files` 和 `code_chunks` 快照校验路径、行号、哈希和片段，并在回答生成后复验。无有效证据时返回 insufficient，不让 LLM 补写来源。
 
 ### 5. Agent Core
 
@@ -67,7 +67,7 @@ M4 新增版本化状态：repository/project/revision、学习目标、已读�
 
 ### 7. API、前端和可观测性
 
-**代码事实**：`main.py` 当前同步分析并编排旧 `/ask`；`qa_agent.py` 文件级规则问答；`learning_agent.py` 固定路线；React 是 V1 五标签页。
+**代码事实**：`main.py` 当前同步分析并编排 M1 `/ask`；`qa_agent.py` 使用验证 Evidence 回答，缺少显式 M1 依赖的旧内部调用才进入标记为 legacy 的兼容路径；`learning_agent.py` 仍是固定路线；React 仍是 V1 五标签页。
 
 V3 中 `/ask` 保留旧请求并增加 evidence、校验与降级状态；`qa_agent.py` 演进为基于验证 Evidence 的回答器，旧规则作为明确降级；`learning_agent.py` 到 M4 才接入状态；`main.py` 保持薄路由。前端逐步展示路径、符号、行号、模型、失败、降级和截断。日志只记 ID、耗时、状态、计数和错误类别，不记密钥、完整 Prompt 或完整源码。
 

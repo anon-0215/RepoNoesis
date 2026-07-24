@@ -378,6 +378,7 @@ class Database:
         path: str | None = None,
         symbol: str | None = None,
         chunk_type: str | None = None,
+        language: str | None = None,
     ) -> list[dict[str, Any]]:
         conditions = ["project_id = ?"]
         params: list[Any] = [project_id]
@@ -390,6 +391,9 @@ class Database:
         if chunk_type:
             conditions.append("chunk_type = ?")
             params.append(chunk_type)
+        if language:
+            conditions.append("lower(language) = lower(?)")
+            params.append(language)
         where_clause = " AND ".join(conditions)
         with self.connect() as conn:
             rows = conn.execute(
@@ -565,6 +569,8 @@ class Database:
         normalized: bool = True,
         path: str | None = None,
         chunk_type: str | None = None,
+        language: str | None = None,
+        symbol: str | None = None,
     ) -> list[dict[str, Any]]:
         conditions = [
             "c.project_id = ?",
@@ -589,6 +595,12 @@ class Database:
         if chunk_type:
             conditions.append("c.chunk_type = ?")
             params.append(chunk_type)
+        if language:
+            conditions.append("lower(c.language) = lower(?)")
+            params.append(language)
+        if symbol:
+            conditions.append("(c.symbol_name = ? OR c.qualified_name = ?)")
+            params.extend([symbol, symbol])
         where_clause = " AND ".join(conditions)
         with self.connect() as conn:
             rows = conn.execute(
@@ -631,6 +643,51 @@ class Database:
             )
             results.append(item)
         return results
+
+    def get_evidence_source(
+        self,
+        project_id: str,
+        code_chunk_id: int,
+        path: str,
+    ) -> dict[str, Any] | None:
+        """Read project, chunk and stored source in one SQLite snapshot."""
+        normalized_path = self._normalize_repo_path(path)
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT
+                    p.id AS project_id,
+                    p.repo_url,
+                    p.owner,
+                    p.repo,
+                    p.default_branch,
+                    c.id AS code_chunk_id,
+                    c.repository_revision,
+                    c.language AS chunk_language,
+                    c.path AS chunk_path,
+                    c.chunk_type,
+                    c.symbol_name,
+                    c.qualified_name,
+                    c.parent_symbol,
+                    c.start_line,
+                    c.end_line,
+                    c.content AS chunk_content,
+                    c.content_hash,
+                    f.language AS file_language,
+                    f.content AS file_content
+                FROM projects p
+                JOIN code_chunks c ON c.project_id = p.id
+                JOIN repo_files f
+                  ON f.project_id = p.id
+                 AND f.path = c.path
+                WHERE p.id = ?
+                  AND c.id = ?
+                  AND c.path = ?
+                LIMIT 1
+                """,
+                (project_id, int(code_chunk_id), normalized_path),
+            ).fetchone()
+        return dict(row) if row is not None else None
 
     def delete_project(self, project_id: str) -> None:
         with self.connect() as conn:

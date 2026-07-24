@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -42,6 +42,56 @@ class AnalyzeRequest(BaseModel):
 
 class AskRequest(BaseModel):
     question: str = Field(..., min_length=1)
+    path: str | None = None
+    language: str | None = None
+    symbol: str | None = None
+    evidence_count: int = Field(default=5, ge=1, le=8)
+
+
+class CitationResponse(BaseModel):
+    path: str
+    summary: str
+    snippet: str
+
+
+class EvidenceResponse(BaseModel):
+    evidence_id: str
+    project_id: str
+    repository_id: str
+    repository_url: str
+    repository_revision: str
+    path: str
+    language: str
+    code_chunk_id: int
+    chunk_identity: str
+    chunk_type: str
+    symbol_name: str
+    qualified_name: str
+    start_line: int
+    end_line: int
+    content_hash: str
+    excerpt: str
+    retrieval_sources: list[str]
+    lexical_score: float | None
+    lexical_rank: int | None
+    semantic_score: float | None
+    semantic_rank: int | None
+    fusion_score: float
+    fusion_rank: int
+    selection_reason: str
+    validation_status: Literal["valid", "invalid", "unvalidated"]
+    invalid_reason: str | None
+    retrieval_strategy_version: str
+
+
+class AskResponse(BaseModel):
+    answer: str
+    citations: list[CitationResponse]
+    evidence_schema_version: Literal[1]
+    evidence: list[EvidenceResponse]
+    grounding_status: Literal["grounded", "insufficient_evidence", "degraded"]
+    retrieval_mode: Literal["hybrid", "lexical", "legacy"]
+    warnings: list[str]
 
 
 @app.get("/api/health")
@@ -152,10 +202,20 @@ def get_learning_path(project_id: str) -> dict[str, Any]:
     return {"steps": bundle.get("learning_steps", [])}
 
 
-@app.post("/api/projects/{project_id}/ask")
+@app.post("/api/projects/{project_id}/ask", response_model=AskResponse)
 def ask_project(project_id: str, request: AskRequest) -> dict[str, Any]:
     bundle = _bundle_or_404(project_id)
-    result = answer_question(request.question, bundle, llm)
+    result = answer_question(
+        request.question,
+        bundle,
+        llm,
+        db,
+        embedding_service,
+        path=request.path,
+        language=request.language,
+        symbol=request.symbol,
+        evidence_count=request.evidence_count,
+    )
     db.save_chat_answer(project_id, request.question, result["answer"], result["citations"])
     return result
 

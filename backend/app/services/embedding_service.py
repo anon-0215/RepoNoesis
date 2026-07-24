@@ -77,6 +77,7 @@ class SentenceTransformerEmbeddingBackend:
     def __init__(self) -> None:
         self._model: Any | None = None
         self._resolved_revision: str | None = None
+        self.local_files_only = False
 
     def load_model(
         self,
@@ -99,6 +100,8 @@ class SentenceTransformerEmbeddingBackend:
             "device": device,
             "cache_folder": str(cache_dir),
         }
+        if self.local_files_only:
+            kwargs["local_files_only"] = True
         if model_revision:
             kwargs["revision"] = model_revision
         model = SentenceTransformer(
@@ -160,7 +163,7 @@ class EmbeddingService:
         self._dimension: int | None = None
         self._lock = RLock()
 
-    def load_model(self) -> None:
+    def load_model(self, local_files_only: bool = False) -> None:
         with self._lock:
             if self._backend is not None:
                 return
@@ -173,6 +176,8 @@ class EmbeddingService:
                 self.settings.model_revision,
             )
             backend = self._backend_factory()
+            if isinstance(backend, SentenceTransformerEmbeddingBackend):
+                backend.local_files_only = local_files_only
             try:
                 backend.load_model(
                     self.settings.model_name_or_path,
@@ -202,11 +207,15 @@ class EmbeddingService:
         prefixed = [self.settings.document_prefix + text for text in texts]
         return self._encode(prefixed, "documents")
 
-    def encode_query(self, text: str) -> list[float]:
+    def encode_query(self, text: str, local_files_only: bool = False) -> list[float]:
         query = text.strip()
         if not query:
             raise EmbeddingEncodeError("embedding query must not be empty")
-        return self._encode([self.settings.query_prefix + query], "query")[0]
+        return self._encode(
+            [self.settings.query_prefix + query],
+            "query",
+            local_files_only=local_files_only,
+        )[0]
 
     def get_model_identity(self) -> EmbeddingModelIdentity:
         if self._identity is not None:
@@ -222,9 +231,12 @@ class EmbeddingService:
             self.settings.model_revision,
         )
 
-    def ensure_model_identity(self) -> EmbeddingModelIdentity:
+    def ensure_model_identity(
+        self,
+        local_files_only: bool = False,
+    ) -> EmbeddingModelIdentity:
         if _needs_loaded_revision(self.settings) and self._identity is None:
-            self.load_model()
+            self.load_model(local_files_only=local_files_only)
         return self.get_model_identity()
 
     def get_embedding_dimension(self) -> int | None:
@@ -249,9 +261,14 @@ class EmbeddingService:
             return True
         return importlib.util.find_spec("sentence_transformers") is not None
 
-    def _encode(self, texts: Sequence[str], operation: str) -> list[list[float]]:
+    def _encode(
+        self,
+        texts: Sequence[str],
+        operation: str,
+        local_files_only: bool = False,
+    ) -> list[list[float]]:
         with self._lock:
-            self.load_model()
+            self.load_model(local_files_only=local_files_only)
             assert self._backend is not None
             identity = self.get_model_identity()
             try:

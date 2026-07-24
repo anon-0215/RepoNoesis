@@ -19,7 +19,10 @@ MAX_TOP_K = 50
 
 @dataclass(frozen=True)
 class SemanticSearchResult:
+    project_id: str
+    repository_revision: str
     code_chunk_id: int
+    language: str
     path: str
     chunk_type: str
     symbol_name: str
@@ -61,12 +64,17 @@ class SemanticRetriever:
         top_k: int = DEFAULT_TOP_K,
         path: str | None = None,
         chunk_type: str | None = None,
+        language: str | None = None,
+        symbol: str | None = None,
+        local_files_only: bool = False,
     ) -> SemanticSearchOutcome:
         cleaned_query = query.strip()
         if not cleaned_query:
             raise ValueError("semantic search query must not be empty")
         limit = _bounded_top_k(top_k)
-        identity = self.embedding_service.ensure_model_identity()
+        identity = self.embedding_service.ensure_model_identity(
+            local_files_only=local_files_only
+        )
         embedding_config_hash = build_embedding_config_hash(self.embedding_service.settings)
         candidates = self.database.get_code_chunk_embeddings_for_project(
             project_id,
@@ -77,6 +85,8 @@ class SemanticRetriever:
             self.embedding_service.settings.normalize,
             path=path,
             chunk_type=chunk_type,
+            language=language,
+            symbol=symbol,
         )
         candidates = [
             candidate
@@ -104,7 +114,10 @@ class SemanticRetriever:
                     f"model {identity.model_name}"
                 )
 
-        query_vector = self.embedding_service.encode_query(cleaned_query)
+        query_vector = self.embedding_service.encode_query(
+            cleaned_query,
+            local_files_only=local_files_only,
+        )
         if len(query_vector) != dimension:
             raise ValueError(
                 f"query embedding dimension {len(query_vector)} does not match "
@@ -130,7 +143,10 @@ class SemanticRetriever:
         )
         results = [
             SemanticSearchResult(
+                project_id=project_id,
+                repository_revision=candidate["repository_revision"],
                 code_chunk_id=int(candidate["id"]),
+                language=candidate["language"],
                 path=candidate["path"],
                 chunk_type=candidate["chunk_type"],
                 symbol_name=candidate["symbol_name"],
