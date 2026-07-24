@@ -107,6 +107,33 @@ def get_agent_limits() -> AgentLimits:
         max_final_answer_tokens=_bounded_env_int(
             "AGENT_MAX_FINAL_ANSWER_TOKENS", 1_600, 128, 1_600
         ),
+        default_relation_depth=_bounded_env_int(
+            "AGENT_DEFAULT_RELATION_DEPTH", 1, 1, 2
+        ),
+        max_relation_depth=_bounded_env_int(
+            "AGENT_MAX_RELATION_DEPTH", 2, 1, 2
+        ),
+        max_relation_seed_nodes=_bounded_env_int(
+            "AGENT_MAX_RELATION_SEEDS", 8, 1, 8
+        ),
+        max_relation_neighbors_per_node=_bounded_env_int(
+            "AGENT_MAX_RELATION_NEIGHBORS", 20, 1, 20
+        ),
+        max_relation_nodes=_bounded_env_int(
+            "AGENT_MAX_RELATION_NODES", 64, 2, 64
+        ),
+        max_relation_edges=_bounded_env_int(
+            "AGENT_MAX_RELATION_EDGES", 128, 1, 128
+        ),
+        max_relation_paths=_bounded_env_int(
+            "AGENT_MAX_RELATION_PATHS", 24, 1, 24
+        ),
+        max_relation_observation_bytes=_bounded_env_int(
+            "AGENT_MAX_RELATION_OBSERVATION_BYTES", 65_536, 1_024, 65_536
+        ),
+        max_relation_evidence_items=_bounded_env_int(
+            "AGENT_MAX_RELATION_EVIDENCE", 16, 1, 16
+        ),
     )
 
 

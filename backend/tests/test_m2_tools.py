@@ -86,7 +86,13 @@ class M2ToolTests(unittest.TestCase):
         tools = self.registry.list_tools()
         self.assertEqual(
             [item["name"] for item in tools],
-            ["lookup_symbol", "read_source", "search_code", "validate_evidence"],
+            [
+                "expand_relations",
+                "lookup_symbol",
+                "read_source",
+                "search_code",
+                "validate_evidence",
+            ],
         )
         self.assertTrue(all(item["version"] == "1" for item in tools))
         with self.assertRaises(ValueError):
@@ -137,13 +143,13 @@ class M2ToolTests(unittest.TestCase):
                 "1",
                 "slow",
                 EmptyInput,
-                lambda _context, _input: (time.sleep(0.01) or [], [], False),
-                1,
+                lambda _context, _input: ([], [], False),
+                0,
                 1,
                 100,
             )
         )
-        call = ToolCall("C", "S", "slow", "1", {}, 1, {})
+        call = ToolCall("C", "S", "slow", "1", {}, 0, {})
         observation = registry.execute(self.context, call)
         self.assertEqual(observation.status, "timed_out")
         self.assertEqual(observation.metrics["timeout_enforcement"], "cooperative")

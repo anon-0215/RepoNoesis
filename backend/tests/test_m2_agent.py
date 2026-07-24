@@ -5,7 +5,6 @@ import importlib
 import os
 from pathlib import Path
 import tempfile
-import time
 import unittest
 from unittest.mock import patch
 
@@ -236,18 +235,15 @@ class M2AgentTests(unittest.TestCase):
         self.assertTrue(result["evidence"])
 
     def test_total_deadline_after_planning_starts_no_tool(self):
-        class SlowPlanner(ScriptedPlanner):
-            def decide(inner_self, state, *, repair_hint=None):
-                time.sleep(0.01)
-                return super().decide(state, repair_hint=repair_hint)
-
-        planner = SlowPlanner(
+        planner = ScriptedPlanner(
             [decision("continue", "search_code", {"query": "authenticate_user"})]
         )
-        result = self._run(
-            planner,
-            limits=replace(AgentLimits(), total_deadline_ms=1),
-        )
+        clock = [0.0, 0.0, 0.002, *([0.002] * 50)]
+        with patch("app.services.agent_core.time.monotonic", side_effect=clock):
+            result = self._run(
+                planner,
+                limits=replace(AgentLimits(), total_deadline_ms=1),
+            )
         self.assertEqual(result["agent_status"], "budget_exhausted")
         self.assertEqual(result["budget_usage"]["tool_calls_used"], 0)
         self.assertEqual(result["citations"], [])
@@ -375,7 +371,7 @@ class M2AgentTests(unittest.TestCase):
         self.assertEqual(result["budget_usage"]["limits"]["max_agent_steps"], 5)
         self.assertEqual(result["citations"], [])
 
-    def test_formal_route_defaults_through_agent_core_and_schema_stays_v4(self):
+    def test_formal_route_defaults_through_agent_core_and_schema_is_v5(self):
         route_directory = tempfile.TemporaryDirectory()
         self.addCleanup(route_directory.cleanup)
         route_db_path = str(Path(route_directory.name) / "route.sqlite")
@@ -404,7 +400,7 @@ class M2AgentTests(unittest.TestCase):
         mocked_agent.assert_called_once()
         self.assertEqual(validated.agent_schema_version, 1)
         self.assertEqual(result["agent_mode"], "deterministic_fallback")
-        self.assertEqual(SCHEMA_VERSION, 4)
+        self.assertEqual(SCHEMA_VERSION, 5)
 
 
 if __name__ == "__main__":

@@ -54,6 +54,15 @@ class M2ContractTests(unittest.TestCase):
                 "max_planner_output_tokens_per_step": 512,
                 "max_total_planner_output_tokens": 2048,
                 "max_final_answer_tokens": 1600,
+                "default_relation_depth": 1,
+                "max_relation_depth": 2,
+                "max_relation_seed_nodes": 8,
+                "max_relation_neighbors_per_node": 20,
+                "max_relation_nodes": 64,
+                "max_relation_edges": 128,
+                "max_relation_paths": 24,
+                "max_relation_observation_bytes": 65536,
+                "max_relation_evidence_items": 16,
             },
         )
 

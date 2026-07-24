@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 from threading import Event
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 AGENT_SCHEMA_VERSION = 1
@@ -32,6 +32,15 @@ class AgentLimits:
     max_planner_output_tokens_per_step: int = 512
     max_total_planner_output_tokens: int = 2_048
     max_final_answer_tokens: int = 1_600
+    default_relation_depth: int = 1
+    max_relation_depth: int = 2
+    max_relation_seed_nodes: int = 8
+    max_relation_neighbors_per_node: int = 20
+    max_relation_nodes: int = 64
+    max_relation_edges: int = 128
+    max_relation_paths: int = 24
+    max_relation_observation_bytes: int = 65_536
+    max_relation_evidence_items: int = 16
 
 
 class StrictModel(BaseModel):
@@ -62,6 +71,23 @@ class ReadSourceInput(StrictModel):
 
 class ValidateEvidenceInput(StrictModel):
     evidence_ids: list[str] = Field(min_length=1, max_length=20)
+
+
+class ExpandRelationsInput(StrictModel):
+    seed_evidence_ids: list[str] = Field(default_factory=list, max_length=8)
+    seed_symbol_ids: list[str] = Field(default_factory=list, max_length=8)
+    relation_types: list[
+        Literal["imports", "calls", "references", "defines"]
+    ] = Field(default_factory=lambda: ["imports", "calls", "references"], min_length=1)
+    direction: Literal["outbound", "inbound", "both"] = "outbound"
+    max_depth: int = Field(default=1, ge=1, le=2)
+    per_node_limit: int = Field(default=20, ge=1, le=20)
+
+    @model_validator(mode="after")
+    def require_seed(self) -> "ExpandRelationsInput":
+        if not self.seed_evidence_ids and not self.seed_symbol_ids:
+            raise ValueError("at least one relation seed is required")
+        return self
 
 
 class PlannerDecision(StrictModel):

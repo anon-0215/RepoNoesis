@@ -95,6 +95,59 @@ class EvidenceBuilder:
             )
         return evidence
 
+    def build_from_code_chunks(
+        self,
+        chunks: list[dict[str, Any]],
+        project: dict[str, Any],
+        *,
+        selection_reason: str = "Selected by validated static relation expansion.",
+    ) -> list[Evidence]:
+        repository_id = _repository_id(project)
+        repository_url = str(project.get("repo_url", ""))
+        evidence: list[Evidence] = []
+        for index, chunk in enumerate(chunks, start=1):
+            content = str(chunk["content"])
+            evidence.append(
+                Evidence(
+                    evidence_id=f"E{index}",
+                    project_id=str(chunk["project_id"]),
+                    repository_id=repository_id,
+                    repository_url=repository_url,
+                    repository_revision=str(chunk["repository_revision"]),
+                    path=str(chunk["path"]),
+                    language=str(chunk["language"]),
+                    code_chunk_id=int(chunk["id"]),
+                    chunk_identity="|".join(
+                        [
+                            str(chunk["project_id"]),
+                            str(chunk["repository_revision"]),
+                            str(chunk["path"]),
+                            str(chunk["start_line"]),
+                            str(chunk["end_line"]),
+                            str(chunk["content_hash"]),
+                            str(chunk["id"]),
+                        ]
+                    ),
+                    chunk_type=str(chunk["chunk_type"]),
+                    symbol_name=str(chunk["symbol_name"]),
+                    qualified_name=str(chunk["qualified_name"]),
+                    start_line=int(chunk["start_line"]),
+                    end_line=int(chunk["end_line"]),
+                    content_hash=str(chunk["content_hash"]),
+                    excerpt=content[: self.excerpt_limit],
+                    retrieval_sources=["relation"],
+                    lexical_score=None,
+                    lexical_rank=None,
+                    semantic_score=None,
+                    semantic_rank=None,
+                    fusion_score=0.0,
+                    fusion_rank=index,
+                    selection_reason=selection_reason,
+                    retrieval_strategy_version="relation-expansion-v1",
+                )
+            )
+        return evidence
+
 
 class CitationValidator:
     def __init__(self, database: Database) -> None:

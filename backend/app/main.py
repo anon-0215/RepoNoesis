@@ -13,7 +13,7 @@ from app.config import (
     get_env_value,
     load_environment,
 )
-from app.database import Database
+from app.database import Database, SCHEMA_VERSION
 from app.services.analyzer import analyze_snapshot
 from app.services.agent_core import run_bounded_agent
 from app.services.code_chunker import extract_python_code_chunks_from_files
@@ -23,6 +23,7 @@ from app.services.github_client import fetch_repository
 from app.services.learning_agent import build_learning_path
 from app.services.llm_client import LLMClient
 from app.services.report import generate_report
+from app.services.relation_analysis import index_project_relations
 
 
 load_environment()
@@ -90,6 +91,16 @@ class EvidenceResponse(BaseModel):
     retrieval_strategy_version: str
 
 
+class EvidenceChainResponse(BaseModel):
+    chain_id: str
+    relation_types: list[str]
+    path_length: int
+    seed_evidence_ids: list[str]
+    supporting_evidence_ids: list[str]
+    resolution_status: str
+    truncated: bool
+
+
 class AskResponse(BaseModel):
     answer: str
     citations: list[CitationResponse]
@@ -110,6 +121,10 @@ class AskResponse(BaseModel):
     ]
     agent_trace: list[dict[str, Any]]
     budget_usage: dict[str, Any]
+    relation_schema_version: Literal[1]
+    analysis_mode: Literal["retrieval_only", "relation_expanded"]
+    evidence_chains: list[EvidenceChainResponse]
+    relation_summary: dict[str, Any]
 
 
 @app.get("/api/health")
@@ -125,6 +140,7 @@ def health() -> dict[str, Any]:
         "embedding_model_revision": embedding_identity.model_revision,
         "embedding_device": embedding_identity.device,
         "database": str(Path(db.path)),
+        "database_schema_version": SCHEMA_VERSION,
     }
 
 
@@ -137,6 +153,7 @@ def analyze_project(request: AnalyzeRequest) -> dict[str, Any]:
 
     project_id = db.create_project(snapshot.to_dict())
     embedding_index: dict[str, Any] | None = None
+    relation_index: dict[str, Any] | None = None
     try:
         analysis = analyze_snapshot(snapshot)
         chunk_result = extract_python_code_chunks_from_files(
@@ -164,6 +181,27 @@ def analyze_project(request: AnalyzeRequest) -> dict[str, Any]:
             learning_steps,
             [chunk.to_dict() for chunk in chunk_result.chunks],
         )
+        try:
+            relation_result = index_project_relations(db, project_id)
+            relation_index = {
+                "status": relation_result.status,
+                "relation_schema_version": 1,
+                "parsed_files": relation_result.parsed_files,
+                "failed_files": relation_result.failed_files,
+                "unsupported_files": relation_result.unsupported_files,
+                "node_count": len(relation_result.nodes),
+                "edge_count": len(relation_result.edges),
+                "warnings": relation_result.warnings,
+            }
+        except Exception as exc:
+            relation_index = {
+                "status": "warning",
+                "relation_schema_version": 1,
+                "warnings": [
+                    "Static relation indexing failed after M1/M2 analysis was saved: "
+                    f"{type(exc).__name__}."
+                ],
+            }
         if embedding_service.settings.enabled:
             try:
                 embedding_index = EmbeddingIndexer(db, embedding_service).index_project(
@@ -181,6 +219,8 @@ def analyze_project(request: AnalyzeRequest) -> dict[str, Any]:
     response: dict[str, Any] = {"project_id": project_id, "status": "done"}
     if embedding_index is not None:
         response["embedding_index"] = embedding_index
+    if relation_index is not None:
+        response["relation_index"] = relation_index
     return response
 
 

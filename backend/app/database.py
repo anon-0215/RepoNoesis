@@ -13,7 +13,7 @@ from typing import Any, Sequence
 
 
 DEFAULT_DB_PATH = Path(__file__).resolve().parents[1] / "data" / "gitlearn.sqlite"
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 
 SCHEMA = """
@@ -29,6 +29,7 @@ CREATE TABLE IF NOT EXISTS projects (
     owner TEXT NOT NULL,
     repo TEXT NOT NULL,
     default_branch TEXT NOT NULL,
+    repository_revision TEXT NOT NULL DEFAULT '',
     status TEXT NOT NULL,
     primary_language TEXT DEFAULT '',
     frameworks_json TEXT DEFAULT '[]',
@@ -123,6 +124,70 @@ CREATE TABLE IF NOT EXISTS code_chunk_embeddings (
     FOREIGN KEY(code_chunk_id) REFERENCES code_chunks(id) ON DELETE CASCADE
 );
 
+CREATE TABLE IF NOT EXISTS relation_nodes (
+    node_id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL,
+    repository_revision TEXT NOT NULL,
+    language TEXT NOT NULL,
+    node_type TEXT NOT NULL,
+    path TEXT NOT NULL,
+    code_chunk_id INTEGER,
+    symbol_name TEXT NOT NULL DEFAULT '',
+    qualified_name TEXT NOT NULL DEFAULT '',
+    start_line INTEGER NOT NULL,
+    end_line INTEGER NOT NULL,
+    content_hash TEXT NOT NULL,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE,
+    FOREIGN KEY(code_chunk_id) REFERENCES code_chunks(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS code_relations (
+    edge_id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL,
+    repository_revision TEXT NOT NULL,
+    relation_type TEXT NOT NULL,
+    source_node_id TEXT NOT NULL,
+    source_path TEXT NOT NULL,
+    source_chunk_id INTEGER,
+    source_symbol TEXT NOT NULL DEFAULT '',
+    source_start_line INTEGER NOT NULL,
+    source_end_line INTEGER NOT NULL,
+    target_node_id TEXT,
+    target_path TEXT,
+    target_chunk_id INTEGER,
+    target_symbol TEXT,
+    target_start_line INTEGER,
+    target_end_line INTEGER,
+    raw_target_name TEXT NOT NULL DEFAULT '',
+    resolution_status TEXT NOT NULL,
+    resolution_rule TEXT NOT NULL,
+    language TEXT NOT NULL,
+    source_content_hash TEXT NOT NULL,
+    target_content_hash TEXT,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE,
+    FOREIGN KEY(source_node_id) REFERENCES relation_nodes(node_id) ON DELETE CASCADE,
+    FOREIGN KEY(target_node_id) REFERENCES relation_nodes(node_id) ON DELETE CASCADE,
+    FOREIGN KEY(source_chunk_id) REFERENCES code_chunks(id) ON DELETE CASCADE,
+    FOREIGN KEY(target_chunk_id) REFERENCES code_chunks(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS relation_index_runs (
+    project_id TEXT NOT NULL,
+    repository_revision TEXT NOT NULL,
+    status TEXT NOT NULL,
+    parsed_files INTEGER NOT NULL DEFAULT 0,
+    failed_files INTEGER NOT NULL DEFAULT 0,
+    unsupported_files INTEGER NOT NULL DEFAULT 0,
+    node_count INTEGER NOT NULL DEFAULT 0,
+    edge_count INTEGER NOT NULL DEFAULT 0,
+    warnings_json TEXT NOT NULL DEFAULT '[]',
+    indexed_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY(project_id, repository_revision),
+    FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
+);
+
 CREATE UNIQUE INDEX IF NOT EXISTS idx_code_chunks_unique
 ON code_chunks (
     project_id, repository_revision, path, chunk_type,
@@ -134,6 +199,26 @@ ON code_chunks (project_id, path);
 
 CREATE INDEX IF NOT EXISTS idx_code_chunks_project_symbol
 ON code_chunks (project_id, qualified_name);
+
+CREATE INDEX IF NOT EXISTS idx_relation_nodes_revision_path
+ON relation_nodes (project_id, repository_revision, path);
+
+CREATE INDEX IF NOT EXISTS idx_relation_nodes_revision_symbol
+ON relation_nodes (project_id, repository_revision, qualified_name);
+
+CREATE INDEX IF NOT EXISTS idx_code_relations_revision_source
+ON code_relations (project_id, repository_revision, source_node_id);
+
+CREATE INDEX IF NOT EXISTS idx_code_relations_revision_target
+ON code_relations (project_id, repository_revision, target_node_id);
+
+CREATE INDEX IF NOT EXISTS idx_code_relations_revision_type
+ON code_relations (project_id, repository_revision, relation_type);
+
+CREATE INDEX IF NOT EXISTS idx_code_relations_revision_symbol
+ON code_relations (
+    project_id, repository_revision, source_symbol, target_symbol
+);
 
 """
 
@@ -185,6 +270,17 @@ class Database:
             )
 
     def _migrate_schema(self, conn: sqlite3.Connection) -> None:
+        project_columns = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(projects)").fetchall()
+        }
+        if "repository_revision" not in project_columns:
+            conn.execute(
+                """
+                ALTER TABLE projects
+                ADD COLUMN repository_revision TEXT NOT NULL DEFAULT ''
+                """
+            )
         embedding_columns = {
             row["name"]
             for row in conn.execute("PRAGMA table_info(code_chunk_embeddings)").fetchall()
@@ -229,8 +325,11 @@ class Database:
         with self.connect() as conn:
             conn.execute(
                 """
-                INSERT INTO projects (id, repo_url, owner, repo, default_branch, status)
-                VALUES (?, ?, ?, ?, ?, 'analyzing')
+                INSERT INTO projects (
+                    id, repo_url, owner, repo, default_branch,
+                    repository_revision, status
+                )
+                VALUES (?, ?, ?, ?, ?, ?, 'analyzing')
                 """,
                 (
                     project_id,
@@ -238,6 +337,7 @@ class Database:
                     snapshot["owner"],
                     snapshot["repo"],
                     snapshot["default_branch"],
+                    snapshot.get("repository_revision", ""),
                 ),
             )
         return project_id
@@ -262,6 +362,11 @@ class Database:
         code_chunks: list[dict[str, Any]] | None = None,
     ) -> None:
         with self.connect() as conn:
+            conn.execute("DELETE FROM code_relations WHERE project_id = ?", (project_id,))
+            conn.execute("DELETE FROM relation_nodes WHERE project_id = ?", (project_id,))
+            conn.execute(
+                "DELETE FROM relation_index_runs WHERE project_id = ?", (project_id,)
+            )
             conn.execute("DELETE FROM repo_files WHERE project_id = ?", (project_id,))
             conn.execute("DELETE FROM modules WHERE project_id = ?", (project_id,))
             conn.execute("DELETE FROM learning_steps WHERE project_id = ?", (project_id,))
@@ -353,6 +458,7 @@ class Database:
         code_chunks: list[dict[str, Any]],
     ) -> None:
         with self.connect() as conn:
+            self._invalidate_relation_index(conn, project_id)
             self._replace_code_chunks_in_scope(conn, project_id, code_chunks)
 
     def replace_code_chunks_for_file(
@@ -364,6 +470,7 @@ class Database:
     ) -> None:
         normalized_path = self._normalize_repo_path(path)
         with self.connect() as conn:
+            self._invalidate_relation_index(conn, project_id)
             self._replace_code_chunks_in_scope(
                 conn,
                 project_id,
@@ -405,6 +512,248 @@ class Database:
                 params,
             ).fetchall()
         return [self._code_chunk_from_row(row) for row in rows]
+
+    def replace_relation_index(
+        self,
+        project_id: str,
+        repository_revision: str,
+        nodes: list[dict[str, Any]],
+        edges: list[dict[str, Any]],
+        *,
+        status: str,
+        parsed_files: int,
+        failed_files: int,
+        unsupported_files: int,
+        warnings: list[str],
+    ) -> None:
+        if status not in {"complete", "partial"}:
+            raise ValueError("relation index status must be complete or partial")
+        prepared_nodes = [
+            self._prepare_relation_node(project_id, repository_revision, item)
+            for item in nodes
+        ]
+        node_ids = {item["node_id"] for item in prepared_nodes}
+        if len(node_ids) != len(prepared_nodes):
+            raise ValueError("relation node IDs must be unique")
+        prepared_edges = [
+            self._prepare_relation_edge(
+                project_id, repository_revision, item, node_ids
+            )
+            for item in edges
+        ]
+        if len({item["edge_id"] for item in prepared_edges}) != len(prepared_edges):
+            raise ValueError("relation edge IDs must be unique")
+        with self.connect() as conn:
+            revisions = {
+                str(row["repository_revision"])
+                for row in conn.execute(
+                    "SELECT repository_revision FROM code_chunks WHERE project_id = ?",
+                    (project_id,),
+                ).fetchall()
+            }
+            if revisions and revisions != {repository_revision}:
+                raise ValueError("relation revision does not match code chunk revision")
+            conn.execute(
+                "DELETE FROM code_relations WHERE project_id = ? AND repository_revision = ?",
+                (project_id, repository_revision),
+            )
+            conn.execute(
+                "DELETE FROM relation_nodes WHERE project_id = ? AND repository_revision = ?",
+                (project_id, repository_revision),
+            )
+            for item in prepared_nodes:
+                conn.execute(
+                    """
+                    INSERT INTO relation_nodes (
+                        node_id, project_id, repository_revision, language,
+                        node_type, path, code_chunk_id, symbol_name,
+                        qualified_name, start_line, end_line, content_hash
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        item["node_id"],
+                        project_id,
+                        repository_revision,
+                        item["language"],
+                        item["node_type"],
+                        item["path"],
+                        item["code_chunk_id"],
+                        item["symbol_name"],
+                        item["qualified_name"],
+                        item["start_line"],
+                        item["end_line"],
+                        item["content_hash"],
+                    ),
+                )
+            for item in prepared_edges:
+                conn.execute(
+                    """
+                    INSERT INTO code_relations (
+                        edge_id, project_id, repository_revision, relation_type,
+                        source_node_id, source_path, source_chunk_id, source_symbol,
+                        source_start_line, source_end_line, target_node_id,
+                        target_path, target_chunk_id, target_symbol,
+                        target_start_line, target_end_line, raw_target_name,
+                        resolution_status, resolution_rule, language,
+                        source_content_hash, target_content_hash
+                    )
+                    VALUES (
+                        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                        ?, ?, ?, ?
+                    )
+                    """,
+                    (
+                        item["edge_id"],
+                        project_id,
+                        repository_revision,
+                        item["relation_type"],
+                        item["source_node_id"],
+                        item["source_path"],
+                        item["source_chunk_id"],
+                        item["source_symbol"],
+                        item["source_start_line"],
+                        item["source_end_line"],
+                        item["target_node_id"],
+                        item["target_path"],
+                        item["target_chunk_id"],
+                        item["target_symbol"],
+                        item["target_start_line"],
+                        item["target_end_line"],
+                        item["raw_target_name"],
+                        item["resolution_status"],
+                        item["resolution_rule"],
+                        item["language"],
+                        item["source_content_hash"],
+                        item["target_content_hash"],
+                    ),
+                )
+            conn.execute(
+                """
+                INSERT INTO relation_index_runs (
+                    project_id, repository_revision, status, parsed_files,
+                    failed_files, unsupported_files, node_count, edge_count,
+                    warnings_json
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(project_id, repository_revision)
+                DO UPDATE SET
+                    status = excluded.status,
+                    parsed_files = excluded.parsed_files,
+                    failed_files = excluded.failed_files,
+                    unsupported_files = excluded.unsupported_files,
+                    node_count = excluded.node_count,
+                    edge_count = excluded.edge_count,
+                    warnings_json = excluded.warnings_json,
+                    indexed_at = CURRENT_TIMESTAMP
+                """,
+                (
+                    project_id,
+                    repository_revision,
+                    status,
+                    int(parsed_files),
+                    int(failed_files),
+                    int(unsupported_files),
+                    len(prepared_nodes),
+                    len(prepared_edges),
+                    json.dumps(warnings[:100], ensure_ascii=False),
+                ),
+            )
+
+    def get_relation_index_status(
+        self, project_id: str, repository_revision: str
+    ) -> dict[str, Any] | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT * FROM relation_index_runs
+                WHERE project_id = ? AND repository_revision = ?
+                """,
+                (project_id, repository_revision),
+            ).fetchone()
+        if row is None:
+            return None
+        result = dict(row)
+        result["warnings"] = self._json(result.pop("warnings_json"), [])
+        return result
+
+    def get_relation_nodes(
+        self,
+        project_id: str,
+        repository_revision: str,
+        *,
+        node_ids: list[str] | None = None,
+        code_chunk_ids: list[int] | None = None,
+        path: str | None = None,
+        qualified_name: str | None = None,
+    ) -> list[dict[str, Any]]:
+        conditions = ["project_id = ?", "repository_revision = ?"]
+        params: list[Any] = [project_id, repository_revision]
+        if node_ids is not None:
+            if not node_ids:
+                return []
+            placeholders = ",".join("?" for _ in node_ids)
+            conditions.append(f"node_id IN ({placeholders})")
+            params.extend(node_ids)
+        if code_chunk_ids is not None:
+            if not code_chunk_ids:
+                return []
+            placeholders = ",".join("?" for _ in code_chunk_ids)
+            conditions.append(f"code_chunk_id IN ({placeholders})")
+            params.extend(int(value) for value in code_chunk_ids)
+        if path is not None:
+            conditions.append("path = ?")
+            params.append(self._normalize_repo_path(path))
+        if qualified_name is not None:
+            conditions.append("qualified_name = ?")
+            params.append(qualified_name)
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT * FROM relation_nodes
+                WHERE {' AND '.join(conditions)}
+                ORDER BY path, start_line, qualified_name, node_id
+                """,
+                params,
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_relations(
+        self,
+        project_id: str,
+        repository_revision: str,
+        *,
+        relation_types: list[str] | None = None,
+        source_node_ids: list[str] | None = None,
+        target_node_ids: list[str] | None = None,
+        resolution_statuses: list[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        conditions = ["project_id = ?", "repository_revision = ?"]
+        params: list[Any] = [project_id, repository_revision]
+        for column, values in (
+            ("relation_type", relation_types),
+            ("source_node_id", source_node_ids),
+            ("target_node_id", target_node_ids),
+            ("resolution_status", resolution_statuses),
+        ):
+            if values is not None:
+                if not values:
+                    return []
+                placeholders = ",".join("?" for _ in values)
+                conditions.append(f"{column} IN ({placeholders})")
+                params.extend(values)
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT * FROM code_relations
+                WHERE {' AND '.join(conditions)}
+                ORDER BY source_path, source_start_line, relation_type,
+                         raw_target_name, COALESCE(target_path, ''),
+                         COALESCE(target_start_line, 0), edge_id
+                """,
+                params,
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     def get_code_chunks_missing_embeddings(
         self,
@@ -776,6 +1125,7 @@ class Database:
             "owner": row["owner"],
             "repo": row["repo"],
             "default_branch": row["default_branch"],
+            "repository_revision": row["repository_revision"],
             "status": row["status"],
             "primary_language": row["primary_language"],
             "frameworks": self._json(row["frameworks_json"], []),
@@ -833,6 +1183,16 @@ class Database:
         chunk: dict[str, Any],
     ) -> None:
         self._insert_prepared_code_chunk(conn, self._prepare_code_chunk(project_id, chunk))
+
+    @staticmethod
+    def _invalidate_relation_index(
+        conn: sqlite3.Connection, project_id: str
+    ) -> None:
+        conn.execute("DELETE FROM code_relations WHERE project_id = ?", (project_id,))
+        conn.execute("DELETE FROM relation_nodes WHERE project_id = ?", (project_id,))
+        conn.execute(
+            "DELETE FROM relation_index_runs WHERE project_id = ?", (project_id,)
+        )
 
     def _replace_code_chunks_in_scope(
         self,
@@ -1009,6 +1369,138 @@ class Database:
             row["chunk_type"],
             row["qualified_name"],
         )
+
+    def _prepare_relation_node(
+        self,
+        project_id: str,
+        repository_revision: str,
+        node: dict[str, Any],
+    ) -> dict[str, Any]:
+        if node.get("project_id") != project_id:
+            raise ValueError("relation node project mismatch")
+        if node.get("repository_revision") != repository_revision:
+            raise ValueError("relation node revision mismatch")
+        node_id = str(node.get("node_id", ""))
+        if len(node_id) != 65 or not node_id.startswith("N"):
+            raise ValueError("invalid relation node identity")
+        start_line = int(node.get("start_line", 0))
+        end_line = int(node.get("end_line", 0))
+        if start_line < 1 or end_line < start_line:
+            raise ValueError("invalid relation node line range")
+        content_hash = str(node.get("content_hash", ""))
+        _require_hash(content_hash, "relation node content_hash")
+        return {
+            **node,
+            "node_id": node_id,
+            "path": self._normalize_repo_path(str(node.get("path", ""))),
+            "code_chunk_id": (
+                int(node["code_chunk_id"])
+                if node.get("code_chunk_id") is not None
+                else None
+            ),
+            "language": str(node.get("language", ""))[:80],
+            "node_type": str(node.get("node_type", ""))[:80],
+            "symbol_name": str(node.get("symbol_name", ""))[:500],
+            "qualified_name": str(node.get("qualified_name", ""))[:500],
+            "start_line": start_line,
+            "end_line": end_line,
+            "content_hash": content_hash,
+        }
+
+    def _prepare_relation_edge(
+        self,
+        project_id: str,
+        repository_revision: str,
+        edge: dict[str, Any],
+        node_ids: set[str],
+    ) -> dict[str, Any]:
+        if edge.get("project_id") != project_id:
+            raise ValueError("relation edge project mismatch")
+        if edge.get("repository_revision") != repository_revision:
+            raise ValueError("relation edge revision mismatch")
+        edge_id = str(edge.get("edge_id", ""))
+        if len(edge_id) != 65 or not edge_id.startswith("R"):
+            raise ValueError("invalid relation edge identity")
+        relation_type = str(edge.get("relation_type", ""))
+        if relation_type not in {"imports", "calls", "references", "defines"}:
+            raise ValueError("unknown relation type")
+        status = str(edge.get("resolution_status", ""))
+        if status not in {
+            "resolved",
+            "ambiguous",
+            "unresolved",
+            "external",
+            "unsupported",
+        }:
+            raise ValueError("unknown relation resolution status")
+        source_node_id = str(edge.get("source_node_id", ""))
+        target_node_id = edge.get("target_node_id")
+        if source_node_id not in node_ids:
+            raise ValueError("relation source node is missing")
+        if target_node_id is not None and str(target_node_id) not in node_ids:
+            raise ValueError("relation target node is missing")
+        if status == "resolved" and target_node_id is None:
+            raise ValueError("resolved relation requires a target node")
+        source_hash = _require_hash(
+            str(edge.get("source_content_hash", "")),
+            "relation source_content_hash",
+        )
+        target_hash = edge.get("target_content_hash")
+        if target_hash is not None:
+            target_hash = _require_hash(
+                str(target_hash), "relation target_content_hash"
+            )
+        source_start = int(edge.get("source_start_line", 0))
+        source_end = int(edge.get("source_end_line", 0))
+        if source_start < 1 or source_end < source_start:
+            raise ValueError("invalid relation source line range")
+        return {
+            **edge,
+            "edge_id": edge_id,
+            "relation_type": relation_type,
+            "source_node_id": source_node_id,
+            "source_path": self._normalize_repo_path(str(edge.get("source_path", ""))),
+            "source_chunk_id": (
+                int(edge["source_chunk_id"])
+                if edge.get("source_chunk_id") is not None
+                else None
+            ),
+            "source_symbol": str(edge.get("source_symbol", ""))[:500],
+            "source_start_line": source_start,
+            "source_end_line": source_end,
+            "target_node_id": str(target_node_id) if target_node_id is not None else None,
+            "target_path": (
+                self._normalize_repo_path(str(edge["target_path"]))
+                if edge.get("target_path") is not None
+                else None
+            ),
+            "target_chunk_id": (
+                int(edge["target_chunk_id"])
+                if edge.get("target_chunk_id") is not None
+                else None
+            ),
+            "target_symbol": (
+                str(edge["target_symbol"])[:500]
+                if edge.get("target_symbol") is not None
+                else None
+            ),
+            "target_start_line": (
+                int(edge["target_start_line"])
+                if edge.get("target_start_line") is not None
+                else None
+            ),
+            "target_end_line": (
+                int(edge["target_end_line"])
+                if edge.get("target_end_line") is not None
+                else None
+            ),
+            "raw_target_name": str(edge.get("raw_target_name", ""))[:500],
+            "resolution_status": status,
+            "resolution_rule": str(edge.get("resolution_rule", ""))[:120],
+            "language": str(edge.get("language", ""))[:80],
+            "source_content_hash": source_hash,
+            "target_content_hash": target_hash,
+        }
 
     def _embedding_values(self, record: dict[str, Any]) -> tuple[Any, ...]:
         vector = list(record["vector"])

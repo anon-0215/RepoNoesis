@@ -26,25 +26,31 @@ Repository Ingestion
 
 - `analyzer.py`：复用文件概览、框架、模块和启动线索。
 - `code_chunker.py`：作为 Python 函数/类/方法代码块与精确行号来源。
-- `database.py`：保留 schema v4 数据，未来显式版本迁移。
+- `database.py`：M3 以幂等迁移升级到 schema v5；保留 v4 数据并新增正式关系节点、
+  edge 和 index-run 状态。
 - `embedding_service.py`：隐藏模型后端、设备、文本格式和身份。
 - `embedding_indexer.py`：继续按内容与配置身份增量缓存。
 - `semantic_retriever.py`：M1 已通过统一检索层接入，不复制实现。
 
 ### 3. Tool Layer
 
-M2 已实现静态白名单 `ToolRegistry` 和四个只读、类型化、带版本/协作式超时/上限的工具：
+M2/M3 共用静态白名单 `ToolRegistry` 和五个只读、类型化、带版本/协作式超时/上限的工具：
 
 - `search_code@1`
 - `lookup_symbol@1`
 - `read_source@1`
 - `validate_evidence@1`
+- `expand_relations@1`
 
 `search_code` 包装 M1 hybrid/lexical 降级与 EvidenceBuilder；`lookup_symbol` 读取
 schema v4 `code_chunks` 定义；`read_source` 读取 SQLite `repo_files` 抓取快照；
 `validate_evidence` 复用 M1 CitationValidator。输入 schema 禁止额外字段，
 project/repository/revision 只从服务器上下文绑定。工具不得执行仓库代码、访问
 网络、修改目标仓库或接受仓库文本中的权限指令。
+
+`expand_relations` 只接受当前请求 Evidence 或绑定 revision 的 relation node，
+调用独立关系服务执行默认一跳、最大二跳的稳定 BFS；发现的 chunk 仍经统一
+EvidenceBuilder 和 CitationValidator，不创建第二套 citation。
 
 ### 4. Retrieval and Evidence
 
@@ -69,11 +75,27 @@ Goal -> Plan -> Tool Call -> Observation -> Complete
 后台线程。正式 `/ask` 默认进入 Agent Core，无 LLM/Planner 失败时回 M1
 deterministic fallback。
 
-### 6. Learning State
+M3 把新 edge/node/path/chain/Evidence 纳入进展判断和规范化 fingerprint。最终回答
+前后都验证 relation chain；关系在生成期间变化时丢弃关系依赖文本。无关系索引时
+保持 M2 retrieval-only，不让 `/ask` 整体失败。
+
+### 6. Static Relation Layer
+
+`relation_analysis.py` 从 SQLite snapshot 的 Python AST 抽取 imports、calls、
+references 和 defines，状态为 resolved、ambiguous、unresolved、external 或
+unsupported，并记录确定性 resolution rule。`relation_graph.py` 负责双向查询、
+有界 BFS、请求级 Evidence chain 和关系身份/内容复验。
+
+schema v5 的 `relation_nodes`、`code_relations`、`relation_index_runs` 全部绑定
+project/repository revision；node/edge ID 包含内容或 revision 身份。默认 depth 1、
+最大 2，且有 seed、neighbor、node、edge、path、Evidence 和字节硬上限。该层不
+宣称恢复运行时调用图。
+
+### 7. Learning State
 
 M4 新增版本化状态：repository/project/revision、学习目标、已读文件和符号、概念、掌握度及证据、未解决问题、当前路线、更新时间和 schema version。revision 改变时旧状态保留但证据重验；掌握度不能只靠模型主观更新。
 
-### 7. API、前端和可观测性
+### 8. API、前端和可观测性
 
 **代码事实**：`main.py` 当前同步分析并编排 M2 bounded Agent `/ask`；
 `qa_agent.py` 的 `answer_from_evidence()` 是 M1/M2 共用的最终强制校验与回答边界；
@@ -81,6 +103,7 @@ M4 新增版本化状态：repository/project/revision、学习目标、已读�
 React 仍是 V1 五标签页。
 
 `/ask` 保留旧请求和 M1/旧响应字段，M2 新增 agent schema/mode/status/trace/budget；
+M3 新增 relation schema、analysis mode、受限 Evidence chain 和 relation summary；
 `learning_agent.py` 到 M4 才接入状态；`main.py` 保持薄路由。前端逐步展示路径、
 符号、行号、模型、失败、降级和截断。日志只记 ID、耗时、状态、计数和错误类别，
 不记密钥、完整 Prompt 或完整源码。
@@ -141,6 +164,24 @@ remaining_steps / remaining_calls / remaining_tokens / remaining_time_ms
 
 `decision_summary` 只说明基于哪些观察选择行动，不记录隐藏推理。
 
+### RelationEdge / EvidenceChain
+
+```text
+RelationEdge:
+edge_id / project_id / repository_revision / relation_type
+source_node_id / source path+symbol+line+hash
+target_node_id? / target path+symbol+line+hash?
+raw_target_name / resolution_status / resolution_rule / language
+
+EvidenceChain:
+chain_id / request owner / project / repository_revision
+seed Evidence IDs / supporting Evidence IDs
+ordered node IDs / ordered edge IDs / relation types
+resolution_status / truncated / warnings
+```
+
+关系 path 不是 citation；最终 citation 仍只能来自 valid Evidence。
+
 ### LearningState
 
 ```text
@@ -171,6 +212,7 @@ updated_at / schema_version
 
 - M1 保持 `/ask` 请求 `{question}`，响应保留 `answer`、`citations`，新增字段可选。
 - 旧 citation 至少兼容一个发布周期，新客户端优先 Evidence。
-- V3 表/列以递增 schema version、幂等事务迁移增加，不破坏 schema v4。
+- M3 database schema 为 v5，保留并迁移 v4 数据；Evidence/Agent/relation API
+  schema 分别独立报告。
 - 每次迁移需旧库 fixture、迁移读写和恢复说明；不可逆变化前提供备份/导出。
 - 旧项目按需补索引；应用启动不得隐式下载模型或全库重算。

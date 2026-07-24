@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 from pathlib import PurePosixPath
 from typing import Any
@@ -98,6 +99,7 @@ def answer_from_evidence(
     warnings: list[str] | None = None,
     max_answer_tokens: int | None = None,
     answer_timeout_seconds: float | None = None,
+    relation_context: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Generate an M1-compatible answer after server-controlled validation.
 
@@ -125,6 +127,7 @@ def answer_from_evidence(
             llm,
             max_tokens=max_answer_tokens,
             timeout_seconds=answer_timeout_seconds,
+            relation_context=relation_context,
         )
         if (
             candidate_answer
@@ -165,7 +168,11 @@ def answer_from_evidence(
             grounding_status="insufficient_evidence",
         )
     if answer is None:
-        answer = _deterministic_grounded_answer(valid, llm_available=bool(llm and llm.available))
+        answer = _deterministic_grounded_answer(
+            valid,
+            llm_available=bool(llm and llm.available),
+            relation_context=relation_context,
+        )
 
     grounding_status = (
         "grounded" if retrieval_mode == "hybrid" else "degraded"
@@ -211,6 +218,7 @@ def _deterministic_grounded_answer(
     evidence: list[Evidence],
     *,
     llm_available: bool,
+    relation_context: list[dict[str, Any]] | None = None,
 ) -> str:
     lines = [
         "已找到并校验以下相关源码证据；当前只能确认这些源码直接事实："
@@ -221,6 +229,36 @@ def _deterministic_grounded_answer(
             f"- [{item.evidence_id}] `{symbol}` 位于 "
             f"`{item.path}:{item.start_line}-{item.end_line}`。"
         )
+    valid_ids = {item.evidence_id for item in evidence}
+    relation_items = [
+        item
+        for item in (relation_context or [])
+        if set(item.get("evidence_ids", [])).intersection(valid_ids)
+    ]
+    if relation_items:
+        lines.append("经程序复验的静态关系（不代表运行时一定执行）：")
+        for item in relation_items[:12]:
+            evidence_id = next(
+                (
+                    value
+                    for value in item.get("evidence_ids", [])
+                    if value in valid_ids
+                ),
+                None,
+            )
+            if evidence_id is None:
+                continue
+            target = item.get("target_symbol") or item.get("raw_target_name") or "未解析目标"
+            qualifier = (
+                "存在歧义，候选为"
+                if item.get("resolution_status") == "ambiguous"
+                else "静态解析为"
+            )
+            lines.append(
+                f"- [{evidence_id}] `{item.get('source_symbol') or item.get('source_path')}` "
+                f"通过 `{item.get('relation_type')}` {qualifier} `{target}`"
+                f"（规则 `{item.get('resolution_rule')}`）。"
+            )
     if not llm_available:
         lines.append("当前未配置可用的生成模型，因此未对源码行为作超出证据的推断。")
     else:
@@ -235,6 +273,7 @@ def _answer_with_grounded_llm(
     *,
     max_tokens: int | None = None,
     timeout_seconds: float | None = None,
+    relation_context: list[dict[str, Any]] | None = None,
 ) -> str | None:
     source_text = "\n\n".join(
         (
@@ -263,6 +302,10 @@ def _answer_with_grounded_llm(
                     "human-readable locations exactly as relative/path.py:start-end. "
                     "If Evidence is insufficient, say so; never invent a path, symbol, "
                     "line, runtime behavior, or missing repository fact."
+                    " A supplied relation summary is a program-validated static "
+                    "analysis result, not proof of runtime execution. Describe "
+                    "ambiguous relations only as candidates and cite supporting "
+                    "Evidence IDs."
                 ),
             },
             {
@@ -270,7 +313,14 @@ def _answer_with_grounded_llm(
                 "content": (
                     f"USER_QUESTION_BEGIN\n{question}\nUSER_QUESTION_END\n\n"
                     f"VALIDATED_UNTRUSTED_EVIDENCE_BEGIN\n{source_text}\n"
-                    "VALIDATED_UNTRUSTED_EVIDENCE_END"
+                    "VALIDATED_UNTRUSTED_EVIDENCE_END\n\n"
+                    "VALIDATED_STATIC_RELATION_SUMMARY_BEGIN\n"
+                    + json.dumps(
+                        relation_context or [],
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    )
+                    + "\nVALIDATED_STATIC_RELATION_SUMMARY_END"
                 ),
             },
         ],

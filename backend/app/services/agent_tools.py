@@ -13,6 +13,7 @@ from app.database import Database
 from app.services.agent_contracts import (
     AgentLimits,
     CancellationToken,
+    ExpandRelationsInput,
     LookupSymbolInput,
     ReadSourceInput,
     SearchCodeInput,
@@ -24,6 +25,11 @@ from app.services.agent_contracts import (
 from app.services.embedding_service import EmbeddingService
 from app.services.evidence import CitationValidator, Evidence, EvidenceBuilder
 from app.services.hybrid_retriever import HybridRetriever
+from app.services.relation_graph import (
+    EvidenceChainStore,
+    RelationGraphService,
+    RelationTraversalLimits,
+)
 
 
 ToolHandler = Callable[["ToolContext", BaseModel], tuple[Any, list[str], bool]]
@@ -87,6 +93,7 @@ class ToolContext:
     database: Database
     embedding_service: EmbeddingService
     evidence_store: EvidenceStore
+    chain_store: EvidenceChainStore
     limits: AgentLimits
     cancellation: CancellationToken
     deadline_monotonic: float
@@ -160,13 +167,24 @@ class ToolRegistry:
                 )
             results, warnings, handler_truncated = spec.handler(context, parameters)
             context.check_active()
+            handler_metrics: dict[str, int | float | str] = {}
+            if isinstance(results, dict):
+                results = dict(results)
+                raw_metrics = results.pop("_observation_metrics", {})
+                if isinstance(raw_metrics, dict):
+                    handler_metrics = {
+                        str(key): value
+                        for key, value in raw_metrics.items()
+                        if isinstance(value, (int, float, str))
+                    }
             serialized, size, serialization_truncated = _bounded_serialization(
                 results,
                 min(spec.max_bytes, context.limits.max_observation_bytes),
                 spec.max_results,
             )
-            duration_ms = int((time.monotonic() - started) * 1000)
-            if duration_ms > min(call.timeout_ms, spec.timeout_ms):
+            elapsed_ms = (time.monotonic() - started) * 1000
+            duration_ms = int(elapsed_ms)
+            if elapsed_ms >= min(call.timeout_ms, spec.timeout_ms):
                 return self._finish_error(
                     call,
                     started,
@@ -187,6 +205,7 @@ class ToolRegistry:
                     "result_count": _result_count(serialized),
                     "output_bytes": size,
                     "timeout_enforcement": "cooperative",
+                    **handler_metrics,
                 },
             )
         except KeyError:
@@ -239,6 +258,21 @@ class ToolRegistry:
 
 def build_m2_tool_registry(limits: AgentLimits) -> ToolRegistry:
     registry = ToolRegistry()
+    registry.register(
+        ToolSpec(
+            name="expand_relations",
+            version="1",
+            description=(
+                "Expand bounded static Python relations from request-owned "
+                "Evidence or bound symbol nodes."
+            ),
+            input_model=ExpandRelationsInput,
+            handler=_expand_relations,
+            timeout_ms=limits.default_tool_timeout_ms,
+            max_results=limits.max_relation_edges,
+            max_bytes=limits.max_relation_observation_bytes,
+        )
+    )
     registry.register(
         ToolSpec(
             name="search_code",
@@ -297,6 +331,7 @@ def build_tool_context(
     database: Database,
     embedding_service: EmbeddingService,
     evidence_store: EvidenceStore,
+    chain_store: EvidenceChainStore | None = None,
     limits: AgentLimits,
     cancellation: CancellationToken,
     deadline_monotonic: float,
@@ -305,7 +340,11 @@ def build_tool_context(
     project_id = str(project.get("id", ""))
     chunks = database.get_code_chunks(project_id)
     revisions = {str(chunk.get("repository_revision", "")) for chunk in chunks}
-    if len(revisions) != 1 or "" in revisions:
+    project_revision = str(project.get("repository_revision", ""))
+    if project_revision:
+        revisions.add(project_revision)
+    revisions.discard("")
+    if len(revisions) != 1:
         raise ValueError("project must have exactly one bound repository revision")
     repository_id = f"{project.get('owner', '')}/{project.get('repo', '')}".strip("/")
     return ToolContext(
@@ -318,6 +357,7 @@ def build_tool_context(
         database=database,
         embedding_service=embedding_service,
         evidence_store=evidence_store,
+        chain_store=chain_store or EvidenceChainStore(),
         limits=limits,
         cancellation=cancellation,
         deadline_monotonic=deadline_monotonic,
@@ -420,6 +460,17 @@ def _lookup_symbol(
             "end_line": int(chunk["end_line"]),
             "repository_revision": chunk["repository_revision"],
             "content_hash": chunk["content_hash"],
+            "relation_node_id": next(
+                (
+                    str(node["node_id"])
+                    for node in context.database.get_relation_nodes(
+                        context.project_id,
+                        context.repository_revision,
+                        code_chunk_ids=[int(chunk["id"])],
+                    )
+                ),
+                None,
+            ),
         }
         for _score, chunk in ranked[:limit]
     ]
@@ -506,6 +557,226 @@ def _validate_evidence(
     if forged:
         warnings.append("One or more Evidence IDs were rejected as unknown to this request.")
     return results, warnings, False
+
+
+def _expand_relations(
+    context: ToolContext,
+    parameters: BaseModel,
+) -> tuple[Any, list[str], bool]:
+    values = ExpandRelationsInput.model_validate(parameters)
+    context.check_active()
+    index_status = context.database.get_relation_index_status(
+        context.project_id, context.repository_revision
+    )
+    if index_status is None:
+        return (
+            {
+                "analysis_mode": "retrieval_only",
+                "relation_support": "unavailable",
+                "paths": [],
+                "nodes": [],
+                "edges": [],
+                "supporting_evidence_ids": [],
+                "evidence_chains": [],
+                "unresolved_count": 0,
+                "ambiguous_count": 0,
+                "external_count": 0,
+                "_observation_metrics": {
+                    "seed_count": 0,
+                    "node_count": 0,
+                    "edge_count": 0,
+                    "path_count": 0,
+                    "evidence_count": 0,
+                },
+            },
+            ["No relation index exists for the bound revision; retrieval-only mode used."],
+            False,
+        )
+
+    owned = context.evidence_store.get_many(
+        context.request_id, values.seed_evidence_ids
+    )
+    if len(owned) != len(set(values.seed_evidence_ids)):
+        raise ToolError("one or more Evidence seeds are not owned by this request")
+    evidence_nodes = context.database.get_relation_nodes(
+        context.project_id,
+        context.repository_revision,
+        code_chunk_ids=[item.code_chunk_id for item in owned],
+    )
+    symbol_nodes = context.database.get_relation_nodes(
+        context.project_id,
+        context.repository_revision,
+        node_ids=sorted(set(values.seed_symbol_ids)),
+    )
+    if len(symbol_nodes) != len(set(values.seed_symbol_ids)):
+        raise ToolError("one or more symbol seeds are outside the bound revision")
+    file_seed_nodes: list[dict[str, Any]] = []
+    if "imports" in values.relation_types:
+        seed_paths = {
+            item.path for item in owned
+        } | {str(item["path"]) for item in symbol_nodes}
+        for path in sorted(seed_paths):
+            file_seed_nodes.extend(
+                item
+                for item in context.database.get_relation_nodes(
+                    context.project_id,
+                    context.repository_revision,
+                    path=path,
+                )
+                if item["node_type"] == "file"
+            )
+    seed_node_ids = sorted(
+        {
+            str(item["node_id"])
+            for item in [*evidence_nodes, *symbol_nodes, *file_seed_nodes]
+        }
+    )
+    if not seed_node_ids:
+        raise ToolError("relation seeds did not resolve to indexed nodes")
+    if len(seed_node_ids) > context.limits.max_relation_seed_nodes:
+        raise ToolError("relation seed count exceeds server limit")
+
+    effective_depth = min(values.max_depth, context.limits.max_relation_depth)
+    effective_per_node = min(
+        values.per_node_limit, context.limits.max_relation_neighbors_per_node
+    )
+    traversal_limits = RelationTraversalLimits(
+        max_depth=context.limits.max_relation_depth,
+        per_node_limit=effective_per_node,
+        max_nodes=context.limits.max_relation_nodes,
+        max_edges=context.limits.max_relation_edges,
+        max_paths=context.limits.max_relation_paths,
+        max_output_bytes=context.limits.max_relation_observation_bytes,
+    )
+    traversal = RelationGraphService(context.database).expand(
+        project_id=context.project_id,
+        repository_revision=context.repository_revision,
+        seed_node_ids=seed_node_ids,
+        relation_types=list(values.relation_types),
+        direction=values.direction,
+        max_depth=effective_depth,
+        limits=traversal_limits,
+        check_active=context.check_active,
+    )
+
+    chunk_ids = sorted(
+        {
+            int(node["code_chunk_id"])
+            for node in traversal.nodes
+            if node.get("code_chunk_id") is not None
+        }
+    )[: context.limits.max_relation_evidence_items]
+    all_chunks = {
+        int(chunk["id"]): chunk
+        for chunk in context.database.get_code_chunks(context.project_id)
+        if str(chunk.get("repository_revision", ""))
+        == context.repository_revision
+    }
+    relation_chunks = [all_chunks[value] for value in chunk_ids if value in all_chunks]
+    built = EvidenceBuilder().build_from_code_chunks(
+        relation_chunks,
+        context.bundle.get("project") or {},
+    )
+    context.evidence_store.add(context.request_id, built)
+    evidence_by_chunk = {
+        item.code_chunk_id: item
+        for item in context.evidence_store.all(context.request_id)
+    }
+    supporting_ids = sorted(
+        {
+            evidence_by_chunk[chunk_id].evidence_id
+            for chunk_id in chunk_ids
+            if chunk_id in evidence_by_chunk
+        }
+    )
+    seed_ids = sorted(set(values.seed_evidence_ids))
+    edges_by_id = {str(item["edge_id"]): item for item in traversal.edges}
+    nodes_by_id = {str(item["node_id"]): item for item in traversal.nodes}
+    chains = []
+    for path in traversal.paths:
+        if not path.edge_ids or path.resolution_status not in {"resolved", "ambiguous"}:
+            continue
+        path_evidence_ids = sorted(
+            {
+                evidence_by_chunk[int(nodes_by_id[node_id]["code_chunk_id"])].evidence_id
+                for node_id in path.node_ids
+                if node_id in nodes_by_id
+                and nodes_by_id[node_id].get("code_chunk_id") is not None
+                and int(nodes_by_id[node_id]["code_chunk_id"]) in evidence_by_chunk
+            }
+        )
+        chain = context.chain_store.add(
+            owner_id=context.request_id,
+            project_id=context.project_id,
+            repository_revision=context.repository_revision,
+            seed_evidence_ids=seed_ids,
+            supporting_evidence_ids=path_evidence_ids,
+            path=path,
+            edges_by_id=edges_by_id,
+            truncated=traversal.truncated,
+            warnings=traversal.warnings,
+        )
+        chains.append(chain.public_summary())
+
+    node_summaries = [
+        {
+            "node_id": node["node_id"],
+            "node_type": node["node_type"],
+            "path": node["path"],
+            "qualified_name": node["qualified_name"],
+            "start_line": node["start_line"],
+            "end_line": node["end_line"],
+        }
+        for node in traversal.nodes
+    ]
+    edge_summaries = [
+        {
+            "edge_id": edge["edge_id"],
+            "relation_type": edge["relation_type"],
+            "source_node_id": edge["source_node_id"],
+            "target_node_id": edge["target_node_id"],
+            "source_line": edge["source_start_line"],
+            "resolution_status": edge["resolution_status"],
+            "resolution_rule": edge["resolution_rule"],
+        }
+        for edge in traversal.edges
+    ]
+    path_summaries = [
+        {
+            "node_ids": list(path.node_ids),
+            "edge_ids": list(path.edge_ids),
+            "path_depth": path.depth,
+            "resolution_status": path.resolution_status,
+        }
+        for path in traversal.paths
+    ]
+    warnings = [*index_status.get("warnings", []), *traversal.warnings]
+    return (
+        {
+            "analysis_mode": "relation_expanded",
+            "relation_support": (
+                "partial" if index_status["status"] == "partial" else "python_static"
+            ),
+            "paths": path_summaries,
+            "nodes": node_summaries,
+            "edges": edge_summaries,
+            "supporting_evidence_ids": supporting_ids,
+            "evidence_chains": chains,
+            "unresolved_count": traversal.unresolved_count,
+            "ambiguous_count": traversal.ambiguous_count,
+            "external_count": traversal.external_count,
+            "_observation_metrics": {
+                "duration_ms": traversal.duration_ms,
+                "seed_count": len(seed_node_ids),
+                "node_count": len(traversal.nodes),
+                "edge_count": len(traversal.edges),
+                "path_count": len(traversal.paths),
+                "evidence_count": len(supporting_ids),
+            },
+        },
+        list(dict.fromkeys(warnings)),
+        traversal.truncated,
+    )
 
 
 def _snapshot_file(context: ToolContext, path: str) -> dict[str, Any]:

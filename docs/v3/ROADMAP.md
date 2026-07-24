@@ -46,6 +46,13 @@ citation 和 M1 Evidence 字段保持。完成并提交 M2 后停止，M3 必须
 
 ## M3：关系扩展与多跳仓库分析
 
+**完成状态（2026-07-24）**：已在 `v3-agent-development` 实现 Python-only
+revision-bound imports/calls/references/defines、数据库 schema v5、稳定 node/edge
+身份、幂等关系索引、有界双向 BFS、`expand_relations@1`、请求级 Evidence chain、
+关系与 Citation 双重最终校验、正式 `/ask` 兼容字段及 20 条冻结工程场景。默认
+depth 1、硬上限 2；没有实现运行时调用图、完整类型/数据流、M4 或 M5。详细冻结
+决策见 `M3_DECISIONS.md`。
+
 **目标与 I/O**：输入 AST、import、代码块、符号、revision 和 Evidence；输出版本化调用/import/定义—引用关系及有限多跳 Evidence 图。
 
 **允许修改**：`analyzer.py`、`code_chunker.py` 的增量扩展或新关系服务、关系表/迁移、查询工具与必要 API。
@@ -54,7 +61,9 @@ citation 和 M1 Evidence 字段保持。完成并提交 M2 后停止，M3 必须
 
 **测试**：同/跨文件调用、alias import、方法、未解析/多候选目标、循环、深度/节点预算、revision 隔离和跨文件 Evidence。
 
-**量化验收**：冻结 Python fixture 静态边 precision >= 0.90、recall >= 0.75；默认深度 <= 2；预算 100% 生效；跨文件 Recall@10 比 M1 提升至少 10 个百分点且引用有效率 100%。
+**量化验收**：按 M3 开发指令冻结的 20 条确定性场景，exact/resolvable call edge
+precision/recall 均为 100%，bounded gold path 找回率 100%，预算和引用校验 100%
+生效；这些结果不外推到真实 Python 生态或真实模型。
 
 **兼容/回滚/出口**：关系表新增并绑定 revision；M1 不依赖关系表；开关关闭回 M2/M1。误差分类和图预算通过后进 M4。
 
