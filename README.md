@@ -56,6 +56,7 @@ GitLearnAgent 的目标是把一个 GitHub 开源仓库转化为一套适合初�
 | 源码问答 | 根据已抓取源码进行检索式问答，并返回引用文件和代码片段。 |
 | 报告导出 | 生成 Markdown 格式的项目学习报告。 |
 | 可选大模型增强 | 配置 `LLM_API_KEY` 后，可使用 OpenAI 兼容模型增强部分自然语言表达。未配置时仍可运行。 |
+| 可复现实验 | M5 CLI 可在固定真实仓库 revision 上验证数据集并运行隔离的 fake/live provider 对照；默认关闭。 |
 
 ## 技术栈
 
@@ -203,6 +204,17 @@ EMBEDDING_QUERY_PREFIX=
 EMBEDDING_DOCUMENT_PREFIX=
 VITE_API_BASE_URL=http://127.0.0.1:8000
 ```
+
+M5 评测默认不会联网、加载模型或调用付费接口。完整协议见
+`docs/v3/M5_EVALUATION_PROTOCOL.md`；从 `backend` 可先执行：
+
+```powershell
+python -B -m app.m5 list-modes
+python -B -m app.m5 validate --dataset ..\benchmarks\m5\datasets\pilot-v1 --repository-root <只读仓库根目录>
+```
+
+真实调用必须额外使用 `--live`，并在本地环境中显式设置相应 `M5_ALLOW_*` gate。不要在命令
+或聊天中粘贴 API key。正常 FastAPI 启动与旧 `/ask` 行为不受 M5 CLI 影响。
 
 启用 BGE-M3 前，请先在后端 Python 环境中安装 `sentence-transformers`
 和兼容的 PyTorch。系统不会在应用启动时自动加载模型；只有

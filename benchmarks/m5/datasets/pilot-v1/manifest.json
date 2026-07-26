@@ -1,0 +1,11 @@
+{
+  "benchmark_schema_version": 1,
+  "metric_schema_version": 1,
+  "dataset_version": "pilot-v1",
+  "title": "RepoNoesis M5 real-repository pilot",
+  "repositories_file": "repositories.json",
+  "scenarios_file": "scenarios.jsonl",
+  "sequences_file": "sequences.jsonl",
+  "annotation_status": "agent_curated_pending_human_review",
+  "minimum_scenarios": 36
+}

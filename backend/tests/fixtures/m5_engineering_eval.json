@@ -1,0 +1,29 @@
+{
+  "dataset_version": "m5-engineering-v1",
+  "scenarios": [
+    {"id": "provider-01-real-disabled", "category": "provider", "expected": "rejected"},
+    {"id": "provider-02-secret-redaction", "category": "provider", "expected": "redacted"},
+    {"id": "provider-03-call-budget", "category": "provider", "expected": "bounded"},
+    {"id": "provider-04-invalid-evaluator", "category": "provider", "expected": "ungradable"},
+    {"id": "dataset-01-valid", "category": "dataset", "expected": "valid"},
+    {"id": "dataset-02-path-traversal", "category": "dataset", "expected": "rejected"},
+    {"id": "dataset-03-cross-revision", "category": "dataset", "expected": "rejected"},
+    {"id": "dataset-04-unknown-field", "category": "dataset", "expected": "rejected"},
+    {"id": "runner-01-stable-identity", "category": "runner", "expected": "stable"},
+    {"id": "runner-02-atomic-checkpoint", "category": "runner", "expected": "atomic"},
+    {"id": "runner-03-corrupt-checkpoint", "category": "runner", "expected": "rejected"},
+    {"id": "runner-04-resume-success", "category": "runner", "expected": "not_repeated"},
+    {"id": "runner-05-deterministic-order", "category": "runner", "expected": "stable"},
+    {"id": "mode-01-fixed-no-planner", "category": "mode", "expected": "isolated"},
+    {"id": "mode-02-m2-no-relation", "category": "mode", "expected": "isolated"},
+    {"id": "mode-03-m3-no-learning", "category": "mode", "expected": "isolated"},
+    {"id": "mode-04-m4-learning-once", "category": "mode", "expected": "isolated"},
+    {"id": "metrics-01-hit-mrr-ndcg", "category": "metrics", "expected": "exact"},
+    {"id": "metrics-02-failed-denominator", "category": "metrics", "expected": "excluded"},
+    {"id": "metrics-03-bootstrap", "category": "metrics", "expected": "reproducible"},
+    {"id": "metrics-04-unknown-cost", "category": "metrics", "expected": "unknown"},
+    {"id": "safety-01-prompt-mode", "category": "safety", "expected": "server_bound"},
+    {"id": "safety-02-no-target-execution", "category": "safety", "expected": 0},
+    {"id": "safety-03-no-shell-validator-bypass", "category": "safety", "expected": 0}
+  ]
+}

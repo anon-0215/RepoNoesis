@@ -228,3 +228,24 @@ derived projection / update rule version / updated_at
   schema 分别独立报告。
 - 每次迁移需旧库 fixture、迁移读写和恢复说明；不可逆变化前提供备份/导出。
 - 旧项目按需补索引；应用启动不得隐式下载模型或全库重算。
+
+## M5 隔离评测平面
+
+M5 是默认不加载的 CLI 评测平面，不新增生产路由或数据库迁移：
+
+```text
+versioned dataset -> strict validator -> fixed local snapshot
+-> existing analyzer/chunker/relation/embedding index
+-> existing retriever or run_bounded_agent
+-> existing CitationValidator/RelationValidator
+-> deterministic metrics -> atomic checkpoint/result/report
+```
+
+fixed 模式直接复用 `LexicalRetriever`、`SemanticRetriever`、`HybridRetriever`、
+`EvidenceBuilder` 和 `answer_from_evidence`。Agent 模式向唯一 `ToolRegistry` 传入服务器定义的
+受限视图；benchmark 输入不能注册工具或关闭 validator。adaptive sequence 在 run 目录内的
+独立 SQLite 中调用正式 `LearningService`，不接触生产 learner。
+
+真实 provider 只通过 CLI `--live` 加环境 gate 启用；正常 FastAPI 启动不会运行 benchmark、
+加载 M5 模型、访问外部仓库或写 artifacts。生产 database schema 保持 v6；独立
+benchmark/metric schema 均为 1。

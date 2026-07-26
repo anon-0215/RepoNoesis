@@ -88,17 +88,24 @@ rubric、bounded attempt、validated evaluation、immutable event、deterministi
 
 **兼容/回滚/出口**：旧 `learning_steps` 保留；新状态用新表；关闭动态路线回固定五阶段且不删事件。迁移与隐私通过后进 M5。
 
-## M5：评测、前端呈现与完整验收
+## M5：真实集成、可复现实验与对照评测
 
-**目标与 I/O**：输入 M1—M4、冻结集和对照配置；输出质量/检索/Agent/学习报告、消融、证据 UI 和最终演示。
+**实现状态（2026-07-26）**：已增量建立默认关闭的 provider/benchmark infrastructure、
+3 个固定真实 Python 仓库、36 场景 pilot-v1、6 条 adaptive sequence、严格 validator、
+7 种模式、原子 checkpoint/resume、确定性指标和 24 条离线冻结场景。生产数据库保持 v6，
+前端未修改。真实 BGE-M3/LLM/evaluator/live pilot 必须通过显式 gate；未完成时只称
+infrastructure complete、live validation incomplete。详见 `M5_DECISIONS.md` 和
+`M5_EVALUATION_PROTOCOL.md`。
 
-**允许修改**：评测 harness/fixtures、报告、`frontend/src`、展示 API、文档和演示脚本；只修复验收缺陷。
+**目标与 I/O**：输入 M1—M4、固定真实 revision、provider 和对照配置；输出可恢复结构化结果、质量/检索/Agent/学习指标与诚实的消融报告。
+
+**允许修改**：provider adapter、评测 harness/fixtures、隔离存储、报告、配置示例和文档；本轮不修改前端。
 
 **不属于 M5**：新核心方向、完整多语言、仓库执行、云多用户、模型训练。
 
 **测试**：指标计算、数据校验、前端状态；分析—索引—问答—Agent—状态—报告 E2E，覆盖加载、失败、降级、取消、revision。
 
-**量化验收**：M1—M4 门槛保持；引用有效率 100%；关键 UI 状态 E2E 覆盖 100%；Direct LLM、semantic-only、无关系扩展等消融各至少一次；Agent 完成率 >= 80%；完整后端测试和前端构建通过。
+**量化验收**：M1—M4 门槛保持；24 条冻结工程场景 100%；真实 gate 结果与 fake 严格区分；失败样本、调用、token、unknown cost 和置信区间可追溯。真实 gate 未完成不得宣称完整 M5。
 
 **兼容/回滚/完成**：UI 兼容旧响应；feature flag 可回旧五标签页；迁移有恢复说明。全部门槛、演示、限制和可复现报告通过后才称 V3 完整验收。
 

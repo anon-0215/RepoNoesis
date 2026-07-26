@@ -34,3 +34,4 @@ embedding_cache/
 tmp/
 temp/
 .tmp/
+artifacts/m5/

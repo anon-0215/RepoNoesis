@@ -1,0 +1,124 @@
+{
+  "$defs": {
+    "AnalysisConfiguration": {
+      "additionalProperties": false,
+      "properties": {
+        "include_globs": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Include Globs",
+          "type": "array"
+        },
+        "maximum_file_bytes": {
+          "default": 250000,
+          "maximum": 1000000,
+          "minimum": 1,
+          "title": "Maximum File Bytes",
+          "type": "integer"
+        },
+        "maximum_files": {
+          "default": 1500,
+          "maximum": 5000,
+          "minimum": 1,
+          "title": "Maximum Files",
+          "type": "integer"
+        }
+      },
+      "title": "AnalysisConfiguration",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "repo_id": {
+      "pattern": "^[a-z0-9][a-z0-9_-]{1,63}$",
+      "title": "Repo Id",
+      "type": "string"
+    },
+    "display_name": {
+      "maxLength": 120,
+      "minLength": 1,
+      "title": "Display Name",
+      "type": "string"
+    },
+    "source_url": {
+      "maxLength": 500,
+      "minLength": 1,
+      "title": "Source Url",
+      "type": "string"
+    },
+    "license": {
+      "maxLength": 120,
+      "minLength": 1,
+      "title": "License",
+      "type": "string"
+    },
+    "language": {
+      "const": "python",
+      "title": "Language",
+      "type": "string"
+    },
+    "exact_commit_sha": {
+      "pattern": "^[0-9a-f]{40}$",
+      "title": "Exact Commit Sha",
+      "type": "string"
+    },
+    "default_branch": {
+      "maxLength": 200,
+      "minLength": 1,
+      "title": "Default Branch",
+      "type": "string"
+    },
+    "acquisition_method": {
+      "enum": [
+        "shallow_clone",
+        "local_existing"
+      ],
+      "title": "Acquisition Method",
+      "type": "string"
+    },
+    "checkout_name": {
+      "pattern": "^[A-Za-z0-9._-]+$",
+      "title": "Checkout Name",
+      "type": "string"
+    },
+    "content_fingerprint": {
+      "pattern": "^sha256:[0-9a-f]{64}$",
+      "title": "Content Fingerprint",
+      "type": "string"
+    },
+    "analysis_configuration": {
+      "$ref": "#/$defs/AnalysisConfiguration"
+    },
+    "excluded_paths": {
+      "items": {
+        "type": "string"
+      },
+      "maxItems": 100,
+      "title": "Excluded Paths",
+      "type": "array"
+    },
+    "annotation_status": {
+      "const": "agent_curated_pending_human_review",
+      "title": "Annotation Status",
+      "type": "string"
+    }
+  },
+  "required": [
+    "repo_id",
+    "display_name",
+    "source_url",
+    "license",
+    "language",
+    "exact_commit_sha",
+    "default_branch",
+    "acquisition_method",
+    "checkout_name",
+    "content_fingerprint",
+    "analysis_configuration",
+    "annotation_status"
+  ],
+  "title": "RepositorySpec",
+  "type": "object"
+}

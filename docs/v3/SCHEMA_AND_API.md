@@ -75,6 +75,25 @@ CitationValidator；旧 revision Evidence 不能进入当前 response citation�
 API 不返回 learner ID、完整 event log、全部答案、raw evaluator/Planner output、聊天、
 私有思维、SQL 行主键、绝对路径、完整源码、其他 learner 数据或无效 Evidence。
 
+## M5 benchmark schema（非生产 API）
+
+M5 没有新增生产 HTTP 字段。`benchmarks/m5/schemas` 发布 manifest、repository、scenario 和
+adaptive sequence 的 JSON Schema；全部 `extra=forbid`。稳定 gold identity 是 repository
+revision、POSIX path、qualified symbol、source span、content hash 和 relation identity，不能
+使用运行时 Evidence ID。
+
+run artifacts 使用独立版本：
+
+```text
+benchmark_schema_version = 1
+metric_schema_version = 1
+checkpoint_schema_version = 1
+```
+
+run ID 绑定 dataset/revision/config/provider/model/prompt/metric/evaluator/source tree。checkpoint
+记录 checksum 并原子替换；safe config 对 secret 和本机根路径脱敏。以上文件不写入 SQLite
+v6，不由 `/ask` 用户输入控制，也不提交到 Git。
+
 ## `get_learning_context@1`
 
 输入为空 JSON `{}`，未知字段拒绝。输出最多 16 states、8 recent verified outcomes、

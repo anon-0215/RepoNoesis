@@ -1,0 +1,65 @@
+{
+  "additionalProperties": false,
+  "properties": {
+    "benchmark_schema_version": {
+      "const": 1,
+      "default": 1,
+      "title": "Benchmark Schema Version",
+      "type": "integer"
+    },
+    "metric_schema_version": {
+      "const": 1,
+      "default": 1,
+      "title": "Metric Schema Version",
+      "type": "integer"
+    },
+    "dataset_version": {
+      "maxLength": 80,
+      "minLength": 1,
+      "title": "Dataset Version",
+      "type": "string"
+    },
+    "title": {
+      "maxLength": 200,
+      "minLength": 1,
+      "title": "Title",
+      "type": "string"
+    },
+    "repositories_file": {
+      "const": "repositories.json",
+      "default": "repositories.json",
+      "title": "Repositories File",
+      "type": "string"
+    },
+    "scenarios_file": {
+      "const": "scenarios.jsonl",
+      "default": "scenarios.jsonl",
+      "title": "Scenarios File",
+      "type": "string"
+    },
+    "sequences_file": {
+      "const": "sequences.jsonl",
+      "default": "sequences.jsonl",
+      "title": "Sequences File",
+      "type": "string"
+    },
+    "annotation_status": {
+      "const": "agent_curated_pending_human_review",
+      "title": "Annotation Status",
+      "type": "string"
+    },
+    "minimum_scenarios": {
+      "default": 36,
+      "minimum": 36,
+      "title": "Minimum Scenarios",
+      "type": "integer"
+    }
+  },
+  "required": [
+    "dataset_version",
+    "title",
+    "annotation_status"
+  ],
+  "title": "DatasetManifest",
+  "type": "object"
+}
