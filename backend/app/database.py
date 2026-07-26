@@ -11,9 +11,11 @@ import uuid
 from pathlib import Path
 from typing import Any, Sequence
 
+from app.learning_schema import LEARNING_SCHEMA_STATEMENTS
+
 
 DEFAULT_DB_PATH = Path(__file__).resolve().parents[1] / "data" / "gitlearn.sqlite"
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 
 SCHEMA = """
@@ -317,6 +319,25 @@ class Database:
                 model_name, model_revision, text_format_version,
                 embedding_config_hash, normalized, content_hash
             )
+            """
+        )
+        for statement in LEARNING_SCHEMA_STATEMENTS:
+            conn.execute(statement)
+        learning_event_columns = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(learning_events)").fetchall()
+        }
+        if "event_order" not in learning_event_columns:
+            conn.execute(
+                "ALTER TABLE learning_events ADD COLUMN event_order INTEGER NOT NULL DEFAULT 0"
+            )
+            conn.execute(
+                "UPDATE learning_events SET event_order = rowid WHERE event_order = 0"
+            )
+        conn.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_learning_events_target_order
+            ON learning_events (learner_id, project_id, target_id, event_order)
             """
         )
 

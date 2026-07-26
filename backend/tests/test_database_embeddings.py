@@ -236,7 +236,7 @@ class DatabaseEmbeddingTests(unittest.TestCase):
 
             self.assertIn("embedding_input_hash", columns)
             self.assertIn("embedding_config_hash", columns)
-            self.assertEqual(version, 5)
+            self.assertEqual(version, 6)
 
     def test_saves_and_reads_float32_vector_blob(self):
         with tempfile.TemporaryDirectory() as directory:

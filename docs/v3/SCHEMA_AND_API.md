@@ -4,57 +4,85 @@
 
 | 契约 | 当前版本 |
 | --- | ---: |
-| SQLite database schema | 5 |
+| SQLite database schema | 6 |
 | Evidence schema | 1 |
 | Agent schema | 1 |
 | Relation API schema | 1 |
+| Learning API schema | 1 |
 
-版本互相独立，不能用 database v5 代替 Evidence/Agent/relation API 版本。
+版本互相独立。database v6 不代表 Evidence、Agent、relation 或 learning API 的版本。
 
-## SQLite v5
+## SQLite v6
 
-v5 保留 v4 的 `projects`、`repo_files`、`modules`、`learning_steps`、
-`chat_answers`、`code_chunks` 和 `code_chunk_embeddings` 数据。`projects` 新增
-`repository_revision`；新增 `relation_nodes`、`code_relations` 和
-`relation_index_runs`。正式字段、稳定身份、索引、迁移与生命周期见
-`M3_DECISIONS.md`。
+v6 保留 v5 的全部 M1/M2/M3 表和数据，新增 `learner_profiles`、`learning_goals`、
+`learning_targets`、`learning_plans`、`learning_plan_steps`、
+`learning_step_prerequisites`、`learning_tasks`、`learning_task_evidence`、
+`learning_rubric_criteria`、`learning_attempts`、`learning_evaluations`、
+`learning_events` 和 `learner_target_states`。正式字段、索引、触发器和状态规则见
+`M4_DECISIONS.md`。
 
 ## `/api/projects/{project_id}/ask`
 
-请求兼容：
+旧请求保持兼容：
 
 ```json
 {"question": "函数 a 跨文件调用了什么？"}
 ```
 
-可选的 M1 filter 仍为 `path`、`language`、`symbol`、`evidence_count`；没有新增
-关系预算或 project/revision 参数。
+M1 filter `path`、`language`、`symbol`、`evidence_count` 仍是可选字段；不接受 learner、
+project、repository、revision、图预算或学习预算。
 
-响应保留：
-
-```text
-answer / citations
-evidence_schema_version / evidence / grounding_status / retrieval_mode / warnings
-agent_schema_version / agent_mode / agent_status / agent_trace / budget_usage
-```
-
-M3 新增：
+响应继续保留 M1/M2/M3 字段，并新增：
 
 ```text
-relation_schema_version = 1
-analysis_mode = retrieval_only | relation_expanded
-evidence_chains[]
-relation_summary
+learning_schema_version = 1
+learning_mode = disabled | profiled | adaptive | degraded
+learning_context_summary {
+  goal_id, plan_version, current_step, explanation_depth,
+  demonstrated_target_count, mastered_target_count, needs_review_count
+}
+learning_plan_summary {
+  plan_id, version, status, current_step_id,
+  completed_step_count, remaining_step_count, adapted, adaptation_reason
+}
+recommended_next_action
+learning_warnings[]
 ```
 
-`evidence_chains[]` 只公开 chain ID、relation types、path length、seed/supporting
-Evidence IDs、resolution status 和 truncated。它不公开完整图、内部 SQL、绝对路径、
-源码、Planner prompt/output 或其他请求数据。
+学习摘要不是源码 Evidence。最终源码事实仍必须通过 RelationValidator 和
+CitationValidator；旧 revision Evidence 不能进入当前 response citation。
+
+## Learning API
+
+所有 learner identity 均由服务器绑定为 local single user。mutation request 使用
+`extra=forbid`，并带 8—120 字符的 client idempotency key。
+
+| 方法 | 路径 | 能力 |
+| --- | --- | --- |
+| POST/GET | `/api/projects/{project_id}/learning/goals` | 创建或列出 goal |
+| PATCH | `/api/projects/{project_id}/learning/goals/{goal_id}` | active/completed/cancelled |
+| POST | `/api/projects/{project_id}/learning/plans` | 按 expected version 创建 plan |
+| GET | `/api/projects/{project_id}/learning/plans/current` | 当前 plan/version/steps |
+| GET | `/api/projects/{project_id}/learning/state` | 受限 target state |
+| POST | `/api/projects/{project_id}/learning/tasks` | 创建 Evidence/rubric 绑定 task |
+| GET | `/api/projects/{project_id}/learning/tasks/{task_id}` | 读取受限 task |
+| POST | `/api/projects/{project_id}/learning/tasks/{task_id}/attempts` | 提交 bounded attempt |
+| POST | `/api/projects/{project_id}/learning/self-reports` | explicit self-report |
+| POST | `/api/projects/{project_id}/learning/events/{event_id}/corrections` | append correction event |
+| GET | `/api/projects/{project_id}/learning/next-action` | 推荐下一动作 |
+| POST | `/api/projects/{project_id}/learning/revalidate` | 当前 revision 重验证 |
+
+API 不返回 learner ID、完整 event log、全部答案、raw evaluator/Planner output、聊天、
+私有思维、SQL 行主键、绝对路径、完整源码、其他 learner 数据或无效 Evidence。
+
+## `get_learning_context@1`
+
+输入为空 JSON `{}`，未知字段拒绝。输出最多 16 states、8 recent verified outcomes、
+12 plan steps 和 16,384 bytes；每次 Agent run 最多调用一次并计入原 step/call/time/
+observation budget。输出只用于教学深度和下一步建议。
 
 ## analyze 与 health
 
-`POST /api/projects/analyze` 可返回受限 `relation_index` 摘要。关系索引失败时分析数据
-仍保存，摘要为 warning。
-
-`GET /api/health` 的 `database_schema_version=5` 只表示 SQLite schema，不表示
-关系覆盖完整或真实运行时行为。
+`POST /api/projects/analyze` 的 M3 relation index 行为不变。`GET /api/health` 的
+`database_schema_version=6` 只表示 SQLite schema，不表示 relation coverage、learning
+profile 完整、真实 evaluator 质量或用户教学效果。

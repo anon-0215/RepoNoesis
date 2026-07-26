@@ -69,6 +69,13 @@ precision/recall 均为 100%，bounded gold path 找回率 100%，预算和引�
 
 ## M4：长期学习状态与自适应引导
 
+**完成状态（2026-07-26）**：已在 `v3-agent-development` 实现 database schema v6、
+local-single-user identity、结构化 goal、versioned plan/DAG step、revision-bound task 与
+rubric、bounded attempt、validated evaluation、immutable event、deterministic projection、
+路线适配、revision 重验证、跨进程恢复、`get_learning_context@1` 和 `/ask` M4 兼容字段。
+24 条冻结工程场景全部通过；没有实现完整前端、多租户、真实用户实验或 M5。详细决策见
+`M4_DECISIONS.md`。
+
 **目标与 I/O**：输入学习目标、验证阅读/问答/练习事件和 revision；输出 LearningState、掌握证据、问题和动态路线。
 
 **允许修改**：`learning_agent.py`、learning state/event 服务、数据库迁移、学习 API 和前端工作台。

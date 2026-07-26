@@ -5,7 +5,7 @@ from typing import Any, Literal
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from app.config import (
     get_agent_limits,
@@ -21,6 +21,16 @@ from app.services.embedding_indexer import EmbeddingIndexer
 from app.services.embedding_service import EmbeddingService
 from app.services.github_client import fetch_repository
 from app.services.learning_agent import build_learning_path
+from app.services.learning_contracts import (
+    CreateGoalRequest,
+    CreatePlanRequest,
+    CreateTaskRequest,
+    EvaluationCorrectionRequest,
+    GoalStatusRequest,
+    SelfReportRequest,
+    SubmitAttemptRequest,
+)
+from app.services.learning_service import LearningError, LearningService
 from app.services.llm_client import LLMClient
 from app.services.report import generate_report
 from app.services.relation_analysis import index_project_relations
@@ -39,6 +49,7 @@ app.add_middleware(
 
 db = Database()
 llm = LLMClient()
+learning_service = LearningService(db, llm)
 embedding_service = EmbeddingService(get_embedding_settings())
 agent_limits = get_agent_limits()
 
@@ -125,6 +136,22 @@ class AskResponse(BaseModel):
     analysis_mode: Literal["retrieval_only", "relation_expanded"]
     evidence_chains: list[EvidenceChainResponse]
     relation_summary: dict[str, Any]
+    learning_schema_version: Literal[1]
+    learning_mode: Literal["disabled", "profiled", "adaptive", "degraded"]
+    learning_context_summary: dict[str, Any]
+    learning_plan_summary: dict[str, Any]
+    recommended_next_action: dict[str, Any] | None
+    learning_warnings: list[str]
+
+
+class LearningResponse(BaseModel):
+    model_config = ConfigDict(extra="allow")
+    learning_schema_version: Literal[1]
+
+
+class LearningListResponse(BaseModel):
+    learning_schema_version: Literal[1]
+    items: list[dict[str, Any]]
 
 
 @app.get("/api/health")
@@ -263,6 +290,7 @@ def get_learning_path(project_id: str) -> dict[str, Any]:
 @app.post("/api/projects/{project_id}/ask", response_model=AskResponse)
 def ask_project(project_id: str, request: AskRequest) -> dict[str, Any]:
     bundle = _bundle_or_404(project_id)
+    learning_context = learning_service.get_learning_context(project_id)
     result = run_bounded_agent(
         request.question,
         bundle,
@@ -274,9 +302,148 @@ def ask_project(project_id: str, request: AskRequest) -> dict[str, Any]:
         symbol=request.symbol,
         evidence_count=request.evidence_count,
         limits=agent_limits,
+        learning_context=learning_context,
     )
     db.save_chat_answer(project_id, request.question, result["answer"], result["citations"])
     return result
+
+
+@app.post(
+    "/api/projects/{project_id}/learning/goals",
+    response_model=LearningResponse,
+)
+def create_learning_goal(
+    project_id: str, request: CreateGoalRequest
+) -> dict[str, Any]:
+    return _learning_call(learning_service.create_goal, project_id, request)
+
+
+@app.get(
+    "/api/projects/{project_id}/learning/goals",
+    response_model=LearningListResponse,
+)
+def get_learning_goals(project_id: str) -> dict[str, Any]:
+    items = _learning_call(learning_service.get_goals, project_id)
+    return {"learning_schema_version": 1, "items": items}
+
+
+@app.patch(
+    "/api/projects/{project_id}/learning/goals/{goal_id}",
+    response_model=LearningResponse,
+)
+def update_learning_goal(
+    project_id: str, goal_id: str, request: GoalStatusRequest
+) -> dict[str, Any]:
+    return _learning_call(
+        learning_service.set_goal_status, project_id, goal_id, request.status
+    )
+
+
+@app.post(
+    "/api/projects/{project_id}/learning/plans",
+    response_model=LearningResponse,
+)
+def create_learning_plan(
+    project_id: str, request: CreatePlanRequest
+) -> dict[str, Any]:
+    return _learning_call(learning_service.create_plan, project_id, request)
+
+
+@app.get(
+    "/api/projects/{project_id}/learning/plans/current",
+    response_model=LearningResponse | None,
+)
+def get_current_learning_plan(
+    project_id: str, goal_id: str | None = None
+) -> dict[str, Any] | None:
+    return _learning_call(
+        learning_service.get_current_plan, project_id, goal_id
+    )
+
+
+@app.get(
+    "/api/projects/{project_id}/learning/state",
+    response_model=LearningListResponse,
+)
+def get_learner_state(project_id: str) -> dict[str, Any]:
+    items = _learning_call(learning_service.get_states, project_id)
+    return {"learning_schema_version": 1, "items": items}
+
+
+@app.post(
+    "/api/projects/{project_id}/learning/tasks",
+    response_model=LearningResponse,
+)
+def create_learning_task(
+    project_id: str, request: CreateTaskRequest
+) -> dict[str, Any]:
+    return _learning_call(learning_service.create_task, project_id, request)
+
+
+@app.get(
+    "/api/projects/{project_id}/learning/tasks/{task_id}",
+    response_model=LearningResponse,
+)
+def get_learning_task(project_id: str, task_id: str) -> dict[str, Any]:
+    return _learning_call(learning_service.get_task, project_id, task_id)
+
+
+@app.post(
+    "/api/projects/{project_id}/learning/tasks/{task_id}/attempts",
+    response_model=LearningResponse,
+)
+def submit_learning_attempt(
+    project_id: str, task_id: str, request: SubmitAttemptRequest
+) -> dict[str, Any]:
+    return _learning_call(
+        learning_service.submit_attempt, project_id, task_id, request
+    )
+
+
+@app.post(
+    "/api/projects/{project_id}/learning/events/{event_id}/corrections",
+    response_model=LearningResponse,
+)
+def correct_learning_evaluation(
+    project_id: str, event_id: str, request: EvaluationCorrectionRequest
+) -> dict[str, Any]:
+    return _learning_call(
+        learning_service.correct_evaluation, project_id, event_id, request
+    )
+
+
+@app.post(
+    "/api/projects/{project_id}/learning/self-reports",
+    response_model=LearningResponse,
+)
+def submit_learning_self_report(
+    project_id: str, request: SelfReportRequest
+) -> dict[str, Any]:
+    return _learning_call(
+        learning_service.submit_self_report, project_id, request
+    )
+
+
+@app.get(
+    "/api/projects/{project_id}/learning/next-action",
+    response_model=LearningResponse,
+)
+def get_recommended_learning_action(project_id: str) -> dict[str, Any]:
+    context = learning_service.get_learning_context(project_id)
+    return {
+        "learning_schema_version": 1,
+        "learning_mode": context["learning_mode"],
+        "recommended_next_action": context.get("recommended_next_action"),
+        "warnings": context.get("warnings", []),
+    }
+
+
+@app.post(
+    "/api/projects/{project_id}/learning/revalidate",
+    response_model=LearningResponse,
+)
+def revalidate_learning_state(project_id: str) -> dict[str, Any]:
+    return _learning_call(learning_service.revalidate_project, project_id)
 
 
 @app.get("/api/projects/{project_id}/report")
@@ -290,3 +457,10 @@ def _bundle_or_404(project_id: str) -> dict[str, Any]:
     if not bundle:
         raise HTTPException(status_code=404, detail="项目不存在")
     return bundle
+
+
+def _learning_call(function: Any, *args: Any) -> Any:
+    try:
+        return function(*args)
+    except LearningError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc

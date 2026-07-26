@@ -63,6 +63,10 @@ class M2ContractTests(unittest.TestCase):
                 "max_relation_paths": 24,
                 "max_relation_observation_bytes": 65536,
                 "max_relation_evidence_items": 16,
+                "max_learning_state_items": 16,
+                "max_recent_learning_events": 8,
+                "max_plan_steps_in_learning_context": 12,
+                "max_learning_context_bytes": 16384,
             },
         )
 

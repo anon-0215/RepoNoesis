@@ -88,6 +88,7 @@ class M2ToolTests(unittest.TestCase):
             [item["name"] for item in tools],
             [
                 "expand_relations",
+                "get_learning_context",
                 "lookup_symbol",
                 "read_source",
                 "search_code",

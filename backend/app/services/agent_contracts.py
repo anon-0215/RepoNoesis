@@ -41,6 +41,10 @@ class AgentLimits:
     max_relation_paths: int = 24
     max_relation_observation_bytes: int = 65_536
     max_relation_evidence_items: int = 16
+    max_learning_state_items: int = 16
+    max_recent_learning_events: int = 8
+    max_plan_steps_in_learning_context: int = 12
+    max_learning_context_bytes: int = 16_384
 
 
 class StrictModel(BaseModel):
@@ -88,6 +92,10 @@ class ExpandRelationsInput(StrictModel):
         if not self.seed_evidence_ids and not self.seed_symbol_ids:
             raise ValueError("at least one relation seed is required")
         return self
+
+
+class GetLearningContextInput(StrictModel):
+    pass
 
 
 class PlannerDecision(StrictModel):

@@ -134,6 +134,18 @@ def get_agent_limits() -> AgentLimits:
         max_relation_evidence_items=_bounded_env_int(
             "AGENT_MAX_RELATION_EVIDENCE", 16, 1, 16
         ),
+        max_learning_state_items=_bounded_env_int(
+            "AGENT_MAX_LEARNING_STATE_ITEMS", 16, 1, 16
+        ),
+        max_recent_learning_events=_bounded_env_int(
+            "AGENT_MAX_RECENT_LEARNING_EVENTS", 8, 1, 8
+        ),
+        max_plan_steps_in_learning_context=_bounded_env_int(
+            "AGENT_MAX_LEARNING_PLAN_STEPS", 12, 1, 12
+        ),
+        max_learning_context_bytes=_bounded_env_int(
+            "AGENT_MAX_LEARNING_CONTEXT_BYTES", 16_384, 1_024, 16_384
+        ),
     )
 
 

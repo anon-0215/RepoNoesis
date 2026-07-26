@@ -2,7 +2,7 @@
 
 ## 原则与分层
 
-V3 在真实 V2 模块上增量演进：旧路径在替代能力验收前保留；结构化输出校验；引用程序验证；Agent 有硬预算；仓库内容是不可信数据。新增组件均为 **V3 规划/设计建议**。
+V3 在真实 V2 模块上增量演进：旧路径在替代能力验收前保留；结构化输出校验；引用程序验证；Agent 有硬预算；仓库内容是不可信数据。本文中 M1—M4 章节描述当前已提交或本轮实现的代码事实，M5 仍是规划。
 
 ```text
 API / React / Observability
@@ -93,18 +93,30 @@ project/repository revision；node/edge ID 包含内容或 revision 身份。默
 
 ### 7. Learning State
 
-M4 新增版本化状态：repository/project/revision、学习目标、已读文件和符号、概念、掌握度及证据、未解决问题、当前路线、更新时间和 schema version。revision 改变时旧状态保留但证据重验；掌握度不能只靠模型主观更新。
+M4 已实现 local-single-user 的结构化学习层。数据库 schema v6 保存 goal、versioned
+plan、ordered DAG step、revision-bound target/task、bounded attempt、validated
+evaluation、immutable event 和 derived target state。状态只由
+verified assessment、explicit self-report、system observation 与 revision
+revalidation 的有限事件确定性投影；不读取完整聊天，也不让模型直接写 mastery。
+
+attempt/evaluation/event/state/plan adaptation 在同一 SQLite 写事务中完成；event 有
+幂等 identity、单调 event order 和禁止 UPDATE/DELETE 的触发器。revision 变化时按
+path/symbol/hash 唯一映射，changed/missing/ambiguous 进入 needs_review 并生成新 plan
+version。`learning_validation.py` 在提交前独立重读 event history 并复算物化投影。
+正式细节见 `M4_DECISIONS.md`。
 
 ### 8. API、前端和可观测性
 
-**代码事实**：`main.py` 当前同步分析并编排 M2 bounded Agent `/ask`；
+**代码事实**：`main.py` 当前同步分析并编排 M2—M4 bounded Agent `/ask`；
 `qa_agent.py` 的 `answer_from_evidence()` 是 M1/M2 共用的最终强制校验与回答边界；
-无 LLM 时 Agent Core 进入 M1 确定性降级。`learning_agent.py` 仍是固定路线；
+无 LLM 时 Agent Core 进入 M1 确定性降级。`learning_agent.py` 仍生成兼容固定路线，
+正式动态状态由 `learning_service.py` 负责；
 React 仍是 V1 五标签页。
 
 `/ask` 保留旧请求和 M1/旧响应字段，M2 新增 agent schema/mode/status/trace/budget；
 M3 新增 relation schema、analysis mode、受限 Evidence chain 和 relation summary；
-`learning_agent.py` 到 M4 才接入状态；`main.py` 保持薄路由。前端逐步展示路径、
+M4 在同一 Registry 新增只读 `get_learning_context@1`，并提供类型化学习 API；
+`main.py` 保持薄路由。前端仍未接入 M4 API。前端逐步展示路径、
 符号、行号、模型、失败、降级和截断。日志只记 ID、耗时、状态、计数和错误类别，
 不记密钥、完整 Prompt 或完整源码。
 
@@ -182,16 +194,16 @@ resolution_status / truncated / warnings
 
 关系 path 不是 citation；最终 citation 仍只能来自 valid Evidence。
 
-### LearningState
+### Learning State and Event
 
 ```text
-learning_state_id
-project_id / repository_id / repository_revision
-learning_goal
-read_files[] / read_symbols[]
-learned_concepts[{concept, mastery, evidence_ids[], method}]
-unresolved_questions[] / current_learning_path[]
-updated_at / schema_version
+learner / project / repository / revision
+goal / plan version / ordered DAG step / target
+task / bounded rubric / attempt / validated evaluation
+immutable event / provenance / idempotency / event_order
+mastery: unseen|introduced|practicing|demonstrated|mastered|needs_review
+availability: current|changed|missing|ambiguous|stale
+derived projection / update rule version / updated_at
 ```
 
 ## 失败、降级、安全

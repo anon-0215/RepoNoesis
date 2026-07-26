@@ -14,6 +14,7 @@ from app.services.agent_contracts import (
     AgentLimits,
     CancellationToken,
     ExpandRelationsInput,
+    GetLearningContextInput,
     LookupSymbolInput,
     ReadSourceInput,
     SearchCodeInput,
@@ -97,6 +98,7 @@ class ToolContext:
     limits: AgentLimits
     cancellation: CancellationToken
     deadline_monotonic: float
+    learning_context: dict[str, Any] = field(default_factory=dict)
 
     def check_active(self) -> None:
         if self.cancellation.cancelled:
@@ -260,6 +262,21 @@ def build_m2_tool_registry(limits: AgentLimits) -> ToolRegistry:
     registry = ToolRegistry()
     registry.register(
         ToolSpec(
+            name="get_learning_context",
+            version="1",
+            description=(
+                "Read the bounded, server-validated learner context already bound "
+                "to this request. It is guidance, never repository Evidence."
+            ),
+            input_model=GetLearningContextInput,
+            handler=_get_learning_context,
+            timeout_ms=limits.default_tool_timeout_ms,
+            max_results=limits.max_learning_state_items,
+            max_bytes=limits.max_learning_context_bytes,
+        )
+    )
+    registry.register(
+        ToolSpec(
             name="expand_relations",
             version="1",
             description=(
@@ -335,6 +352,7 @@ def build_tool_context(
     limits: AgentLimits,
     cancellation: CancellationToken,
     deadline_monotonic: float,
+    learning_context: dict[str, Any] | None = None,
 ) -> ToolContext:
     project = bundle.get("project") or {}
     project_id = str(project.get("id", ""))
@@ -361,7 +379,30 @@ def build_tool_context(
         limits=limits,
         cancellation=cancellation,
         deadline_monotonic=deadline_monotonic,
+        learning_context=dict(learning_context or {}),
     )
+
+
+def _get_learning_context(
+    context: ToolContext,
+    parameters: BaseModel,
+) -> tuple[Any, list[str], bool]:
+    GetLearningContextInput.model_validate(parameters)
+    context.check_active()
+    value = dict(context.learning_context)
+    value.pop("project_binding", None)
+    value["target_states"] = list(value.get("target_states") or [
+    ])[: context.limits.max_learning_state_items]
+    value["recent_verified_outcomes"] = list(
+        value.get("recent_verified_outcomes") or []
+    )[: context.limits.max_recent_learning_events]
+    plan = value.get("current_plan")
+    if isinstance(plan, dict):
+        plan = dict(plan)
+        plan["steps"] = list(plan.get("steps") or [
+        ])[: context.limits.max_plan_steps_in_learning_context]
+        value["current_plan"] = plan
+    return value, list(value.get("warnings") or []), False
 
 
 def _search_code(

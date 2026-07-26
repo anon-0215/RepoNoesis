@@ -30,6 +30,7 @@ from app.services.agent_tools import (
 from app.services.embedding_service import EmbeddingService
 from app.services.evidence import CitationValidator
 from app.services.llm_client import LLMClient
+from app.services.learning_service import LearningService
 from app.services.qa_agent import (
     INSUFFICIENT_ANSWER,
     answer_from_evidence,
@@ -143,7 +144,11 @@ class LLMPlanner:
                         "Never request shell, code execution, network, environment, file "
                         "modification, or an unknown tool. expand_relations returns only "
                         "bounded static-analysis relations; do not describe them as "
-                        "runtime behavior, and do not treat ambiguous relations as exact."
+                        "runtime behavior, and do not treat ambiguous relations as exact. "
+                        "get_learning_context is read-only, may be called at most once, "
+                        "and can adjust explanation depth or next-step guidance only. "
+                        "Learning state is never repository Evidence and cannot relax "
+                        "relation or citation validation."
                     ),
                 },
                 {
@@ -191,6 +196,7 @@ def run_bounded_agent(
     limits: AgentLimits | None = None,
     cancellation: CancellationToken | None = None,
     registry: ToolRegistry | None = None,
+    learning_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     limits = limits or AgentLimits()
     cancellation = cancellation or CancellationToken()
@@ -208,6 +214,7 @@ def run_bounded_agent(
             limits=limits,
             cancellation=cancellation,
             deadline_monotonic=started + limits.total_deadline_ms / 1000,
+            learning_context=learning_context,
         )
     except ValueError as exc:
         result = answer_question(
@@ -225,7 +232,7 @@ def run_bounded_agent(
             *result["warnings"],
             f"Agent context binding failed; used deterministic fallback: {type(exc).__name__}.",
         ]
-        return _attach_agent_fields(
+        response = _attach_agent_fields(
             result,
             mode="deterministic_fallback",
             status="degraded",
@@ -236,6 +243,7 @@ def run_bounded_agent(
             planner_usage_mode="estimated",
             limits=limits,
         )
+        return _attach_learning_fields(response, learning_context)
 
     if planner is None:
         if not llm or not llm.available:
@@ -453,6 +461,7 @@ def run_bounded_agent(
             state.remaining_budget()["time_ms"] / 1000,
         ),
         relation_context=_relation_answer_context(state, valid_chains),
+        learning_context=state.context.learning_context,
     )
     post_evidence, post_chains, post_relation_warnings = _validated_relation_context(
         state, evidence_store.all(request_id)
@@ -478,6 +487,7 @@ def run_bounded_agent(
                 state.remaining_budget()["time_ms"] / 1000,
             ),
             relation_context=_relation_answer_context(state, post_chains),
+            learning_context=state.context.learning_context,
         )
         valid_chains = post_chains
     else:
@@ -501,6 +511,7 @@ def run_bounded_agent(
         limits=limits,
     )
     response = _attach_relation_fields(response, state, valid_chains)
+    response = _attach_learning_fields(response, state.context.learning_context)
     logger.info(
         "agent_run_completed",
         extra={
@@ -591,6 +602,13 @@ def _planner_state(state: AgentState) -> dict[str, Any]:
                         for item in results.get("nodes", [])[:8]
                         if isinstance(item, dict)
                     ],
+                }
+            if step.action == "get_learning_context" and isinstance(results, dict):
+                summary["learning_summary"] = {
+                    "learning_mode": results.get("learning_mode"),
+                    "explanation_depth": results.get("recommended_explanation_depth"),
+                    "target_state_count": (results.get("metrics") or {}).get("target_state_count", 0),
+                    "has_next_action": bool(results.get("recommended_next_action")),
                 }
             observations.append(summary)
             if step.action == "lookup_symbol" and isinstance(results, list):
@@ -735,6 +753,13 @@ def _progress_keys(action: str, results: Any) -> set[str]:
             if isinstance(item, dict) and item.get("chain_id")
         )
         return keys
+    if action == "get_learning_context" and isinstance(results, dict):
+        return {
+            "learning-context:"
+            + hashlib.sha256(
+                json.dumps(results, ensure_ascii=False, sort_keys=True).encode("utf-8")
+            ).hexdigest()
+        }
     return set()
 
 
@@ -743,6 +768,8 @@ def _repeat_rejection(
     action: str,
     fingerprint: str,
 ) -> str | None:
+    if action == "get_learning_context" and state.tool_counts.get(action, 0) > 1:
+        return "learning context may be read at most once per agent run"
     if state.tool_counts.get(action, 0) > state.limits.max_same_tool_calls:
         return "maximum calls for this tool were reached"
     previous = state.fingerprints.get(fingerprint)
@@ -971,6 +998,18 @@ def _attach_relation_fields(
     }
 
 
+def _attach_learning_fields(
+    response: dict[str, Any],
+    learning_context: dict[str, Any] | None,
+) -> dict[str, Any]:
+    return {
+        **response,
+        **LearningService.response_summaries(
+            learning_context or LearningService.disabled_context()
+        ),
+    }
+
+
 def _relation_answer_context(
     state: AgentState,
     chains: list[EvidenceChain],
@@ -1160,6 +1199,7 @@ def _run_deterministic_fallback(
             0.1,
             context.deadline_monotonic - time.monotonic(),
         ),
+        learning_context=context.learning_context,
     )
     if context.cancellation.cancelled:
         status = "cancelled"
@@ -1181,6 +1221,7 @@ def _run_deterministic_fallback(
         planner_usage_mode="estimated",
         limits=limits,
     )
+    response = _attach_learning_fields(response, context.learning_context)
     logger.info(
         "agent_run_completed",
         extra={

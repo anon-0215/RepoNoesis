@@ -52,6 +52,7 @@ GitLearnAgent 的目标是把一个 GitHub 开源仓库转化为一套适合初�
 | 文件重要性排序 | 根据 README、依赖文件、入口文件、源码目录、导入关系等线索计算核心文件。 |
 | 项目地图 | 展示目录树、核心文件、模块职责和模块关系。 |
 | 学习路线 | 生成面向初学者的分阶段阅读路径、任务和测验。 |
+| 自适应学习状态 | 本地单用户下持久化目标、版本化计划、Evidence 约束任务、学习事件与复习状态。 |
 | 源码问答 | 根据已抓取源码进行检索式问答，并返回引用文件和代码片段。 |
 | 报告导出 | 生成 Markdown 格式的项目学习报告。 |
 | 可选大模型增强 | 配置 `LLM_API_KEY` 后，可使用 OpenAI 兼容模型增强部分自然语言表达。未配置时仍可运行。 |
@@ -305,6 +306,12 @@ http://127.0.0.1:8000
 | `GET` | `/api/projects/{project_id}/map` | 获取目录树、模块关系和核心文件列表。 |
 | `GET` | `/api/projects/{project_id}/learning-path` | 获取学习路线、任务和测验。 |
 | `POST` | `/api/projects/{project_id}/ask` | 对已分析项目进行源码问答，返回答案和引用片段。 |
+| `POST/GET` | `/api/projects/{project_id}/learning/goals` | 创建或读取结构化学习目标。 |
+| `POST` | `/api/projects/{project_id}/learning/plans` | 创建版本化学习计划。 |
+| `GET` | `/api/projects/{project_id}/learning/plans/current` | 读取当前计划和版本。 |
+| `GET` | `/api/projects/{project_id}/learning/state` | 读取受限、可重建的学习状态。 |
+| `POST` | `/api/projects/{project_id}/learning/tasks` | 创建绑定当前 revision Evidence 和 rubric 的任务。 |
+| `POST` | `/api/projects/{project_id}/learning/tasks/{task_id}/attempts` | 提交受限回答并进行结构化评价。 |
 | `GET` | `/api/projects/{project_id}/report` | 获取 Markdown 格式分析报告。 |
 
 分析请求示例：
@@ -434,7 +441,7 @@ GitLearnAgent/
 
 ### 5. 学习路线生成
 
-当前学习路线按五个阶段生成：
+兼容学习路线仍按五个阶段生成：
 
 1. 建立项目全局印象。
 2. 理解依赖和启动方式。
@@ -443,6 +450,10 @@ GitLearnAgent/
 5. 完成一个小修改任务。
 
 即使没有配置大模型 API，这部分也可以通过本地规则生成。
+
+M4 另提供正式的结构化学习闭环。它使用 local single-user profile、版本化 plan、
+不可变 event 和确定性状态投影；self-report 不会直接变成 mastered，无可用语义 evaluator
+时 attempt 明确返回 ungradable。学习记忆不保存完整聊天，也不执行目标仓库代码。
 
 ### 6. 源码问答
 
@@ -609,7 +620,7 @@ samples/demo_repositories.md
 - 只支持公开 GitHub 仓库。
 - 首版重点支持 Python、JavaScript、TypeScript。
 - JS/TS 分析目前是轻量规则，不是完整 TypeScript 编译器级分析。
-- Python 支持基础 AST 分析，但暂不构建完整跨文件调用图。
+- Python 支持保守的静态 import/call/reference/definition 关系扩展，但不代表运行时调用图。
 - 问答检索目前是本地关键词和规则评分，不是完整向量数据库。
 - 大模型增强只支持 OpenAI 兼容接口。
 - 暂不支持私有仓库 OAuth 授权。
@@ -622,7 +633,7 @@ samples/demo_repositories.md
 - 加入向量检索，提高源码问答召回率。
 - 增加后台任务队列和进度条，改善大仓库体验。
 - 支持上传 ZIP 仓库，减少 GitHub 网络依赖。
-- 增加用户学习进度记录。
+- 在 M5 为现有结构化学习状态补充完整前端体验和真实/半真实评测。
 - 增加更系统的对比实验评测模块。
 - 生成适合大创答辩的可视化分析报告。
 

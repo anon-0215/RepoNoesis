@@ -20,7 +20,7 @@ class M3SchemaAndRelationTests(unittest.TestCase):
     def tearDown(self):
         self.directory.cleanup()
 
-    def test_fresh_schema_is_v5_with_relation_tables_and_indexes(self):
+    def test_fresh_schema_is_v6_with_relation_tables_and_indexes(self):
         with self.db.connect() as conn:
             version = conn.execute(
                 "SELECT version FROM schema_versions WHERE key = 'database'"
@@ -37,8 +37,8 @@ class M3SchemaAndRelationTests(unittest.TestCase):
                     "SELECT name FROM sqlite_master WHERE type='index'"
                 )
             }
-        self.assertEqual(SCHEMA_VERSION, 5)
-        self.assertEqual(version, 5)
+        self.assertEqual(SCHEMA_VERSION, 6)
+        self.assertEqual(version, 6)
         self.assertTrue(
             {"relation_nodes", "code_relations", "relation_index_runs"}.issubset(
                 tables
@@ -70,7 +70,7 @@ class M3SchemaAndRelationTests(unittest.TestCase):
                 conn.execute(
                     "SELECT version FROM schema_versions WHERE key='database'"
                 ).fetchone()["version"],
-                5,
+                6,
             )
 
     def test_migration_failure_does_not_report_a_false_v5_version(self):
