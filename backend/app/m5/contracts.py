@@ -24,6 +24,9 @@ SCENARIO_CATEGORIES = (
     "impact",
     "unanswerable",
 )
+AnnotationProvenance = Literal["agent_assisted_developer_curation", "user_confirmed"]
+AnnotationStatus = Literal["agent_curated_pending_human_review", "human_reviewed"]
+AnnotationReviewMethod = Literal["codex_conversation"]
 
 
 class StrictModel(BaseModel):
@@ -99,8 +102,10 @@ class Scenario(StrictModel):
     allowed_evidence_scope: AllowedEvidenceScope
     maximum_steps: int = Field(ge=1, le=8)
     maximum_tool_calls: int = Field(ge=1, le=12)
-    annotation_provenance: Literal["agent_assisted_developer_curation"]
-    annotation_status: Literal["agent_curated_pending_human_review"]
+    annotation_provenance: AnnotationProvenance
+    annotation_status: AnnotationStatus
+    annotation_reviewed_at: str | None = Field(default=None, pattern=r"^\d{4}-\d{2}-\d{2}$")
+    annotation_review_method: AnnotationReviewMethod | None = None
     annotation_note: str = Field(min_length=1, max_length=500)
 
     @model_validator(mode="after")
@@ -120,6 +125,12 @@ class Scenario(StrictModel):
                 raise ValueError("unanswerable scenario cannot declare source gold")
         elif not self.expected_files and not self.expected_symbols:
             raise ValueError("answerable scenario requires file or symbol gold")
+        _validate_annotation_review(
+            self.annotation_provenance,
+            self.annotation_status,
+            self.annotation_reviewed_at,
+            self.annotation_review_method,
+        )
         return self
 
 
@@ -131,11 +142,22 @@ class SequenceStep(StrictModel):
         "separate_fact_inference_unknown",
     ]
     answer_text: str = Field(min_length=1, max_length=12_000)
+    expected_key_points: list[str] = Field(min_length=1, max_length=20)
+    expected_source_spans: list[SourceSpan] = Field(min_length=1, max_length=10)
+    expected_relation_edges: list[RelationIdentity] = Field(default_factory=list, max_length=10)
     expected_verdict: Literal["fail", "partial", "pass"]
     expected_state: Literal[
         "unseen", "introduced", "practicing", "demonstrated", "mastered", "needs_review"
     ]
     expected_adaptation: str = Field(min_length=1, max_length=120)
+
+    @model_validator(mode="after")
+    def consistent_relation_gold(self) -> "SequenceStep":
+        if self.task_type == "trace_static_relation" and not self.expected_relation_edges:
+            raise ValueError("trace_static_relation step requires relation gold")
+        if self.task_type != "trace_static_relation" and self.expected_relation_edges:
+            raise ValueError("non-relation sequence step cannot declare relation gold")
+        return self
 
 
 class AdaptiveSequence(StrictModel):
@@ -146,7 +168,21 @@ class AdaptiveSequence(StrictModel):
     target_path: str = Field(min_length=1, max_length=500)
     target_symbol: str = Field(min_length=1, max_length=500)
     steps: list[SequenceStep] = Field(min_length=1, max_length=12)
-    annotation_status: Literal["agent_curated_pending_human_review"]
+    annotation_provenance: AnnotationProvenance
+    annotation_status: AnnotationStatus
+    annotation_reviewed_at: str | None = Field(default=None, pattern=r"^\d{4}-\d{2}-\d{2}$")
+    annotation_review_method: AnnotationReviewMethod | None = None
+    annotation_note: str = Field(min_length=1, max_length=500)
+
+    @model_validator(mode="after")
+    def consistent_review(self) -> "AdaptiveSequence":
+        _validate_annotation_review(
+            self.annotation_provenance,
+            self.annotation_status,
+            self.annotation_reviewed_at,
+            self.annotation_review_method,
+        )
+        return self
 
 
 class DatasetManifest(StrictModel):
@@ -157,8 +193,34 @@ class DatasetManifest(StrictModel):
     repositories_file: Literal["repositories.json"] = "repositories.json"
     scenarios_file: Literal["scenarios.jsonl"] = "scenarios.jsonl"
     sequences_file: Literal["sequences.jsonl"] = "sequences.jsonl"
-    annotation_status: Literal["agent_curated_pending_human_review"]
+    annotation_provenance: AnnotationProvenance
+    annotation_status: AnnotationStatus
+    annotation_reviewed_at: str | None = Field(default=None, pattern=r"^\d{4}-\d{2}-\d{2}$")
+    annotation_review_method: AnnotationReviewMethod | None = None
     minimum_scenarios: int = Field(default=36, ge=36)
+
+    @model_validator(mode="after")
+    def consistent_review(self) -> "DatasetManifest":
+        _validate_annotation_review(
+            self.annotation_provenance,
+            self.annotation_status,
+            self.annotation_reviewed_at,
+            self.annotation_review_method,
+        )
+        return self
+
+
+def _validate_annotation_review(
+    provenance: AnnotationProvenance,
+    status: AnnotationStatus,
+    reviewed_at: str | None,
+    method: AnnotationReviewMethod | None,
+) -> None:
+    if status == "human_reviewed":
+        if provenance != "user_confirmed" or reviewed_at is None or method is None:
+            raise ValueError("human-reviewed annotation requires user-confirmed provenance, date, and method")
+    elif provenance != "agent_assisted_developer_curation" or reviewed_at is not None or method is not None:
+        raise ValueError("pending annotation cannot declare completed human-review provenance")
 
 
 @dataclass(frozen=True)

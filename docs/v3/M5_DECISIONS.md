@@ -81,12 +81,14 @@ method。scenario gold 使用 revision + POSIX path + qualified symbol + line sp
 数据库 Evidence ID。
 
 36 个场景严格分为 9 locate、9 explain、9 relation、6 impact、3 unanswerable/injection；每仓库
-12 个。另有 6 条受控 adaptive sequence。全部 annotation provenance 为
-`agent_assisted_developer_curation`，status 为 `agent_curated_pending_human_review`。
+12 个。另有 6 条受控 adaptive sequence。42 项 annotation 已于 2026-07-27 完成人工决定落实，
+provenance 为 `user_confirmed`，status 为 `human_reviewed`，review method 为
+`codex_conversation`。
 
 validator 在 run 前拒绝未知字段、错误 schema、重复身份/问题、非 40 位 SHA、跨 revision、
-路径穿越、symlink 越界、缺文件/符号、越界 span、hash 不符、不可解析 relation identity、
-预算越界、过长文本、非法 provenance 和不一致的 unanswerable gold。
+路径穿越、symlink 越界、缺文件/符号、越界 span、hash 不符、不可解析或源码中不存在的直接
+calls relation、序列占位答案/无目标关系、预算越界、过长文本、非法 provenance 和不一致的
+unanswerable gold。
 
 ## 模式、公平性与消融
 
@@ -120,6 +122,6 @@ NaN/Infinity 被拒绝；unknown cost 保持 unknown。
 目标仓库只通过 Git 和文本/AST 读取，不 import、不执行、不装依赖。Registry 没有 Shell、网络、
 写仓库或 validator bypass 工具。运行记录明确保存 execution/import/Shell count 为 0。
 
-当前 annotation 尚未人工复核；静态 relation 不能证明运行时行为；fake provider 工程结果不能
+annotation 已完成人工决定落实，但静态 relation 不能证明运行时行为；fake provider 工程结果不能
 代表真实模型质量；同模型 judge 必须标记 `same_model`；pilot 不能证明教学有效性、mastery
 预测准确性、所有仓库优势或语言泛化。

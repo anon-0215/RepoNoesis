@@ -4,9 +4,9 @@ This directory contains versioned definitions, schemas, and annotation tools. Ru
 provider caches, raw run records, and cloned repositories are deliberately outside this directory.
 
 `pilot-v1` contains 36 scenarios over three fixed Python repository revisions and six controlled
-learning sequences. All gold annotations are marked
-`agent_curated_pending_human_review`; this is a developer-curated pilot, not an authoritative
-benchmark or evidence of teaching effectiveness.
+learning sequences. The 36 scenarios and six adaptive sequences record `user_confirmed`
+provenance from the 2026-07-27 review. This remains a small pilot, not an authoritative benchmark
+or evidence of teaching effectiveness.
 
 The external checkouts are expected below an operator-supplied repository root with checkout names
 `itsdangerous`, `click`, and `httpx`. The validator verifies the full commit SHA, content fingerprint,

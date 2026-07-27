@@ -14,8 +14,9 @@ REVISION_BY_REPO = {
     "repo-b": "b" * 40,
     "repo-c": "c" * 40,
 }
-SOURCE = "def target():\n    return 1\n"
-SOURCE_HASH = hashlib.sha256(SOURCE.encode("utf-8")).hexdigest()
+TARGET_SOURCE = "def target():\n    return target()\n"
+SOURCE = TARGET_SOURCE + "\ndef outer():\n    def new_func():\n        return target()\n    return new_func\n"
+SOURCE_HASH = hashlib.sha256(TARGET_SOURCE.encode("utf-8")).hexdigest()
 
 
 def make_dataset(root: Path) -> tuple[Path, Path]:
@@ -94,18 +95,28 @@ def make_dataset(root: Path) -> tuple[Path, Path]:
             "target_path": "app.py", "target_symbol": "target",
             "steps": [{
                 "step_id": "attempt-1", "task_type": "explain_symbol", "answer_text": "pass",
+                "expected_key_points": ["target calls itself"],
+                "expected_source_spans": [{
+                    "path": "app.py", "qualified_symbol": "target", "start_line": 1,
+                    "end_line": 2, "content_hash": SOURCE_HASH,
+                }],
+                "expected_relation_edges": [],
                 "expected_verdict": "pass", "expected_state": "demonstrated",
                 "expected_adaptation": "verified_pass_advance",
             }],
+            "annotation_provenance": "agent_assisted_developer_curation",
             "annotation_status": "agent_curated_pending_human_review",
+            "annotation_note": "offline fixture pending review",
         }
         for index, repo_id in enumerate(["repo-a", "repo-a", "repo-b", "repo-b", "repo-c", "repo-c"], 1)
     ]
     write_json(dataset / "manifest.json", {
-        "benchmark_schema_version": 1, "metric_schema_version": 1,
+        "benchmark_schema_version": 2, "metric_schema_version": 1,
         "dataset_version": "fixture-v1", "title": "fixture",
         "repositories_file": "repositories.json", "scenarios_file": "scenarios.jsonl",
-        "sequences_file": "sequences.jsonl", "annotation_status": "agent_curated_pending_human_review",
+        "sequences_file": "sequences.jsonl",
+        "annotation_provenance": "agent_assisted_developer_curation",
+        "annotation_status": "agent_curated_pending_human_review",
         "minimum_scenarios": 36,
     })
     write_json(dataset / "repositories.json", repositories)

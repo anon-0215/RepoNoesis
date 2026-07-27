@@ -2,8 +2,8 @@
   "additionalProperties": false,
   "properties": {
     "benchmark_schema_version": {
-      "const": 1,
-      "default": 1,
+      "const": 2,
+      "default": 2,
       "title": "Benchmark Schema Version",
       "type": "integer"
     },
@@ -43,10 +43,47 @@
       "title": "Sequences File",
       "type": "string"
     },
+    "annotation_provenance": {
+      "enum": [
+        "agent_assisted_developer_curation",
+        "user_confirmed"
+      ],
+      "title": "Annotation Provenance",
+      "type": "string"
+    },
     "annotation_status": {
-      "const": "agent_curated_pending_human_review",
+      "enum": [
+        "agent_curated_pending_human_review",
+        "human_reviewed"
+      ],
       "title": "Annotation Status",
       "type": "string"
+    },
+    "annotation_reviewed_at": {
+      "anyOf": [
+        {
+          "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Annotation Reviewed At"
+    },
+    "annotation_review_method": {
+      "anyOf": [
+        {
+          "const": "codex_conversation",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Annotation Review Method"
     },
     "minimum_scenarios": {
       "default": 36,
@@ -58,6 +95,7 @@
   "required": [
     "dataset_version",
     "title",
+    "annotation_provenance",
     "annotation_status"
   ],
   "title": "DatasetManifest",

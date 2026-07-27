@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import tempfile
 import unittest
@@ -37,7 +38,9 @@ class M5DatasetTests(unittest.TestCase):
 
     def test_invalid_schema_version(self):
         self.assert_invalid(
-            lambda d, _: mutate_json(d / "manifest.json", lambda value: value.update(benchmark_schema_version=2)),
+            lambda d, _: mutate_json(
+                d / "manifest.json", lambda value: value.update(benchmark_schema_version=3)
+            ),
             "dataset load failed",
         )
 
@@ -100,6 +103,15 @@ class M5DatasetTests(unittest.TestCase):
             mutate_first_jsonl(dataset / "scenarios.jsonl", lambda value: value["expected_source_spans"][0].update(content_hash="0" * 64))
         self.assert_invalid(mutate, "content hash mismatch")
 
+    def test_non_relation_span_must_cover_complete_ast_symbol(self):
+        def mutate(dataset, _):
+            def change(value):
+                digest = hashlib.sha256(b"def target():\n").hexdigest()
+                value["expected_source_spans"][0].update(end_line=1, content_hash=digest)
+                value["expected_content_hashes"] = [digest]
+            mutate_first_jsonl(dataset / "scenarios.jsonl", change)
+        self.assert_invalid(mutate, "source span does not match AST symbol identity")
+
     def test_cross_revision_target(self):
         self.assert_invalid(
             lambda d, _: mutate_first_jsonl(d / "scenarios.jsonl", lambda value: value.update(repository_revision="f" * 40)),
@@ -119,6 +131,45 @@ class M5DatasetTests(unittest.TestCase):
                 value["expected_target_type"] = "none"
             mutate_first_jsonl(dataset / "scenarios.jsonl", change)
         self.assert_invalid(mutate, "unanswerable scenario cannot declare source gold")
+
+    def test_outer_function_cannot_claim_nested_wrapper_call(self):
+        def mutate(dataset, _):
+            def change(value):
+                value["expected_relation_edges"][0]["source_symbol"] = "outer"
+            lines = [json.loads(line) for line in (dataset / "scenarios.jsonl").read_text().splitlines()]
+            relation = next(item for item in lines if item["category"] == "relation")
+            change(relation)
+            (dataset / "scenarios.jsonl").write_text(
+                "".join(json.dumps(item) + "\n" for item in lines), encoding="utf-8"
+            )
+        self.assert_invalid(mutate, "declared call relation is not present in source")
+
+    def test_nested_wrapper_owns_its_direct_call(self):
+        def mutate(dataset, _):
+            lines = [json.loads(line) for line in (dataset / "scenarios.jsonl").read_text().splitlines()]
+            relation = next(item for item in lines if item["category"] == "relation")
+            relation["expected_relation_edges"][0]["source_symbol"] = "outer.new_func"
+            (dataset / "scenarios.jsonl").write_text(
+                "".join(json.dumps(item) + "\n" for item in lines), encoding="utf-8"
+            )
+        report = self.validate(mutate)
+        self.assertTrue(report.valid, report.errors)
+
+    def test_placeholder_sequence_answer_is_rejected(self):
+        self.assert_invalid(
+            lambda d, _: mutate_first_jsonl(
+                d / "sequences.jsonl",
+                lambda value: value["steps"][0].update(answer_text="pass controlled benchmark answer"),
+            ),
+            "placeholder answer_text is forbidden",
+        )
+
+    def test_human_review_requires_complete_provenance(self):
+        def mutate(dataset, _):
+            def change(value):
+                value.update(annotation_provenance="user_confirmed", annotation_status="human_reviewed")
+            mutate_first_jsonl(dataset / "scenarios.jsonl", change)
+        self.assert_invalid(mutate, "dataset load failed")
 
 
 if __name__ == "__main__":

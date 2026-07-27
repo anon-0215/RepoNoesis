@@ -87,9 +87,14 @@ class BenchmarkDatasetValidator:
             index = repository_indexes.get(scenario.repo_id)
             if index is not None:
                 self._validate_scenario(scenario, index, report)
+        for sequence in dataset.sequences:
+            index = repository_indexes.get(sequence.repo_id)
+            if index is not None:
+                self._validate_sequence(sequence, index, report)
         self._validate_dataset_shape(dataset, report)
         report.valid = not report.errors
-        if all(item.annotation_status == "agent_curated_pending_human_review" for item in dataset.scenarios):
+        annotations = [*dataset.scenarios, *dataset.sequences]
+        if all(item.annotation_status == "agent_curated_pending_human_review" for item in annotations):
             report.warnings.append("All annotations are pending human review.")
         return report
 
@@ -134,6 +139,10 @@ class BenchmarkDatasetValidator:
                 report.errors.append(f"{sequence.sequence_id}: sequence repository/revision mismatch")
             if sequence.dataset_version != dataset.manifest.dataset_version:
                 report.errors.append(f"{sequence.sequence_id}: sequence dataset version mismatch")
+        if dataset.manifest.annotation_status == "human_reviewed" and any(
+            item.annotation_status != "human_reviewed" for item in [*dataset.scenarios, *dataset.sequences]
+        ):
+            report.errors.append("human-reviewed manifest contains annotations without completed review")
 
     def _validate_repository(self, spec: RepositorySpec) -> "_RepositoryIndex":
         root = _safe_checkout(self.repository_root, spec.checkout_name)
@@ -180,8 +189,7 @@ class BenchmarkDatasetValidator:
             span_hashes.append(digest)
             if digest != span.content_hash:
                 report.errors.append(f"{prefix}: source span content hash mismatch")
-            identities = index.symbols.get(span.qualified_symbol, [])
-            if (span.path, span.start_line, span.end_line) not in identities:
+            if not _span_matches_symbol(index, span, allow_subspan=scenario.category == "relation"):
                 report.errors.append(f"{prefix}: source span does not match AST symbol identity")
         if sorted(set(scenario.expected_content_hashes)) != sorted(set(span_hashes)):
             report.errors.append(f"{prefix}: expected_content_hashes do not match source spans")
@@ -194,8 +202,55 @@ class BenchmarkDatasetValidator:
                 report.errors.append(f"{prefix}: relation target path is missing")
             if edge.target_symbol not in index.symbols:
                 report.errors.append(f"{prefix}: relation target symbol is missing")
+            if edge.relation_type == "calls" and not _call_edge_exists(index, edge.source_path, edge.source_symbol, edge.target_symbol):
+                report.errors.append(f"{prefix}: declared call relation is not present in source")
         if sum(len(value) for value in scenario.expected_key_points) > 4_000:
             report.errors.append(f"{prefix}: expected key points exceed byte budget")
+
+    def _validate_sequence(
+        self,
+        sequence: AdaptiveSequence,
+        index: "_RepositoryIndex",
+        report: ValidationReport,
+    ) -> None:
+        prefix = sequence.sequence_id
+        if sequence.target_path not in index.lines:
+            report.errors.append(f"{prefix}: sequence target file is missing")
+        if sequence.target_symbol not in index.symbols:
+            report.errors.append(f"{prefix}: sequence target symbol is missing")
+        for step in sequence.steps:
+            step_prefix = f"{prefix}/{step.step_id}"
+            if "controlled benchmark answer" in step.answer_text.casefold():
+                report.errors.append(f"{step_prefix}: placeholder answer_text is forbidden")
+            if sum(len(value) for value in step.expected_key_points) > 4_000:
+                report.errors.append(f"{step_prefix}: expected key points exceed byte budget")
+            for span in step.expected_source_spans:
+                lines = index.lines.get(span.path)
+                if lines is None:
+                    report.errors.append(f"{step_prefix}: expected source file is missing")
+                    continue
+                if span.end_line > len(lines):
+                    report.errors.append(f"{step_prefix}: source span exceeds file")
+                    continue
+                source = "".join(lines[span.start_line - 1 : span.end_line])
+                digest = hashlib.sha256(source.encode("utf-8")).hexdigest()
+                if digest != span.content_hash:
+                    report.errors.append(f"{step_prefix}: source span content hash mismatch")
+                if not _span_matches_symbol(
+                    index,
+                    span,
+                    allow_subspan=step.task_type == "trace_static_relation",
+                ):
+                    report.errors.append(f"{step_prefix}: source span does not match AST symbol identity")
+            for edge in step.expected_relation_edges:
+                if edge.source_path not in index.lines or edge.target_path not in index.lines:
+                    report.errors.append(f"{step_prefix}: relation file is missing")
+                if edge.source_symbol not in index.symbols or edge.target_symbol not in index.symbols:
+                    report.errors.append(f"{step_prefix}: relation symbol is missing")
+                if edge.relation_type == "calls" and not _call_edge_exists(
+                    index, edge.source_path, edge.source_symbol, edge.target_symbol
+                ):
+                    report.errors.append(f"{step_prefix}: declared call relation is not present in source")
 
     @staticmethod
     def _validate_dataset_shape(dataset: LoadedDataset, report: ValidationReport) -> None:
@@ -220,6 +275,7 @@ class BenchmarkDatasetValidator:
 class _RepositoryIndex:
     lines: dict[str, list[str]]
     symbols: dict[str, list[tuple[str, int, int]]]
+    calls: dict[tuple[str, str], set[str]]
 
 
 def repository_content_fingerprint(
@@ -248,6 +304,7 @@ def repository_content_fingerprint(
 def _index_repository(root: Path, files: list[str], spec: RepositorySpec) -> _RepositoryIndex:
     lines: dict[str, list[str]] = {}
     symbols: dict[str, list[tuple[str, int, int]]] = {}
+    calls: dict[tuple[str, str], set[str]] = {}
     excluded = tuple(value.rstrip("/") + "/" for value in spec.excluded_paths)
     selected = [
         path for path in files
@@ -283,6 +340,8 @@ def _index_repository(root: Path, files: list[str], spec: RepositorySpec) -> _Re
                 end = int(getattr(node, "end_lineno"))
                 symbols.setdefault(qualified, []).append((relative, start, end))
                 symbols.setdefault(name, []).append((relative, start, end))
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    calls[(relative, qualified)] = _collect_direct_calls(node.body)
                 stack.append(name)
                 self.generic_visit(node)
                 stack.pop()
@@ -297,7 +356,58 @@ def _index_repository(root: Path, files: list[str], spec: RepositorySpec) -> _Re
                 self._visit(node)
 
         Visitor().visit(tree)
-    return _RepositoryIndex(lines, symbols)
+    return _RepositoryIndex(lines, symbols, calls)
+
+
+def _collect_direct_calls(body: list[ast.stmt]) -> set[str]:
+    names: set[str] = set()
+
+    class CallVisitor(ast.NodeVisitor):
+        def visit_Call(self, node: ast.Call) -> None:
+            if isinstance(node.func, ast.Name):
+                names.add(node.func.id)
+            elif isinstance(node.func, ast.Attribute):
+                names.add(node.func.attr)
+            self.generic_visit(node)
+
+        def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+            return None
+
+        def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+            return None
+
+        def visit_ClassDef(self, node: ast.ClassDef) -> None:
+            return None
+
+    visitor = CallVisitor()
+    for statement in body:
+        visitor.visit(statement)
+    return names
+
+
+def _call_edge_exists(
+    index: _RepositoryIndex,
+    source_path: str,
+    source_symbol: str,
+    target_symbol: str,
+) -> bool:
+    called_name = target_symbol.rsplit(".", 1)[-1]
+    return called_name in index.calls.get((source_path, source_symbol), set())
+
+
+def _span_matches_symbol(
+    index: _RepositoryIndex,
+    span: SourceSpan,
+    *,
+    allow_subspan: bool,
+) -> bool:
+    identities = index.symbols.get(span.qualified_symbol, [])
+    if not allow_subspan:
+        return (span.path, span.start_line, span.end_line) in identities
+    return any(
+        path == span.path and start <= span.start_line <= span.end_line <= end
+        for path, start, end in identities
+    )
 
 
 def _safe_checkout(repository_root: Path, checkout_name: str) -> Path:

@@ -1,11 +1,14 @@
 {
-  "benchmark_schema_version": 1,
+  "benchmark_schema_version": 2,
   "metric_schema_version": 1,
   "dataset_version": "pilot-v1",
   "title": "RepoNoesis M5 real-repository pilot",
   "repositories_file": "repositories.json",
   "scenarios_file": "scenarios.jsonl",
   "sequences_file": "sequences.jsonl",
-  "annotation_status": "agent_curated_pending_human_review",
+  "annotation_provenance": "user_confirmed",
+  "annotation_status": "human_reviewed",
+  "annotation_reviewed_at": "2026-07-27",
+  "annotation_review_method": "codex_conversation",
   "minimum_scenarios": 36
 }

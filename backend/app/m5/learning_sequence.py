@@ -67,6 +67,13 @@ def run_adaptive_sequence(
         )
         if step is None:
             raise RuntimeError("adaptive sequence has no active step")
+        relation_instruction = ""
+        if expected.expected_relation_edges:
+            relation = expected.expected_relation_edges[0]
+            relation_instruction = (
+                f" Trace the {relation.relation_type} relation from "
+                f"{relation.source_symbol} to {relation.target_symbol}."
+            )
         task = service.create_task(
             project_id,
             CreateTaskRequest(
@@ -74,13 +81,16 @@ def run_adaptive_sequence(
                 plan_version=current["version"],
                 step_id=step["step_id"],
                 task_type=expected.task_type,
-                prompt_text=f"Explain {sequence.target_symbol} from the bounded Evidence.",
+                prompt_text=(
+                    f"Explain {sequence.target_symbol} from the bounded Evidence."
+                    f"{relation_instruction}"
+                ),
                 rubric=[
                     RubricCriterionInput(
                         criterion_id="source_fact",
                         criterion_type="source_fact",
                         weight=0.5,
-                        expected_claim="State one source-backed fact.",
+                        expected_claim="; ".join(expected.expected_key_points),
                         critical=True,
                     ),
                     RubricCriterionInput(

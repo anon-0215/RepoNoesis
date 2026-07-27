@@ -249,14 +249,46 @@
       "type": "integer"
     },
     "annotation_provenance": {
-      "const": "agent_assisted_developer_curation",
+      "enum": [
+        "agent_assisted_developer_curation",
+        "user_confirmed"
+      ],
       "title": "Annotation Provenance",
       "type": "string"
     },
     "annotation_status": {
-      "const": "agent_curated_pending_human_review",
+      "enum": [
+        "agent_curated_pending_human_review",
+        "human_reviewed"
+      ],
       "title": "Annotation Status",
       "type": "string"
+    },
+    "annotation_reviewed_at": {
+      "anyOf": [
+        {
+          "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Annotation Reviewed At"
+    },
+    "annotation_review_method": {
+      "anyOf": [
+        {
+          "const": "codex_conversation",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Annotation Review Method"
     },
     "annotation_note": {
       "maxLength": 500,
