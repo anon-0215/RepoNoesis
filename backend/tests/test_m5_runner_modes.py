@@ -11,8 +11,12 @@ from app.m5.embedding import fake_embedding_service
 from app.m5.modes import execute_mode
 from app.m5.providers import FakeDeterministicProvider, ProviderLLMClient
 from app.m5.runner import (
+    BenchmarkRunner,
     BenchmarkCheckpointError,
+    _latest_records,
     _load_checkpoint,
+    _verify_checkpoint_identity,
+    _verify_manifest_identity,
     _write_checkpoint,
     compute_run_id,
 )
@@ -115,6 +119,75 @@ class M5RunnerModeTests(unittest.TestCase):
         value = json.loads(path.read_text()); value["records"][0]["scenario_status"] = "failed"
         path.write_text(json.dumps(value))
         with self.assertRaises(BenchmarkCheckpointError): _load_checkpoint(path)
+
+    def test_run_identity_separates_live_embedding_and_evaluator_identity(self):
+        repository = SimpleNamespace(repo_id="r", exact_commit_sha="a" * 40,
+                                     content_fingerprint="sha256:" + "b" * 64)
+        dataset = SimpleNamespace(manifest=SimpleNamespace(dataset_version="v1"), repositories=[repository])
+        config = BenchmarkConfig(dataset_directory="d", repository_root="r", artifacts_directory="a",
+                                 modes=["fixed_lexical_rag"])
+        answer = ProviderIdentity("provider", "answer", "a1", "answer_generation", True,
+                                  "https://example.com/v1")
+        evaluator = ProviderIdentity("provider", "judge", "j1", "structured_evaluator", True,
+                                     "https://judge.example.com/v1")
+        embedding = {"provider": "dense", "model": "bge", "model_revision": "e1",
+                     "dimension": 1024, "normalize": True, "query_prefix": "q"}
+        code = {"source_tree_digest": "digest"}
+        fake_id = compute_run_id(config, dataset, answer, code, live=False,
+                                 embedding_identity=embedding, evaluator=evaluator)
+        live_id = compute_run_id(config, dataset, answer, code, live=True,
+                                 embedding_identity=embedding, evaluator=evaluator)
+        self.assertNotEqual(fake_id, live_id)
+        changed_embedding = {**embedding, "model_revision": "e2"}
+        self.assertNotEqual(
+            live_id, compute_run_id(config, dataset, answer, code, live=True,
+                                    embedding_identity=changed_embedding, evaluator=evaluator),
+        )
+        changed_evaluator = ProviderIdentity("provider", "judge-2", "j2", "structured_evaluator", True,
+                                             "https://judge.example.com/v1")
+        self.assertNotEqual(
+            live_id, compute_run_id(config, dataset, answer, code, live=True,
+                                    embedding_identity=embedding, evaluator=changed_evaluator),
+        )
+
+    def test_manifest_and_checkpoint_identity_mismatch_fail_closed(self):
+        with self.assertRaises(BenchmarkCheckpointError):
+            _verify_manifest_identity({"run_identity_digest": "old"}, "new")
+        path = Path(self.temporary.name) / "identity-checkpoint.json"
+        _write_checkpoint(path, "run-a", "start", [], run_identity_digest="digest-a")
+        checkpoint = _load_checkpoint(path)
+        with self.assertRaises(BenchmarkCheckpointError):
+            _verify_checkpoint_identity(checkpoint, "run-a", "digest-b")
+
+    def test_exact_eighteen_cell_plan_is_not_cartesian_product(self):
+        cells = [f"scenario-{index:02d}::fixed_lexical_rag" for index in range(18)]
+        config = BenchmarkConfig(dataset_directory="d", repository_root="r", artifacts_directory="a",
+                                 modes=["fixed_lexical_rag", "fixed_dense_rag"], cells=cells)
+        runner = BenchmarkRunner(config)
+        scenarios = [SimpleNamespace(scenario_id=f"scenario-{index:02d}", repo_id="r") for index in range(36)]
+        dataset = SimpleNamespace(scenarios=scenarios)
+        self.assertEqual(len(runner._planned_cells(dataset)), 18)
+
+    def test_fake_and_live_artifact_roots_are_disjoint(self):
+        config = BenchmarkConfig(dataset_directory="d", repository_root="r", artifacts_directory="artifacts",
+                                 modes=["fixed_lexical_rag"])
+        self.assertEqual(BenchmarkRunner(config)._artifact_root.name, "fake")
+        self.assertEqual(BenchmarkRunner(config, live=True)._artifact_root.name, "live")
+        self.assertNotEqual(BenchmarkRunner(config)._artifact_root, BenchmarkRunner(config, live=True)._artifact_root)
+
+    def test_batch_resume_deduplicates_completed_cells(self):
+        records = [
+            {"scenario_id": "s1", "experiment_mode": "m1_hybrid_rag", "attempt_number": 1},
+            {"scenario_id": "s1", "experiment_mode": "m1_hybrid_rag", "attempt_number": 2},
+            {"scenario_id": "s2", "experiment_mode": "m1_hybrid_rag", "attempt_number": 1},
+        ]
+        path = Path(self.temporary.name) / "resume.json"
+        _write_checkpoint(path, "run", "start", records, run_identity_digest="identity")
+        loaded = _load_checkpoint(path)
+        _verify_checkpoint_identity(loaded, "run", "identity")
+        latest = _latest_records(loaded["records"])
+        self.assertEqual(len(latest), 2)
+        self.assertEqual(next(item for item in latest if item["scenario_id"] == "s1")["attempt_number"], 2)
 
 
 if __name__ == "__main__":

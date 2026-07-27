@@ -230,6 +230,8 @@ class ProviderIdentity:
     model_revision: str
     capability: str
     is_real: bool
+    endpoint_identity: str = "local"
+    pricing_identity: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -241,6 +243,9 @@ class ProviderUsage:
     output_tokens: int | None = None
     total_tokens: int | None = None
     estimated_cost_usd: float | None = None
+    cost_status: Literal["known_zero", "calculated", "unknown"] = "unknown"
+    cost_currency: str | None = None
+    cost_unknown_reason: str | None = "pricing_not_configured"
 
     def to_dict(self) -> dict[str, Any]:
         value = asdict(self)
@@ -284,6 +289,10 @@ class BenchmarkConfig(StrictModel):
     modes: list[Literal[*EXPERIMENT_MODES]] = Field(min_length=1)
     scenario_ids: list[str] = Field(default_factory=list)
     repo_ids: list[str] = Field(default_factory=list)
+    cells: list[str] = Field(default_factory=list)
+    batch_index: int = Field(default=0, ge=0)
+    batch_count: int = Field(default=1, ge=1, le=216)
+    run_purpose: Literal["smoke", "pilot", "full"] = "smoke"
     top_k: int = Field(default=5, ge=1, le=8)
     maximum_steps: int = Field(default=5, ge=1, le=8)
     maximum_tool_calls: int = Field(default=8, ge=1, le=12)
@@ -295,8 +304,32 @@ class BenchmarkConfig(StrictModel):
     evaluator_version: str = "m5-evaluator-v1"
     metric_version: str = "m5-metrics-v1"
     parallelism: int = Field(default=1, ge=1, le=4)
-    maximum_llm_calls: int = Field(default=250, ge=1, le=250)
-    maximum_total_input_tokens: int = Field(default=1_000_000, ge=1, le=2_000_000)
-    maximum_total_output_tokens: int = Field(default=250_000, ge=1, le=500_000)
+    maximum_answer_requests: int = Field(default=24, ge=1, le=1_000)
+    maximum_evaluator_requests: int = Field(default=24, ge=1, le=250)
+    maximum_answer_input_tokens: int = Field(default=1_000_000, ge=1, le=2_000_000)
+    maximum_answer_output_tokens: int = Field(default=250_000, ge=1, le=500_000)
+    maximum_evaluator_input_tokens: int = Field(default=100_000, ge=1, le=500_000)
+    maximum_evaluator_output_tokens: int = Field(default=25_000, ge=1, le=100_000)
+    maximum_answer_cost_usd: float | None = Field(default=None, gt=0.0, le=10_000.0)
+    maximum_evaluator_cost_usd: float | None = Field(default=None, gt=0.0, le=10_000.0)
+    maximum_wall_clock_seconds: float = Field(default=3_600.0, ge=1.0, le=86_400.0)
     maximum_provider_attempts: int = Field(default=2, ge=1, le=3)
     dry_run: bool = False
+
+    @model_validator(mode="after")
+    def consistent_execution_plan(self) -> "BenchmarkConfig":
+        if self.batch_index >= self.batch_count:
+            raise ValueError("batch_index must be smaller than batch_count")
+        seen: set[str] = set()
+        for cell in self.cells:
+            parts = cell.rsplit("::", 1)
+            if len(parts) != 2 or not parts[0] or parts[1] not in EXPERIMENT_MODES or parts[1] == "m4_adaptive_sequence":
+                raise ValueError(f"invalid scenario-mode cell: {cell}")
+            if cell in seen:
+                raise ValueError(f"duplicate scenario-mode cell: {cell}")
+            if parts[1] not in self.modes:
+                raise ValueError(f"cell mode is absent from configured modes: {cell}")
+            seen.add(cell)
+        if self.cells and (self.scenario_ids or self.repo_ids):
+            raise ValueError("explicit cells cannot be combined with scenario or repository filters")
+        return self

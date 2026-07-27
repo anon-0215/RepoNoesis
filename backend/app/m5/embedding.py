@@ -90,11 +90,42 @@ class M5EmbeddingProvider:
             is_real=True,
         )
 
-    def encode_query(self, text: str) -> list[float]:
-        vector = self.service.encode_query(text, local_files_only=not self.allow_network)
+    def encode_query(self, text: str, local_files_only: bool = False) -> list[float]:
+        vector = self.service.encode_query(
+            text, local_files_only=local_files_only or not self.allow_network
+        )
         validate_vector(vector, expected_dimension=self._dimension)
         self._dimension = len(vector)
         return vector
+
+    def encode_documents(self, texts: list[str], local_files_only: bool = False) -> list[list[float]]:
+        vectors = self.service.encode_documents(
+            texts, local_files_only=local_files_only or not self.allow_network
+        )
+        for vector in vectors:
+            validate_vector(vector, expected_dimension=self._dimension)
+            self._dimension = len(vector)
+        return vectors
+
+    def ensure_model_identity(self, local_files_only: bool = False) -> Any:
+        return self.service.ensure_model_identity(
+            local_files_only=local_files_only or not self.allow_network
+        )
+
+    def get_model_identity(self) -> Any:
+        return self.service.get_model_identity()
+
+    def get_embedding_dimension(self) -> int | None:
+        self.ensure_model_identity()
+        dimension = self.service.get_embedding_dimension()
+        if dimension is not None:
+            if self._dimension is not None and self._dimension != dimension:
+                raise ValueError("embedding dimension changed during the run")
+            self._dimension = dimension
+        return dimension
+
+    def is_available(self) -> bool:
+        return self.service.is_available()
 
     def smoke_check(self) -> EmbeddingSmokeResult:
         started = time.monotonic()

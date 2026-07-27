@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import math
 import re
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from typing import Any, Protocol
@@ -52,6 +54,26 @@ class ProviderConfigurationError(ValueError):
 
 
 @dataclass(frozen=True)
+class PricingConfig:
+    model: str
+    currency: str
+    input_price_per_unit: float
+    output_price_per_unit: float
+    unit_tokens: int
+    source: str
+
+    def validate(self) -> None:
+        if not self.model.strip():
+            raise ProviderConfigurationError("pricing model registration must be explicit")
+        if self.currency != "USD":
+            raise ProviderConfigurationError("M5 currently records provider cost in USD")
+        if self.input_price_per_unit < 0 or self.output_price_per_unit < 0:
+            raise ProviderConfigurationError("pricing values must be non-negative")
+        if self.unit_tokens <= 0 or not self.source.strip():
+            raise ProviderConfigurationError("pricing unit and source must be explicit")
+
+
+@dataclass(frozen=True)
 class OpenAICompatibleSettings:
     base_url: str
     api_key: str
@@ -61,6 +83,7 @@ class OpenAICompatibleSettings:
     allow_real_llm: bool = False
     allow_paid_eval: bool = False
     maximum_response_bytes: int = MAX_PROVIDER_RESPONSE_BYTES
+    pricing: PricingConfig | None = None
 
     def validate(self, *, evaluator: bool = False) -> None:
         if not self.allow_network or not self.allow_real_llm:
@@ -73,10 +96,16 @@ class OpenAICompatibleSettings:
             raise ProviderConfigurationError("provider endpoint must use HTTPS or loopback HTTP")
         if not self.model.strip():
             raise ProviderConfigurationError("provider model is not configured")
+        if not self.model_revision.strip() or self.model_revision == "provider-managed":
+            raise ProviderConfigurationError("provider model revision/identity must be explicit")
+        if self.pricing is not None:
+            self.pricing.validate()
+            if self.pricing.model != self.model:
+                raise ProviderConfigurationError("pricing model does not match provider model")
 
     def safe_dict(self) -> dict[str, Any]:
         return {
-            "base_url": self.base_url,
+            "endpoint_identity": normalized_endpoint_identity(self.base_url),
             "api_key": "[REDACTED]" if self.api_key else "",
             "model": self.model,
             "model_revision": self.model_revision,
@@ -84,6 +113,14 @@ class OpenAICompatibleSettings:
             "allow_real_llm": self.allow_real_llm,
             "allow_paid_eval": self.allow_paid_eval,
             "maximum_response_bytes": self.maximum_response_bytes,
+            "pricing": None if self.pricing is None else {
+                "currency": self.pricing.currency,
+                "model": self.pricing.model,
+                "input_price_per_unit": self.pricing.input_price_per_unit,
+                "output_price_per_unit": self.pricing.output_price_per_unit,
+                "unit_tokens": self.pricing.unit_tokens,
+                "source": self.pricing.source,
+            },
         }
 
 
@@ -100,6 +137,8 @@ class OpenAICompatibleProvider:
             model_revision=settings.model_revision,
             capability="structured_evaluator" if evaluator else "answer_generation",
             is_real=True,
+            endpoint_identity=normalized_endpoint_identity(settings.base_url),
+            pricing_identity=_pricing_identity(settings.pricing),
         )
 
     @property
@@ -192,12 +231,10 @@ class OpenAICompatibleProvider:
         if not isinstance(content, str):
             return self._failure("failed", "invalid_json", started, attempt)
         usage_data = data.get("usage") if isinstance(data.get("usage"), dict) else {}
-        usage = ProviderUsage(
-            input_tokens=_optional_nonnegative_int(usage_data.get("prompt_tokens")),
-            output_tokens=_optional_nonnegative_int(usage_data.get("completion_tokens")),
-            total_tokens=_optional_nonnegative_int(usage_data.get("total_tokens")),
-            estimated_cost_usd=None,
-        )
+        input_tokens = _optional_nonnegative_int(usage_data.get("prompt_tokens"))
+        output_tokens = _optional_nonnegative_int(usage_data.get("completion_tokens"))
+        total_tokens = _optional_nonnegative_int(usage_data.get("total_tokens"))
+        usage = _priced_usage(input_tokens, output_tokens, total_tokens, self.settings.pricing)
         actual_model = str(data.get("model") or self.settings.model)
         return ProviderResult(
             status="succeeded",
@@ -222,7 +259,7 @@ class OpenAICompatibleProvider:
             status=status,  # type: ignore[arg-type]
             content=None,
             identity=self.identity,
-            usage=ProviderUsage(),
+            usage=ProviderUsage(cost_unknown_reason="usage_unavailable_for_failed_request"),
             latency_ms=int((time.monotonic() - started) * 1000),
             actual_model=None,
             error_type=error_type,
@@ -238,6 +275,8 @@ class FakeDeterministicProvider:
             model_revision="fixture-v1",
             capability=capability,
             is_real=False,
+            endpoint_identity="local:fake",
+            pricing_identity={"status": "known_zero", "source": "deterministic fixture"},
         )
         self.call_count = 0
 
@@ -263,7 +302,7 @@ class FakeDeterministicProvider:
                 status="cancelled",
                 content=None,
                 identity=self.identity,
-                usage=ProviderUsage(),
+                usage=ProviderUsage(cost_unknown_reason="cancelled_before_usage"),
                 latency_ms=0,
                 error_type="cancelled",
             )
@@ -281,7 +320,10 @@ class FakeDeterministicProvider:
             status="succeeded",
             content=content,
             identity=self.identity,
-            usage=ProviderUsage(input_tokens, output_tokens, input_tokens + output_tokens, 0.0),
+            usage=ProviderUsage(
+                input_tokens, output_tokens, input_tokens + output_tokens, 0.0,
+                "known_zero", "USD", None,
+            ),
             latency_ms=int((time.monotonic() - started) * 1000),
             actual_model=self.identity.model,
             attempt_count=1,
@@ -306,42 +348,125 @@ class BudgetedProvider:
         self,
         provider: Provider,
         *,
-        maximum_calls: int,
+        maximum_requests: int | None = None,
+        maximum_calls: int | None = None,
         maximum_input_tokens: int,
         maximum_output_tokens: int,
+        maximum_cost_usd: float | None = None,
+        maximum_wall_clock_seconds: float = 3_600.0,
     ) -> None:
         self.provider = provider
-        self.maximum_calls = maximum_calls
+        self.maximum_requests = maximum_requests if maximum_requests is not None else maximum_calls
+        if self.maximum_requests is None:
+            raise ValueError("maximum_requests is required")
         self.maximum_input_tokens = maximum_input_tokens
         self.maximum_output_tokens = maximum_output_tokens
-        self.call_count = 0
+        self.maximum_cost_usd = maximum_cost_usd
+        self.maximum_wall_clock_seconds = maximum_wall_clock_seconds
+        self.request_count = 0
+        self.logical_call_count = 0
         self.input_tokens = 0
         self.output_tokens = 0
+        self.cost_usd = 0.0
+        self.retry_count = 0
+        self.usage_complete = True
+        self.cost_complete = True
+        self.cost_unknown_reasons: set[str] = set()
+        self.stop_reason: str | None = None
+        self.started_monotonic = time.monotonic()
+
+    @property
+    def call_count(self) -> int:
+        return self.request_count
 
     @property
     def identity(self) -> ProviderIdentity:
         return self.provider.identity
 
     def invoke(self, messages: list[dict[str, str]], **kwargs: Any) -> ProviderResult:
-        if (
-            self.call_count >= self.maximum_calls
-            or self.input_tokens >= self.maximum_input_tokens
-            or self.output_tokens >= self.maximum_output_tokens
-        ):
-            return ProviderResult(
-                status="failed",
-                content=None,
-                identity=self.identity,
-                usage=ProviderUsage(),
-                latency_ms=0,
-                error_type="provider_budget_exhausted",
-                attempt_count=0,
-            )
-        self.call_count += 1
+        reason = self._limit_reason()
+        if reason is not None:
+            self.stop_reason = reason
+            return self._exhausted(reason)
+        remaining = self.maximum_requests - self.request_count
+        kwargs["maximum_attempts"] = min(int(kwargs.get("maximum_attempts", 1)), remaining)
+        self.logical_call_count += 1
         result = self.provider.invoke(messages, **kwargs)
-        self.input_tokens += result.usage.input_tokens or 0
-        self.output_tokens += result.usage.output_tokens or 0
+        attempts = max(1, result.attempt_count)
+        self.request_count += attempts
+        self.retry_count += max(0, attempts - 1)
+        if result.usage.input_tokens is None or result.usage.output_tokens is None:
+            self.usage_complete = False
+        else:
+            self.input_tokens += result.usage.input_tokens
+            self.output_tokens += result.usage.output_tokens
+        if result.usage.estimated_cost_usd is None:
+            self.cost_complete = False
+            self.cost_unknown_reasons.add(result.usage.cost_unknown_reason or "unspecified")
+        else:
+            self.cost_usd += result.usage.estimated_cost_usd
+        self.stop_reason = self._limit_reason()
         return result
+
+    def _limit_reason(self) -> str | None:
+        if self.request_count >= self.maximum_requests:
+            return "request_budget_exhausted"
+        if self.input_tokens >= self.maximum_input_tokens:
+            return "input_token_budget_exhausted"
+        if self.output_tokens >= self.maximum_output_tokens:
+            return "output_token_budget_exhausted"
+        if self.maximum_cost_usd is not None and self.cost_usd >= self.maximum_cost_usd:
+            return "cost_budget_exhausted"
+        if time.monotonic() - self.started_monotonic >= self.maximum_wall_clock_seconds:
+            return "wall_clock_budget_exhausted"
+        if not self.usage_complete:
+            return "token_usage_unavailable"
+        if self.maximum_cost_usd is not None and not self.cost_complete:
+            return "cost_usage_unavailable"
+        return None
+
+    def _exhausted(self, reason: str) -> ProviderResult:
+        return ProviderResult(
+            status="failed", content=None, identity=self.identity,
+            usage=ProviderUsage(cost_unknown_reason="request_not_sent"), latency_ms=0,
+            error_type="provider_budget_exhausted", attempt_count=0,
+            raw_metadata={"stop_reason": reason},
+        )
+
+    def ledger(self) -> dict[str, Any]:
+        return {
+            "request_count": self.request_count, "logical_call_count": self.logical_call_count,
+            "retry_count": self.retry_count, "input_tokens": self.input_tokens,
+            "output_tokens": self.output_tokens, "usage_complete": self.usage_complete,
+            "cost_usd": self.cost_usd if self.cost_complete else "unknown",
+            "cost_complete": self.cost_complete, "stop_reason": self.stop_reason,
+            "cost_unknown_reasons": sorted(self.cost_unknown_reasons),
+            "elapsed_seconds": time.monotonic() - self.started_monotonic,
+            "limits": {
+                "maximum_requests": self.maximum_requests,
+                "maximum_input_tokens": self.maximum_input_tokens,
+                "maximum_output_tokens": self.maximum_output_tokens,
+                "maximum_cost_usd": self.maximum_cost_usd,
+                "maximum_wall_clock_seconds": self.maximum_wall_clock_seconds,
+            },
+        }
+
+    def restore(self, ledger: dict[str, Any]) -> None:
+        limits = ledger.get("limits")
+        if limits != self.ledger()["limits"]:
+            raise ProviderConfigurationError("checkpoint provider budget identity mismatch")
+        self.request_count = int(ledger.get("request_count", 0))
+        self.logical_call_count = int(ledger.get("logical_call_count", 0))
+        self.retry_count = int(ledger.get("retry_count", 0))
+        self.input_tokens = int(ledger.get("input_tokens", 0))
+        self.output_tokens = int(ledger.get("output_tokens", 0))
+        self.usage_complete = bool(ledger.get("usage_complete", True))
+        self.cost_complete = bool(ledger.get("cost_complete", True))
+        self.cost_unknown_reasons = {str(item) for item in ledger.get("cost_unknown_reasons", [])}
+        stored_cost = ledger.get("cost_usd", 0.0)
+        self.cost_usd = float(stored_cost) if isinstance(stored_cost, (int, float)) else 0.0
+        self.stop_reason = ledger.get("stop_reason")
+        self.started_monotonic = time.monotonic() - max(0.0, float(ledger.get("elapsed_seconds", 0.0)))
 
     def smoke_check(self) -> ProviderResult:
         return self.invoke(
@@ -364,11 +489,15 @@ class ProviderLLMClient:
         maximum_attempts: int = 2,
         seed: int = 20260726,
         cancellation: CancellationToken | None = None,
+        request_timeout_seconds: float = 60.0,
+        maximum_output_tokens: int = 1_600,
     ) -> None:
         self.provider = provider
         self.maximum_attempts = max(1, min(3, maximum_attempts))
         self.seed = seed
         self.cancellation = cancellation
+        self.request_timeout_seconds = max(0.1, min(60.0, request_timeout_seconds))
+        self.maximum_output_tokens = max(1, min(4_096, maximum_output_tokens))
         self.results: list[ProviderResult] = []
 
     @property
@@ -390,8 +519,8 @@ class ProviderLLMClient:
         result = self.provider.invoke(
             messages,
             temperature=temperature,
-            max_output_tokens=max_tokens or 1_600,
-            timeout_seconds=timeout_seconds,
+            max_output_tokens=min(max_tokens or self.maximum_output_tokens, self.maximum_output_tokens),
+            timeout_seconds=min(timeout_seconds, self.request_timeout_seconds),
             maximum_attempts=self.maximum_attempts,
             cancellation=self.cancellation,
             seed=self.seed,
@@ -403,10 +532,18 @@ class ProviderLLMClient:
 class StructuredLearningEvaluator:
     """M5 evaluator adapter; invalid provider output is explicitly ungradable."""
 
-    def __init__(self, provider: Provider, *, seed: int = 20260726) -> None:
+    def __init__(
+        self, provider: Provider, *, seed: int = 20260726,
+        maximum_attempts: int = 2, request_timeout_seconds: float = 60.0,
+        maximum_output_tokens: int = 1_600,
+    ) -> None:
         if provider.identity.capability != "structured_evaluator":
             raise ProviderConfigurationError("provider lacks structured evaluator capability")
-        self.client = ProviderLLMClient(provider, maximum_attempts=2, seed=seed)
+        self.client = ProviderLLMClient(
+            provider, maximum_attempts=maximum_attempts, seed=seed,
+            request_timeout_seconds=request_timeout_seconds,
+            maximum_output_tokens=maximum_output_tokens,
+        )
 
     @property
     def results(self) -> list[ProviderResult]:
@@ -565,6 +702,54 @@ def _optional_nonnegative_int(value: Any) -> int | None:
     except (TypeError, ValueError, OverflowError):
         return None
     return parsed if parsed >= 0 else None
+
+
+def normalized_endpoint_identity(base_url: str) -> str:
+    parsed = urllib.parse.urlsplit(base_url.strip())
+    host = (parsed.hostname or "").casefold()
+    port = f":{parsed.port}" if parsed.port is not None else ""
+    path = "/" + "/".join(part for part in parsed.path.split("/") if part)
+    path_digest = hashlib.sha256(path.encode("utf-8")).hexdigest()[:16]
+    return f"{parsed.scheme.casefold()}://{host}{port}|path-sha256:{path_digest}"
+
+
+def _pricing_identity(pricing: PricingConfig | None) -> dict[str, Any]:
+    if pricing is None:
+        return {"status": "unknown", "reason": "pricing_not_configured"}
+    return {
+        "status": "configured", "currency": pricing.currency,
+        "model": pricing.model,
+        "input_price_per_unit": pricing.input_price_per_unit,
+        "output_price_per_unit": pricing.output_price_per_unit,
+        "unit_tokens": pricing.unit_tokens, "source": pricing.source,
+    }
+
+
+def _priced_usage(
+    input_tokens: int | None,
+    output_tokens: int | None,
+    total_tokens: int | None,
+    pricing: PricingConfig | None,
+) -> ProviderUsage:
+    if input_tokens is None or output_tokens is None:
+        return ProviderUsage(
+            input_tokens, output_tokens, total_tokens, None,
+            "unknown", pricing.currency if pricing else None, "token_usage_missing",
+        )
+    if pricing is None:
+        return ProviderUsage(
+            input_tokens, output_tokens, total_tokens, None,
+            "unknown", None, "pricing_not_configured",
+        )
+    cost = (
+        input_tokens * pricing.input_price_per_unit
+        + output_tokens * pricing.output_price_per_unit
+    ) / pricing.unit_tokens
+    status = "known_zero" if cost == 0 else "calculated"
+    return ProviderUsage(
+        input_tokens, output_tokens, total_tokens, cost,
+        status, pricing.currency, None,
+    )
 
 
 def _is_secret_key(key: str) -> bool:
