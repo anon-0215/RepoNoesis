@@ -30,6 +30,15 @@ An existing manifest or checkpoint whose identity differs is rejected. Resume th
 dataset, live/fake, provider endpoint/model/revision, embedding configuration, evaluator identity, or
 result-affecting configuration boundaries.
 
+For local Hugging Face snapshots, embedding identity fields have distinct meanings:
+`configured_revision` is the explicit configuration, `resolved_revision` is a verified plain
+40-character commit SHA (or `null`), `local_snapshot_identity` is a non-sensitive path hash, and
+`model_identity` is the composite identity used for run/cache/resume isolation. A local revision is
+resolved only when the directory is a `models--*/snapshots/<sha>` snapshot with the required small
+SentenceTransformer configuration files, the configured SHA matches the directory, and `refs/main`
+also matches when present. Live runs fail closed when that revision cannot be verified. Absolute model
+paths are never written to manifests.
+
 An exact finite pilot plan uses repeated `--cell <scenario-id>::<mode>` arguments. Eighteen arguments
 mean eighteen cells, not eighteen scenarios multiplied by all modes. `--batch-count N` and zero-based
 `--batch-index I` deterministically partition the same complete plan; later batches use `--resume` and

@@ -16,8 +16,12 @@ from app.services.embedding_service import EmbeddingService
 class EmbeddingIdentity:
     provider: str
     model_name: str
-    model_revision: str
+    configured_revision: str | None
+    resolved_revision: str | None
+    local_snapshot_identity: str | None
+    model_identity: str
     max_length: int
+    batch_size: int
     normalized: bool
     device: str
     dtype: str
@@ -68,25 +72,37 @@ class M5EmbeddingProvider:
         model_identity = self.service.get_model_identity()
         payload = "|".join(
             [
+                "sentence-transformers",
                 model_identity.model_name,
-                model_identity.model_revision,
+                model_identity.model_identity,
+                model_identity.configured_revision or "unknown",
+                model_identity.resolved_revision or "unknown",
+                model_identity.local_snapshot_identity or "none",
                 str(self.settings.max_length),
+                str(self.settings.batch_size),
                 str(self.settings.normalize),
                 model_identity.device,
                 str(self.settings.query_prefix),
                 str(self.settings.document_prefix),
+                str(self._dimension),
+                "float32",
             ]
         )
+        composite_identity = hashlib.sha256(payload.encode("utf-8")).hexdigest()
         return EmbeddingIdentity(
             provider="sentence-transformers",
             model_name=model_identity.model_name,
-            model_revision=model_identity.model_revision,
+            configured_revision=model_identity.configured_revision,
+            resolved_revision=model_identity.resolved_revision,
+            local_snapshot_identity=model_identity.local_snapshot_identity,
+            model_identity=f"embedding-sha256:{composite_identity}",
             max_length=self.settings.max_length,
+            batch_size=self.settings.batch_size,
             normalized=self.settings.normalize,
             device=model_identity.device,
             dtype="float32",
             dimension=self._dimension,
-            cache_identity=hashlib.sha256(payload.encode("utf-8")).hexdigest(),
+            cache_identity=composite_identity,
             is_real=True,
         )
 

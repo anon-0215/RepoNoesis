@@ -79,7 +79,7 @@ class SemanticRetriever:
         candidates = self.database.get_code_chunk_embeddings_for_project(
             project_id,
             identity.model_name,
-            identity.model_revision,
+            identity.model_identity,
             CODE_CHUNK_TEXT_FORMAT_VERSION,
             embedding_config_hash,
             self.embedding_service.settings.normalize,

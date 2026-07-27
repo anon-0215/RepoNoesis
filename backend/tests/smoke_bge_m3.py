@@ -92,8 +92,10 @@ def main() -> int:
     integration = _run_integration_smoke(service, chunks)
     report = {
         "model_name": identity.model_name,
-        "model_revision": identity.model_revision,
-        "cache_dir": str(settings.cache_dir),
+        "configured_revision": identity.configured_revision,
+        "resolved_revision": identity.resolved_revision,
+        "local_snapshot_identity": identity.local_snapshot_identity,
+        "model_identity": identity.model_identity,
         "device": identity.device,
         "python": sys.version.split()[0],
         "versions": _versions(),

@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from app.m5.contracts import BenchmarkConfig, DatasetManifest, ProviderIdentity, RepositorySpec, Scenario
 from app.m5.embedding import fake_embedding_service
@@ -130,7 +132,9 @@ class M5RunnerModeTests(unittest.TestCase):
                                   "https://example.com/v1")
         evaluator = ProviderIdentity("provider", "judge", "j1", "structured_evaluator", True,
                                      "https://judge.example.com/v1")
-        embedding = {"provider": "dense", "model": "bge", "model_revision": "e1",
+        embedding = {"provider": "dense", "model": "bge", "configured_revision": "1" * 40,
+                     "resolved_revision": "1" * 40, "local_snapshot_identity": "path-sha256:a",
+                     "model_identity": "embedding-sha256:e1",
                      "dimension": 1024, "normalize": True, "query_prefix": "q"}
         code = {"source_tree_digest": "digest"}
         fake_id = compute_run_id(config, dataset, answer, code, live=False,
@@ -138,7 +142,8 @@ class M5RunnerModeTests(unittest.TestCase):
         live_id = compute_run_id(config, dataset, answer, code, live=True,
                                  embedding_identity=embedding, evaluator=evaluator)
         self.assertNotEqual(fake_id, live_id)
-        changed_embedding = {**embedding, "model_revision": "e2"}
+        changed_embedding = {**embedding, "local_snapshot_identity": "path-sha256:b",
+                             "model_identity": "embedding-sha256:e2"}
         self.assertNotEqual(
             live_id, compute_run_id(config, dataset, answer, code, live=True,
                                     embedding_identity=changed_embedding, evaluator=evaluator),
@@ -158,6 +163,29 @@ class M5RunnerModeTests(unittest.TestCase):
         checkpoint = _load_checkpoint(path)
         with self.assertRaises(BenchmarkCheckpointError):
             _verify_checkpoint_identity(checkpoint, "run-a", "digest-b")
+
+    def test_live_embedding_rejects_unverified_revision_before_model_load(self):
+        model_directory = Path(self.temporary.name) / "not-a-trusted-snapshot"
+        model_directory.mkdir()
+        config = BenchmarkConfig(
+            dataset_directory="d",
+            repository_root="r",
+            artifacts_directory=str(Path(self.temporary.name) / "artifacts"),
+            modes=["fixed_dense_rag"],
+        )
+        environment = {
+            "EMBEDDING_ENABLED": "1",
+            "EMBEDDING_MODEL_NAME_OR_PATH": str(model_directory),
+            "EMBEDDING_MODEL_REVISION": "not-a-commit",
+            "EMBEDDING_DEVICE": "cpu",
+            "M5_EMBEDDING_DIMENSION": "1024",
+            "M5_ALLOW_MODEL_LOAD": "1",
+            "M5_ALLOW_NETWORK": "0",
+        }
+
+        with patch.dict(os.environ, environment, clear=False):
+            with self.assertRaisesRegex(ValueError, "verified 40-character snapshot"):
+                BenchmarkRunner(config, live=True)._embedding_service()
 
     def test_exact_eighteen_cell_plan_is_not_cartesian_product(self):
         cells = [f"scenario-{index:02d}::fixed_lexical_rag" for index in range(18)]

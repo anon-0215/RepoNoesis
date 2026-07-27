@@ -424,25 +424,32 @@ class BenchmarkRunner:
             allow_network=_env_gate("M5_ALLOW_NETWORK"),
         )
         resolved_model = wrapper.ensure_model_identity()
+        if resolved_model.resolved_revision is None:
+            raise ValueError(
+                "live embedding requires a verified 40-character snapshot revision"
+            )
         actual_dimension = wrapper.get_embedding_dimension()
         if actual_dimension != int(dimension_text):
             raise ValueError(
                 f"configured embedding dimension {dimension_text} does not match loaded model dimension {actual_dimension}"
             )
-        model_name = resolved_model.model_name
-        if Path(model_name).is_absolute():
-            model_name = f"local:{Path(model_name).name}"
+        embedding_identity = wrapper.identity
         return wrapper, {
-            "provider": "sentence-transformers", "model": model_name,
-            "model_revision": resolved_model.model_revision,
-            "configured_model_revision": settings.model_revision,
+            "provider": embedding_identity.provider,
+            "model": embedding_identity.model_name,
+            "configured_revision": embedding_identity.configured_revision,
+            "resolved_revision": embedding_identity.resolved_revision,
+            "local_snapshot_identity": embedding_identity.local_snapshot_identity,
+            "model_identity": embedding_identity.model_identity,
+            "cache_identity": embedding_identity.cache_identity,
             "dimension": int(dimension_text),
-            "normalize": settings.normalize, "max_length": settings.max_length,
-            "batch_size": settings.batch_size,
+            "normalize": embedding_identity.normalized,
+            "max_length": embedding_identity.max_length,
+            "batch_size": embedding_identity.batch_size,
             "query_prefix_identity": _text_identity(settings.query_prefix),
             "document_prefix_identity": _text_identity(settings.document_prefix),
-            "device": settings.device,
-            "dtype": "float32",
+            "device": embedding_identity.device,
+            "dtype": embedding_identity.dtype,
         }
 
     def _evaluator_identity(self) -> ProviderIdentity:

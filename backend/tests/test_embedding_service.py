@@ -1,5 +1,6 @@
 import math
 import struct
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -292,6 +293,92 @@ class EmbeddingServiceTests(unittest.TestCase):
 
         self.assertEqual(identity.model_name, "BAAI/bge-m3")
         self.assertEqual(identity.model_revision, "abc123")
+
+    def test_verified_local_snapshot_separates_revision_and_model_identity(self):
+        revision = "5617a9f61b028005a4858fdac845db406aefb181"
+        with tempfile.TemporaryDirectory() as directory:
+            snapshot = self._make_snapshot(Path(directory), revision, refs_revision=revision)
+
+            identity = build_model_identity(str(snapshot), "cuda", revision)
+
+            self.assertEqual(identity.configured_revision, revision)
+            self.assertEqual(identity.resolved_revision, revision)
+            self.assertRegex(identity.resolved_revision, r"^[0-9a-f]{40}$")
+            self.assertTrue(identity.local_snapshot_identity.startswith("path-sha256:"))
+            self.assertTrue(identity.model_identity.startswith("model-sha256:"))
+            self.assertNotEqual(identity.model_identity, identity.resolved_revision)
+            self.assertNotIn(str(snapshot), str(identity.to_dict()))
+
+    def test_configured_revision_conflict_fails_closed(self):
+        revision = "1" * 40
+        with tempfile.TemporaryDirectory() as directory:
+            snapshot = self._make_snapshot(Path(directory), revision, refs_revision=revision)
+
+            with self.assertRaisesRegex(
+                EmbeddingConfigurationError, "configured embedding revision"
+            ):
+                build_model_identity(str(snapshot), "cpu", "2" * 40)
+
+    def test_refs_main_conflict_fails_closed(self):
+        revision = "1" * 40
+        with tempfile.TemporaryDirectory() as directory:
+            snapshot = self._make_snapshot(Path(directory), revision, refs_revision="2" * 40)
+
+            with self.assertRaisesRegex(EmbeddingConfigurationError, "refs/main"):
+                build_model_identity(str(snapshot), "cpu", revision)
+
+    def test_sha_named_arbitrary_directory_is_not_a_resolved_snapshot(self):
+        revision = "1" * 40
+        with tempfile.TemporaryDirectory() as directory:
+            snapshot = Path(directory) / revision
+            snapshot.mkdir()
+            (snapshot / "config.json").write_text("{}", encoding="utf-8")
+            (snapshot / "modules.json").write_text("[]", encoding="utf-8")
+
+            identity = build_model_identity(str(snapshot), "cpu", revision)
+
+            self.assertIsNone(identity.resolved_revision)
+            self.assertIsNotNone(identity.local_snapshot_identity)
+
+    def test_missing_or_invalid_configured_revision_remains_unresolved(self):
+        revision = "1" * 40
+        with tempfile.TemporaryDirectory() as directory:
+            snapshot = self._make_snapshot(Path(directory), revision, refs_revision=revision)
+
+            missing = build_model_identity(str(snapshot), "cpu", "")
+            invalid = build_model_identity(str(snapshot), "cpu", "not-a-commit")
+
+            self.assertIsNone(missing.resolved_revision)
+            self.assertIsNone(invalid.resolved_revision)
+
+    def test_different_local_snapshots_have_different_model_identities(self):
+        revision = "1" * 40
+        with tempfile.TemporaryDirectory() as first, tempfile.TemporaryDirectory() as second:
+            first_snapshot = self._make_snapshot(Path(first), revision, refs_revision=revision)
+            second_snapshot = self._make_snapshot(Path(second), revision, refs_revision=revision)
+
+            first_identity = build_model_identity(str(first_snapshot), "cpu", revision)
+            second_identity = build_model_identity(str(second_snapshot), "cpu", revision)
+
+            self.assertNotEqual(
+                first_identity.local_snapshot_identity,
+                second_identity.local_snapshot_identity,
+            )
+            self.assertNotEqual(first_identity.model_identity, second_identity.model_identity)
+
+    @staticmethod
+    def _make_snapshot(root: Path, revision: str, refs_revision: str | None) -> Path:
+        model_root = root / "models--BAAI--bge-m3"
+        snapshot = model_root / "snapshots" / revision
+        (snapshot / "1_Pooling").mkdir(parents=True)
+        (snapshot / "config.json").write_text("{}", encoding="utf-8")
+        (snapshot / "modules.json").write_text("[]", encoding="utf-8")
+        (snapshot / "1_Pooling" / "config.json").write_text("{}", encoding="utf-8")
+        if refs_revision is not None:
+            refs = model_root / "refs"
+            refs.mkdir()
+            (refs / "main").write_text(refs_revision, encoding="utf-8")
+        return snapshot
 
 
 if __name__ == "__main__":

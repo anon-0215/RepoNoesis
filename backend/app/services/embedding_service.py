@@ -5,7 +5,7 @@ import importlib.util
 import json
 import math
 import re
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from pathlib import Path
 from threading import RLock
 from typing import Any, Callable, Protocol, Sequence
@@ -37,11 +37,26 @@ class EmbeddingEncodeError(EmbeddingError):
 @dataclass(frozen=True)
 class EmbeddingModelIdentity:
     model_name: str
-    model_revision: str
+    model_identity: str
     device: str
+    configured_revision: str | None = None
+    resolved_revision: str | None = None
+    local_snapshot_identity: str | None = None
 
-    def to_dict(self) -> dict[str, str]:
-        return asdict(self)
+    @property
+    def model_revision(self) -> str:
+        """Backward-compatible alias for the composite cache identity."""
+        return self.model_identity
+
+    def to_dict(self) -> dict[str, str | None]:
+        return {
+            "model_name": self.model_name,
+            "model_identity": self.model_identity,
+            "device": self.device,
+            "configured_revision": self.configured_revision,
+            "resolved_revision": self.resolved_revision,
+            "local_snapshot_identity": self.local_snapshot_identity,
+        }
 
 
 class EmbeddingBackend(Protocol):
@@ -111,9 +126,7 @@ class SentenceTransformerEmbeddingBackend:
         if max_length > 0 and hasattr(model, "max_seq_length"):
             model.max_seq_length = max_length
         self._model = model
-        self._resolved_revision = (
-            _extract_sentence_transformer_revision(model) or model_revision
-        )
+        self._resolved_revision = _extract_sentence_transformer_revision(model)
 
     def encode(
         self,
@@ -192,12 +205,32 @@ class EmbeddingService:
                 raise EmbeddingModelLoadError(
                     f"failed to load embedding model {identity.model_name} on {device}"
                 ) from exc
-            resolved_revision = _backend_model_revision(backend) or identity.model_revision
+            backend_revision = _normalize_commit_sha(_backend_model_revision(backend))
+            resolved_revision = identity.resolved_revision
+            configured_commit = _normalize_commit_sha(identity.configured_revision)
+            if backend_revision is not None:
+                if configured_commit is not None and backend_revision != configured_commit:
+                    raise EmbeddingModelLoadError(
+                        "loaded embedding revision does not match configured revision"
+                    )
+                if resolved_revision is not None and backend_revision != resolved_revision:
+                    raise EmbeddingModelLoadError(
+                        "loaded embedding revision does not match verified local snapshot"
+                    )
+                resolved_revision = backend_revision
             self._backend = backend
             self._identity = EmbeddingModelIdentity(
                 identity.model_name,
-                resolved_revision,
+                _compose_model_identity(
+                    identity.model_name,
+                    identity.configured_revision,
+                    resolved_revision,
+                    identity.local_snapshot_identity,
+                ),
                 identity.device,
+                identity.configured_revision,
+                resolved_revision,
+                identity.local_snapshot_identity,
             )
             self._dimension = backend.get_embedding_dimension()
 
@@ -346,11 +379,106 @@ def build_model_identity(
         resolved = path.expanduser().resolve(strict=False)
         digest = hashlib.sha256(str(resolved).encode("utf-8")).hexdigest()[:16]
         safe_name = f"local:{resolved.name or 'embedding-model'}"
-        revision = f"path-sha256:{digest}"
-        if configured_revision:
-            revision = f"{revision}:configured-revision:{configured_revision}"
-        return EmbeddingModelIdentity(safe_name, revision, device)
-    return EmbeddingModelIdentity(raw, configured_revision, device)
+        local_snapshot_identity = f"path-sha256:{digest}"
+        resolved_revision = _resolve_local_snapshot_revision(
+            resolved,
+            configured_revision or None,
+        )
+        model_identity = _compose_model_identity(
+            safe_name,
+            configured_revision or None,
+            resolved_revision,
+            local_snapshot_identity,
+        )
+        return EmbeddingModelIdentity(
+            safe_name,
+            model_identity,
+            device,
+            configured_revision or None,
+            resolved_revision,
+            local_snapshot_identity,
+        )
+    return EmbeddingModelIdentity(
+        raw,
+        configured_revision or raw,
+        device,
+        configured_revision or None,
+        None,
+        None,
+    )
+
+
+def _resolve_local_snapshot_revision(
+    snapshot_path: Path,
+    configured_revision: str | None,
+) -> str | None:
+    """Resolve a commit only from a verified Hugging Face snapshot layout."""
+    if not _is_hugging_face_snapshot_layout(snapshot_path):
+        return None
+
+    directory_revision = _normalize_commit_sha(snapshot_path.name)
+    configured_commit = _normalize_commit_sha(configured_revision)
+    if directory_revision is None or configured_commit is None:
+        return None
+    if configured_commit != directory_revision:
+        raise EmbeddingConfigurationError(
+            "configured embedding revision does not match local snapshot directory"
+        )
+
+    refs_main = snapshot_path.parent.parent / "refs" / "main"
+    if refs_main.exists():
+        try:
+            refs_revision = _normalize_commit_sha(
+                refs_main.read_text(encoding="utf-8").strip()
+            )
+        except OSError as exc:
+            raise EmbeddingConfigurationError(
+                "unable to read local embedding snapshot refs/main"
+            ) from exc
+        if refs_revision != directory_revision:
+            raise EmbeddingConfigurationError(
+                "local embedding snapshot refs/main does not match snapshot directory"
+            )
+    return directory_revision
+
+
+def _is_hugging_face_snapshot_layout(snapshot_path: Path) -> bool:
+    model_root = snapshot_path.parent.parent
+    return (
+        snapshot_path.is_dir()
+        and snapshot_path.parent.name == "snapshots"
+        and model_root.name.startswith("models--")
+        and (snapshot_path / "config.json").is_file()
+        and (snapshot_path / "modules.json").is_file()
+        and (snapshot_path / "1_Pooling" / "config.json").is_file()
+    )
+
+
+def _compose_model_identity(
+    model_name: str,
+    configured_revision: str | None,
+    resolved_revision: str | None,
+    local_snapshot_identity: str | None,
+) -> str:
+    if local_snapshot_identity is None and resolved_revision is None:
+        return configured_revision or model_name
+    payload = json.dumps(
+        {
+            "provider": "sentence-transformers",
+            "model_name": model_name,
+            "configured_revision": configured_revision,
+            "resolved_revision": resolved_revision,
+            "local_snapshot_identity": local_snapshot_identity,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return f"model-sha256:{hashlib.sha256(payload.encode('utf-8')).hexdigest()}"
+
+
+def _normalize_commit_sha(value: str | None) -> str | None:
+    candidate = (value or "").strip().lower()
+    return candidate if re.fullmatch(r"[0-9a-f]{40}", candidate) else None
 
 
 def build_embedding_config_hash(settings: EmbeddingSettings) -> str:

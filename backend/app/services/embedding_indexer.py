@@ -22,7 +22,10 @@ class EmbeddingIndexStats:
     generated_chunks: int
     failed_chunks: int
     model_name: str
-    model_revision: str
+    configured_revision: str | None
+    resolved_revision: str | None
+    local_snapshot_identity: str | None
+    model_identity: str
     dimension: int | None
     device: str
     duration_ms: int
@@ -54,7 +57,10 @@ class EmbeddingIndexer:
                 generated_chunks=0,
                 failed_chunks=0,
                 model_name=identity.model_name,
-                model_revision=identity.model_revision,
+                configured_revision=identity.configured_revision,
+                resolved_revision=identity.resolved_revision,
+                local_snapshot_identity=identity.local_snapshot_identity,
+                model_identity=identity.model_identity,
                 dimension=None,
                 device=identity.device,
                 duration_ms=_elapsed_ms(started),
@@ -74,7 +80,7 @@ class EmbeddingIndexer:
         missing = self.database.get_code_chunks_missing_embeddings(
             project_id,
             identity.model_name,
-            identity.model_revision,
+            identity.model_identity,
             CODE_CHUNK_TEXT_FORMAT_VERSION,
             embedding_config_hash,
             self.embedding_service.settings.normalize,
@@ -101,7 +107,8 @@ class EmbeddingIndexer:
                                 self.embedding_service.settings,
                             ),
                             "model_name": identity.model_name,
-                            "model_revision": identity.model_revision,
+                            # Historical database column; stores the composite cache identity.
+                            "model_revision": identity.model_identity,
                             "text_format_version": CODE_CHUNK_TEXT_FORMAT_VERSION,
                             "embedding_config_hash": embedding_config_hash,
                             "embedding_dimension": len(vector),
@@ -124,7 +131,7 @@ class EmbeddingIndexer:
         cached_dimensions = self.database.get_fresh_embedding_dimensions_for_project(
             project_id,
             identity.model_name,
-            identity.model_revision,
+            identity.model_identity,
             CODE_CHUNK_TEXT_FORMAT_VERSION,
             embedding_config_hash,
             self.embedding_service.settings.normalize,
@@ -143,7 +150,10 @@ class EmbeddingIndexer:
             generated_chunks=generated,
             failed_chunks=failed,
             model_name=identity.model_name,
-            model_revision=identity.model_revision,
+            configured_revision=identity.configured_revision,
+            resolved_revision=identity.resolved_revision,
+            local_snapshot_identity=identity.local_snapshot_identity,
+            model_identity=identity.model_identity,
             dimension=dimension,
             device=self.embedding_service.get_model_identity().device,
             duration_ms=_elapsed_ms(started),
