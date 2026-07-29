@@ -3,34 +3,16 @@ from __future__ import annotations
 import hashlib
 import math
 import time
-from dataclasses import asdict, dataclass, replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
 from app.config import EmbeddingSettings
 from app.m5.providers import ProviderConfigurationError, validate_vector
-from app.services.embedding_service import EmbeddingService
+from app.services.embedding_service import EffectiveEmbeddingIdentity, EmbeddingService
 
 
-@dataclass(frozen=True)
-class EmbeddingIdentity:
-    provider: str
-    model_name: str
-    configured_revision: str | None
-    resolved_revision: str | None
-    local_snapshot_identity: str | None
-    model_identity: str
-    max_length: int
-    batch_size: int
-    normalized: bool
-    device: str
-    dtype: str
-    dimension: int | None
-    cache_identity: str
-    is_real: bool
-
-    def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+EmbeddingIdentity = EffectiveEmbeddingIdentity
 
 
 @dataclass(frozen=True)
@@ -69,42 +51,11 @@ class M5EmbeddingProvider:
 
     @property
     def identity(self) -> EmbeddingIdentity:
-        model_identity = self.service.get_model_identity()
-        payload = "|".join(
-            [
-                "sentence-transformers",
-                model_identity.model_name,
-                model_identity.model_identity,
-                model_identity.configured_revision or "unknown",
-                model_identity.resolved_revision or "unknown",
-                model_identity.local_snapshot_identity or "none",
-                str(self.settings.max_length),
-                str(self.settings.batch_size),
-                str(self.settings.normalize),
-                model_identity.device,
-                str(self.settings.query_prefix),
-                str(self.settings.document_prefix),
-                str(self._dimension),
-                "float32",
-            ]
+        identity = self.service.get_effective_embedding_identity(
+            local_files_only=not self.allow_network,
         )
-        composite_identity = hashlib.sha256(payload.encode("utf-8")).hexdigest()
-        return EmbeddingIdentity(
-            provider="sentence-transformers",
-            model_name=model_identity.model_name,
-            configured_revision=model_identity.configured_revision,
-            resolved_revision=model_identity.resolved_revision,
-            local_snapshot_identity=model_identity.local_snapshot_identity,
-            model_identity=f"embedding-sha256:{composite_identity}",
-            max_length=self.settings.max_length,
-            batch_size=self.settings.batch_size,
-            normalized=self.settings.normalize,
-            device=model_identity.device,
-            dtype="float32",
-            dimension=self._dimension,
-            cache_identity=composite_identity,
-            is_real=True,
-        )
+        self._dimension = identity.dimension
+        return replace(identity, is_real=True)
 
     def encode_query(self, text: str, local_files_only: bool = False) -> list[float]:
         vector = self.service.encode_query(
@@ -123,17 +74,34 @@ class M5EmbeddingProvider:
             self._dimension = len(vector)
         return vectors
 
-    def ensure_model_identity(self, local_files_only: bool = False) -> Any:
+    def ensure_backend_identity(self, local_files_only: bool = False) -> Any:
         return self.service.ensure_model_identity(
             local_files_only=local_files_only or not self.allow_network
         )
 
-    def get_model_identity(self) -> Any:
+    def get_backend_identity(self) -> Any:
         return self.service.get_model_identity()
 
+    def ensure_effective_embedding_identity(
+        self,
+        local_files_only: bool = False,
+    ) -> EmbeddingIdentity:
+        identity = self.service.ensure_effective_embedding_identity(
+            local_files_only=local_files_only or not self.allow_network
+        )
+        self._dimension = identity.dimension
+        return replace(identity, is_real=True)
+
+    def get_model_identity(self) -> EmbeddingIdentity:
+        return self.ensure_effective_embedding_identity()
+
+    def ensure_model_identity(self, local_files_only: bool = False) -> EmbeddingIdentity:
+        return self.ensure_effective_embedding_identity(local_files_only=local_files_only)
+
     def get_embedding_dimension(self) -> int | None:
-        self.ensure_model_identity()
-        dimension = self.service.get_embedding_dimension()
+        dimension = self.service.get_embedding_dimension(
+            local_files_only=not self.allow_network
+        )
         if dimension is not None:
             if self._dimension is not None and self._dimension != dimension:
                 raise ValueError("embedding dimension changed during the run")

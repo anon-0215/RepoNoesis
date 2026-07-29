@@ -39,6 +39,24 @@ SentenceTransformer configuration files, the configured SHA matches the director
 also matches when present. Live runs fail closed when that revision cannot be verified. Absolute model
 paths are never written to manifests.
 
+Dense cache and standalone resume use one `embedding-effective-v1` identity contract. The backend
+identity describes the loaded model source; the wrapper identity is the canonical
+`embedding-sha256:<digest>` over that backend identity plus the verified revisions, non-sensitive
+snapshot identity, output dimension, normalization, text-format version, hashed query/document
+prefixes, maximum length, pooling/config identities, device, and dtype. Callers obtain this object
+from the embedding provider instead of assembling cache keys themselves. Dimension is explicit in
+the identity and the SQLite uniqueness key because differently shaped vectors are not interchangeable,
+even when every model label is otherwise the same.
+
+SQLite schema v7 retains pre-contract rows as `legacy`/ineligible audit records; they are never a hit
+for the effective identity protocol and are not deleted during migration. New identities may coexist
+for the same chunk. A standalone dense artifact writes atomic `manifest.json` and `checkpoint.json`
+files containing the repository and chunk-inventory identities plus the same effective embedding
+identity used by SQLite. Resume rejects missing/old schemas and any repository, inventory, wrapper,
+revision, dimension, normalization, text-format, or configuration mismatch. Internally inconsistent
+metadata is rejected in a no-model preflight before the provider is asked to resolve its effective
+identity; a valid artifact is then compared with the current provider identity before any encoding.
+
 An exact finite pilot plan uses repeated `--cell <scenario-id>::<mode>` arguments. Eighteen arguments
 mean eighteen cells, not eighteen scenarios multiplied by all modes. `--batch-count N` and zero-based
 `--batch-index I` deterministically partition the same complete plan; later batches use `--resume` and

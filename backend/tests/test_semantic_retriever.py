@@ -9,7 +9,9 @@ from app.services.embedding_service import (
     CODE_CHUNK_TEXT_FORMAT_VERSION,
     EmbeddingService,
     build_code_chunk_embedding_input_hash,
+    build_effective_embedding_identity,
     build_embedding_config_hash,
+    build_model_identity,
 )
 from app.services.semantic_retriever import SemanticRetriever
 
@@ -94,6 +96,16 @@ def _chunk(path, name, content=None, chunk_type="function", start_line=1):
 
 def _record(chunk, vector, settings=None):
     embedding_settings = settings or _settings()
+    identity = build_effective_embedding_identity(
+        build_model_identity(
+            embedding_settings.model_name_or_path,
+            embedding_settings.device,
+            embedding_settings.model_revision,
+        ),
+        embedding_settings,
+        len(vector),
+        is_real=False,
+    )
     return {
         "code_chunk_id": chunk["id"],
         "content_hash": chunk["content_hash"],
@@ -103,6 +115,10 @@ def _record(chunk, vector, settings=None):
         ),
         "model_name": MODEL_NAME,
         "model_revision": MODEL_REVISION,
+        "identity_schema_version": identity.identity_schema_version,
+        "wrapper_model_identity": identity.model_identity,
+        "resolved_revision": identity.resolved_revision or "",
+        "identity_eligible": True,
         "text_format_version": CODE_CHUNK_TEXT_FORMAT_VERSION,
         "embedding_config_hash": build_embedding_config_hash(embedding_settings),
         "embedding_dimension": len(vector),
@@ -252,7 +268,7 @@ class SemanticRetrieverTests(unittest.TestCase):
             self.assertEqual(outcome.status, "no_embeddings")
             self.assertEqual(outcome.results, [])
 
-    def test_dimension_mismatch_is_reported(self):
+    def test_dimension_mismatch_is_isolated_from_candidates(self):
         with tempfile.TemporaryDirectory() as directory:
             db = Database(Path(directory) / "dimension.sqlite")
             project_id = _project_id(db)
@@ -268,8 +284,13 @@ class SemanticRetrieverTests(unittest.TestCase):
                 ]
             )
 
-            with self.assertRaises(ValueError):
-                SemanticRetriever(db, _service()).search(project_id, "auth")
+            outcome = SemanticRetriever(db, _service()).search(project_id, "auth")
+
+            self.assertEqual(outcome.status, "ok")
+            self.assertEqual(
+                [item.qualified_name for item in outcome.results],
+                ["authenticate_user"],
+            )
 
     def test_top_k_is_bounded(self):
         with tempfile.TemporaryDirectory() as directory:

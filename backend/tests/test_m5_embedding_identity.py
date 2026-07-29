@@ -3,7 +3,7 @@ import unittest
 from pathlib import Path
 
 from app.config import EmbeddingSettings
-from app.m5.embedding import M5EmbeddingProvider
+from app.m5.embedding import FakeEmbeddingBackend, M5EmbeddingProvider
 
 
 class M5EmbeddingIdentityTests(unittest.TestCase):
@@ -16,7 +16,7 @@ class M5EmbeddingIdentityTests(unittest.TestCase):
                 cache_directory=Path(directory) / "cache",
                 allow_model_load=True,
                 allow_network=False,
-                backend_factory=lambda: None,
+                backend_factory=lambda: FakeEmbeddingBackend(1024),
                 cuda_available=lambda: True,
             )
 
@@ -39,7 +39,7 @@ class M5EmbeddingIdentityTests(unittest.TestCase):
                 cache_directory=Path(directory) / "cache-a",
                 allow_model_load=True,
                 allow_network=False,
-                backend_factory=lambda: None,
+                backend_factory=lambda: FakeEmbeddingBackend(1024),
                 cuda_available=lambda: True,
             ).identity
             second = M5EmbeddingProvider(
@@ -47,7 +47,7 @@ class M5EmbeddingIdentityTests(unittest.TestCase):
                 cache_directory=Path(directory) / "cache-b",
                 allow_model_load=True,
                 allow_network=False,
-                backend_factory=lambda: None,
+                backend_factory=lambda: FakeEmbeddingBackend(1024),
                 cuda_available=lambda: True,
             ).identity
 

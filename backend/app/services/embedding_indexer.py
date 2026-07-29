@@ -2,17 +2,33 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 from time import perf_counter
-from typing import Any, Sequence
+from typing import Any, Literal, Protocol, Sequence
 
 from app.database import Database
 from app.services.embedding_service import (
     CODE_CHUNK_TEXT_FORMAT_VERSION,
     EmbeddingError,
-    EmbeddingService,
+    EffectiveEmbeddingIdentity,
     build_code_chunk_embedding_input_hash,
     build_code_chunk_document_text,
-    build_embedding_config_hash,
 )
+
+
+class EffectiveEmbeddingProvider(Protocol):
+    settings: Any
+
+    def get_backend_identity(self) -> Any: ...
+
+    def ensure_effective_embedding_identity(
+        self,
+        local_files_only: bool = False,
+    ) -> EffectiveEmbeddingIdentity: ...
+
+    def encode_documents(
+        self,
+        texts: Sequence[str],
+        local_files_only: bool = False,
+    ) -> list[list[float]]: ...
 
 
 @dataclass
@@ -25,6 +41,7 @@ class EmbeddingIndexStats:
     configured_revision: str | None
     resolved_revision: str | None
     local_snapshot_identity: str | None
+    backend_model_identity: str
     model_identity: str
     dimension: int | None
     device: str
@@ -39,15 +56,21 @@ class EmbeddingIndexer:
     def __init__(
         self,
         database: Database,
-        embedding_service: EmbeddingService,
+        embedding_service: EffectiveEmbeddingProvider,
     ) -> None:
         self.database = database
         self.embedding_service = embedding_service
 
-    def index_project(self, project_id: str) -> EmbeddingIndexStats:
+    def index_project(
+        self,
+        project_id: str,
+        *,
+        artifact: Any | None = None,
+        artifact_mode: Literal["create", "extend", "resume"] = "resume",
+    ) -> EmbeddingIndexStats:
         started = perf_counter()
         chunks = self.database.get_code_chunks(project_id)
-        identity = self.embedding_service.get_model_identity()
+        backend_identity = self.embedding_service.get_backend_identity()
         warnings: list[str] = []
         if not self.embedding_service.settings.enabled:
             warnings.append("Embeddings are disabled by EMBEDDING_ENABLED=false.")
@@ -56,19 +79,23 @@ class EmbeddingIndexer:
                 cached_chunks=0,
                 generated_chunks=0,
                 failed_chunks=0,
-                model_name=identity.model_name,
-                configured_revision=identity.configured_revision,
-                resolved_revision=identity.resolved_revision,
-                local_snapshot_identity=identity.local_snapshot_identity,
-                model_identity=identity.model_identity,
+                model_name=backend_identity.model_name,
+                configured_revision=backend_identity.configured_revision,
+                resolved_revision=backend_identity.resolved_revision,
+                local_snapshot_identity=backend_identity.local_snapshot_identity,
+                backend_model_identity=backend_identity.model_identity,
+                model_identity=backend_identity.model_identity,
                 dimension=None,
-                device=identity.device,
+                device=backend_identity.device,
                 duration_ms=_elapsed_ms(started),
                 warnings=warnings,
             )
-        if chunks:
-            identity = self.embedding_service.ensure_model_identity()
-        embedding_config_hash = build_embedding_config_hash(self.embedding_service.settings)
+        if artifact is not None:
+            artifact.preflight(chunks, mode=artifact_mode)
+        identity = self.embedding_service.ensure_effective_embedding_identity()
+        if artifact is not None:
+            artifact.prepare(chunks, identity, mode=artifact_mode)
+        embedding_config_hash = identity.embedding_config_hash
         embedding_input_hashes = {
             int(chunk["id"]): build_code_chunk_embedding_input_hash(
                 chunk,
@@ -80,11 +107,12 @@ class EmbeddingIndexer:
         missing = self.database.get_code_chunks_missing_embeddings(
             project_id,
             identity.model_name,
-            identity.model_identity,
+            identity.backend_model_identity,
             CODE_CHUNK_TEXT_FORMAT_VERSION,
             embedding_config_hash,
             self.embedding_service.settings.normalize,
             embedding_input_hashes,
+            effective_identity=identity,
         )
         generated = 0
         failed = 0
@@ -107,8 +135,13 @@ class EmbeddingIndexer:
                                 self.embedding_service.settings,
                             ),
                             "model_name": identity.model_name,
-                            # Historical database column; stores the composite cache identity.
-                            "model_revision": identity.model_identity,
+                            # Historical column retained for legacy readers; the wrapper identity
+                            # below is authoritative for the effective cache protocol.
+                            "model_revision": identity.backend_model_identity,
+                            "identity_schema_version": identity.identity_schema_version,
+                            "wrapper_model_identity": identity.model_identity,
+                            "resolved_revision": identity.resolved_revision or "",
+                            "identity_eligible": True,
                             "text_format_version": CODE_CHUNK_TEXT_FORMAT_VERSION,
                             "embedding_config_hash": embedding_config_hash,
                             "embedding_dimension": len(vector),
@@ -127,14 +160,20 @@ class EmbeddingIndexer:
                 continue
             generated += len(successes)
             dimension = len(successes[0][1])
+            if artifact is not None:
+                artifact.update_progress(
+                    len(chunks) - len(missing) + generated,
+                    status="indexing",
+                )
 
         cached_dimensions = self.database.get_fresh_embedding_dimensions_for_project(
             project_id,
             identity.model_name,
-            identity.model_identity,
+            identity.backend_model_identity,
             CODE_CHUNK_TEXT_FORMAT_VERSION,
             embedding_config_hash,
             self.embedding_service.settings.normalize,
+            effective_identity=identity,
         )
         if dimension is None and len(cached_dimensions) == 1:
             dimension = cached_dimensions[0]
@@ -144,7 +183,7 @@ class EmbeddingIndexer:
                 f"{cached_dimensions}"
             )
 
-        return EmbeddingIndexStats(
+        stats = EmbeddingIndexStats(
             total_chunks=len(chunks),
             cached_chunks=len(chunks) - len(missing),
             generated_chunks=generated,
@@ -153,12 +192,20 @@ class EmbeddingIndexer:
             configured_revision=identity.configured_revision,
             resolved_revision=identity.resolved_revision,
             local_snapshot_identity=identity.local_snapshot_identity,
+            backend_model_identity=identity.backend_model_identity,
             model_identity=identity.model_identity,
             dimension=dimension,
-            device=self.embedding_service.get_model_identity().device,
+            device=identity.device,
             duration_ms=_elapsed_ms(started),
             warnings=warnings,
         )
+        if artifact is not None:
+            indexed_count = stats.cached_chunks + stats.generated_chunks
+            artifact.complete(
+                indexed_count,
+                partial=stats.failed_chunks > 0 or indexed_count != stats.total_chunks,
+            )
+        return stats
 
     def _encode_batch(
         self,

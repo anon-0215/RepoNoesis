@@ -371,7 +371,7 @@ class M2AgentTests(unittest.TestCase):
         self.assertEqual(result["budget_usage"]["limits"]["max_agent_steps"], 5)
         self.assertEqual(result["citations"], [])
 
-    def test_formal_route_defaults_through_agent_core_and_schema_is_v6(self):
+    def test_formal_route_defaults_through_agent_core_and_schema_is_v7(self):
         route_directory = tempfile.TemporaryDirectory()
         self.addCleanup(route_directory.cleanup)
         route_db_path = str(Path(route_directory.name) / "route.sqlite")
@@ -400,7 +400,7 @@ class M2AgentTests(unittest.TestCase):
         mocked_agent.assert_called_once()
         self.assertEqual(validated.agent_schema_version, 1)
         self.assertEqual(result["agent_mode"], "deterministic_fallback")
-        self.assertEqual(SCHEMA_VERSION, 6)
+        self.assertEqual(SCHEMA_VERSION, 7)
 
 
 if __name__ == "__main__":

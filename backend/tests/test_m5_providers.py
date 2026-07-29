@@ -22,7 +22,7 @@ from app.m5.providers import (
     normalized_endpoint_identity,
 )
 from app.m5.contracts import ProviderResult, ProviderUsage
-from app.m5.embedding import M5EmbeddingProvider
+from app.m5.embedding import M5EmbeddingProvider, fake_embedding_service
 from app.services.agent_contracts import CancellationToken
 
 
@@ -226,12 +226,17 @@ class M5ProviderTests(unittest.TestCase):
         wrapper.service = MagicMock()
         wrapper.service.encode_query.return_value = [1.0, 0.0]
         wrapper.service.encode_documents.return_value = [[1.0, 0.0]]
+        wrapper.service.ensure_effective_embedding_identity.return_value = (
+            fake_embedding_service(Path("unused")).ensure_effective_embedding_identity()
+        )
         wrapper.encode_query("query")
         wrapper.encode_documents(["document"])
         wrapper.ensure_model_identity()
         wrapper.service.encode_query.assert_called_once_with("query", local_files_only=True)
         wrapper.service.encode_documents.assert_called_once_with(["document"], local_files_only=True)
-        wrapper.service.ensure_model_identity.assert_called_once_with(local_files_only=True)
+        wrapper.service.ensure_effective_embedding_identity.assert_called_once_with(
+            local_files_only=True
+        )
 
 
 if __name__ == "__main__":

@@ -15,7 +15,7 @@ from app.learning_schema import LEARNING_SCHEMA_STATEMENTS
 
 
 DEFAULT_DB_PATH = Path(__file__).resolve().parents[1] / "data" / "gitlearn.sqlite"
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 
 SCHEMA = """
@@ -115,6 +115,10 @@ CREATE TABLE IF NOT EXISTS code_chunk_embeddings (
     embedding_input_hash TEXT NOT NULL,
     model_name TEXT NOT NULL,
     model_revision TEXT NOT NULL DEFAULT '',
+    identity_schema_version TEXT NOT NULL DEFAULT 'legacy',
+    wrapper_model_identity TEXT NOT NULL DEFAULT '',
+    resolved_revision TEXT NOT NULL DEFAULT '',
+    identity_eligible INTEGER NOT NULL DEFAULT 0,
     text_format_version TEXT NOT NULL,
     embedding_config_hash TEXT NOT NULL DEFAULT '',
     embedding_dimension INTEGER NOT NULL,
@@ -256,20 +260,27 @@ class Database:
     def _init_schema(self) -> None:
         with self.connect() as conn:
             conn.executescript(SCHEMA)
-            self._migrate_schema(conn)
-            conn.execute(
-                "INSERT OR IGNORE INTO schema_versions (key, version) VALUES (?, ?)",
-                ("database", SCHEMA_VERSION),
-            )
-            conn.execute(
-                """
-                UPDATE schema_versions
-                SET version = ?,
-                    updated_at = CURRENT_TIMESTAMP
-                WHERE key = ? AND version < ?
-                """,
-                (SCHEMA_VERSION, "database", SCHEMA_VERSION),
-            )
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                self._migrate_schema(conn)
+                conn.execute(
+                    "INSERT OR IGNORE INTO schema_versions (key, version) VALUES (?, ?)",
+                    ("database", SCHEMA_VERSION),
+                )
+                conn.execute(
+                    """
+                    UPDATE schema_versions
+                    SET version = ?,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE key = ? AND version < ?
+                    """,
+                    (SCHEMA_VERSION, "database", SCHEMA_VERSION),
+                )
+            except Exception:
+                conn.rollback()
+                raise
+            else:
+                conn.commit()
 
     def _migrate_schema(self, conn: sqlite3.Connection) -> None:
         project_columns = {
@@ -301,14 +312,36 @@ class Database:
                 ADD COLUMN embedding_config_hash TEXT NOT NULL DEFAULT ''
                 """
             )
+        if "identity_schema_version" not in embedding_columns:
+            conn.execute(
+                "ALTER TABLE code_chunk_embeddings "
+                "ADD COLUMN identity_schema_version TEXT NOT NULL DEFAULT 'legacy'"
+            )
+        if "wrapper_model_identity" not in embedding_columns:
+            conn.execute(
+                "ALTER TABLE code_chunk_embeddings "
+                "ADD COLUMN wrapper_model_identity TEXT NOT NULL DEFAULT ''"
+            )
+        if "resolved_revision" not in embedding_columns:
+            conn.execute(
+                "ALTER TABLE code_chunk_embeddings "
+                "ADD COLUMN resolved_revision TEXT NOT NULL DEFAULT ''"
+            )
+        if "identity_eligible" not in embedding_columns:
+            conn.execute(
+                "ALTER TABLE code_chunk_embeddings "
+                "ADD COLUMN identity_eligible INTEGER NOT NULL DEFAULT 0"
+            )
         conn.execute("DROP INDEX IF EXISTS idx_code_chunk_embeddings_unique")
         conn.execute("DROP INDEX IF EXISTS idx_code_chunk_embeddings_lookup")
         conn.execute(
             """
             CREATE UNIQUE INDEX IF NOT EXISTS idx_code_chunk_embeddings_unique
             ON code_chunk_embeddings (
-                code_chunk_id, embedding_input_hash, model_name, model_revision,
-                text_format_version, embedding_config_hash, normalized
+                code_chunk_id, content_hash, embedding_input_hash,
+                identity_schema_version, wrapper_model_identity,
+                resolved_revision, embedding_dimension, normalized,
+                text_format_version, embedding_config_hash
             )
             """
         )
@@ -316,8 +349,10 @@ class Database:
             """
             CREATE INDEX IF NOT EXISTS idx_code_chunk_embeddings_lookup
             ON code_chunk_embeddings (
-                model_name, model_revision, text_format_version,
-                embedding_config_hash, normalized, content_hash
+                identity_eligible, identity_schema_version,
+                wrapper_model_identity, resolved_revision,
+                embedding_dimension, normalized, text_format_version,
+                embedding_config_hash, content_hash, embedding_input_hash
             )
             """
         )
@@ -785,7 +820,11 @@ class Database:
         embedding_config_hash: str = "",
         normalized: bool = True,
         embedding_input_hashes: dict[int, str] | None = None,
+        effective_identity: Any | None = None,
     ) -> list[dict[str, Any]]:
+        identity_clause, identity_params = _embedding_identity_predicate(
+            "e", effective_identity
+        )
         with self.connect() as conn:
             if embedding_input_hashes is None:
                 rows = conn.execute(
@@ -803,9 +842,10 @@ class Database:
                           AND e.text_format_version = ?
                           AND e.embedding_config_hash = ?
                           AND e.normalized = ?
+                          {identity_clause}
                       )
                     ORDER BY c.path, c.start_line, c.id
-                    """,
+                    """.format(identity_clause=identity_clause),
                     (
                         project_id,
                         model_name,
@@ -813,6 +853,7 @@ class Database:
                         text_format_version,
                         embedding_config_hash,
                         1 if normalized else 0,
+                        *identity_params,
                     ),
                 ).fetchall()
                 return [self._code_chunk_from_row(row) for row in rows]
@@ -846,8 +887,9 @@ class Database:
                       AND e.text_format_version = ?
                       AND e.embedding_config_hash = ?
                       AND e.normalized = ?
+                      {identity_clause}
                     LIMIT 1
-                    """,
+                    """.format(identity_clause=identity_clause),
                     (
                         chunk_id,
                         chunk["content_hash"],
@@ -857,6 +899,7 @@ class Database:
                         text_format_version,
                         embedding_config_hash,
                         1 if normalized else 0,
+                        *identity_params,
                     ),
                 ).fetchone()
                 if fresh is None:
@@ -871,7 +914,11 @@ class Database:
         text_format_version: str,
         embedding_config_hash: str = "",
         normalized: bool = True,
+        effective_identity: Any | None = None,
     ) -> list[int]:
+        identity_clause, identity_params = _embedding_identity_predicate(
+            "e", effective_identity
+        )
         with self.connect() as conn:
             rows = conn.execute(
                 """
@@ -885,8 +932,9 @@ class Database:
                   AND e.text_format_version = ?
                   AND e.embedding_config_hash = ?
                   AND e.normalized = ?
+                  {identity_clause}
                 ORDER BY e.embedding_dimension
-                """,
+                """.format(identity_clause=identity_clause),
                 (
                     project_id,
                     model_name,
@@ -894,6 +942,7 @@ class Database:
                     text_format_version,
                     embedding_config_hash,
                     1 if normalized else 0,
+                    *identity_params,
                 ),
             ).fetchall()
         return [int(row["embedding_dimension"]) for row in rows]
@@ -908,15 +957,18 @@ class Database:
                     """
                     INSERT INTO code_chunk_embeddings (
                         code_chunk_id, content_hash, embedding_input_hash,
-                        model_name, model_revision, text_format_version,
+                        model_name, model_revision, identity_schema_version,
+                        wrapper_model_identity, resolved_revision, identity_eligible,
+                        text_format_version,
                         embedding_config_hash, embedding_dimension,
                         embedding_dtype, normalized, vector_blob
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT (
-                        code_chunk_id, embedding_input_hash, model_name,
-                        model_revision, text_format_version,
-                        embedding_config_hash, normalized
+                        code_chunk_id, content_hash, embedding_input_hash,
+                        identity_schema_version, wrapper_model_identity,
+                        resolved_revision, embedding_dimension, normalized,
+                        text_format_version, embedding_config_hash
                     )
                     DO UPDATE SET
                         content_hash = excluded.content_hash,
@@ -941,6 +993,7 @@ class Database:
         chunk_type: str | None = None,
         language: str | None = None,
         symbol: str | None = None,
+        effective_identity: Any | None = None,
     ) -> list[dict[str, Any]]:
         conditions = [
             "c.project_id = ?",
@@ -959,6 +1012,12 @@ class Database:
             embedding_config_hash,
             1 if normalized else 0,
         ]
+        identity_clause, identity_params = _embedding_identity_predicate(
+            "e", effective_identity
+        )
+        if identity_clause:
+            conditions.append(identity_clause.removeprefix("AND "))
+            params.extend(identity_params)
         if path:
             conditions.append("c.path = ?")
             params.append(self._normalize_repo_path(path))
@@ -979,6 +1038,10 @@ class Database:
                     c.*,
                     e.model_name AS embedding_model_name,
                     e.model_revision AS embedding_model_revision,
+                    e.identity_schema_version,
+                    e.wrapper_model_identity,
+                    e.resolved_revision,
+                    e.identity_eligible,
                     e.text_format_version AS embedding_text_format_version,
                     e.embedding_input_hash,
                     e.embedding_config_hash,
@@ -998,17 +1061,24 @@ class Database:
         for row in rows:
             item = self._code_chunk_from_row(row)
             dimension = int(row["embedding_dimension"])
+            vector = unpack_float32_vector(row["vector_blob"], dimension)
+            if bool(row["normalized"]):
+                _validate_normalized_vector(vector)
             item.update(
                 {
                     "model_name": row["embedding_model_name"],
                     "model_revision": row["embedding_model_revision"],
+                    "identity_schema_version": row["identity_schema_version"],
+                    "wrapper_model_identity": row["wrapper_model_identity"],
+                    "resolved_revision": row["resolved_revision"],
+                    "identity_eligible": bool(row["identity_eligible"]),
                     "text_format_version": row["embedding_text_format_version"],
                     "embedding_input_hash": row["embedding_input_hash"],
                     "embedding_config_hash": row["embedding_config_hash"],
                     "embedding_dimension": dimension,
                     "embedding_dtype": row["embedding_dtype"],
                     "normalized": bool(row["normalized"]),
-                    "vector": unpack_float32_vector(row["vector_blob"], dimension),
+                    "vector": vector,
                 }
             )
             results.append(item)
@@ -1538,12 +1608,27 @@ class Database:
         normalized = bool(record.get("normalized", True))
         if normalized:
             _validate_normalized_vector(vector)
+        identity_schema_version = str(
+            record.get("identity_schema_version") or "legacy"
+        )
+        wrapper_model_identity = str(record.get("wrapper_model_identity") or "")
+        resolved_revision = str(record.get("resolved_revision") or "")
+        identity_eligible = bool(record.get("identity_eligible", False))
+        if identity_eligible:
+            if identity_schema_version == "legacy":
+                raise ValueError("eligible embedding identity cannot use legacy schema")
+            if not wrapper_model_identity.startswith("embedding-sha256:"):
+                raise ValueError("wrapper model identity must use embedding-sha256")
         return (
             int(record["code_chunk_id"]),
             record["content_hash"],
             _require_hash(record["embedding_input_hash"], "embedding_input_hash"),
             record["model_name"],
             record.get("model_revision") or "",
+            identity_schema_version,
+            wrapper_model_identity,
+            resolved_revision,
+            1 if identity_eligible else 0,
             record["text_format_version"],
             _require_hash(record["embedding_config_hash"], "embedding_config_hash"),
             dimension,
@@ -1561,8 +1646,10 @@ class Database:
             """
             DELETE FROM code_chunk_embeddings
             WHERE code_chunk_id = ?
-              AND model_name = ?
-              AND model_revision = ?
+              AND identity_schema_version = ?
+              AND wrapper_model_identity = ?
+              AND resolved_revision = ?
+              AND embedding_dimension = ?
               AND text_format_version = ?
               AND embedding_config_hash = ?
               AND normalized = ?
@@ -1570,8 +1657,10 @@ class Database:
             """,
             (
                 int(record["code_chunk_id"]),
-                record["model_name"],
-                record.get("model_revision") or "",
+                record.get("identity_schema_version") or "legacy",
+                record.get("wrapper_model_identity") or "",
+                record.get("resolved_revision") or "",
+                int(record.get("embedding_dimension") or len(record["vector"])),
                 record["text_format_version"],
                 _require_hash(record["embedding_config_hash"], "embedding_config_hash"),
                 1 if record.get("normalized", True) else 0,
@@ -1643,3 +1732,34 @@ def _require_hash(value: Any, field_name: str) -> str:
     if len(text) != 64 or any(char not in "0123456789abcdef" for char in text):
         raise ValueError(f"{field_name} must be a lowercase sha256 hex digest")
     return text
+
+
+def _embedding_identity_predicate(
+    alias: str,
+    effective_identity: Any | None,
+) -> tuple[str, tuple[Any, ...]]:
+    if effective_identity is None:
+        return f"AND {alias}.identity_eligible = 0", ()
+    data = (
+        effective_identity.to_dict()
+        if hasattr(effective_identity, "to_dict")
+        else dict(effective_identity)
+    )
+    schema_version = str(data.get("identity_schema_version") or "")
+    wrapper_identity = str(data.get("model_identity") or "")
+    resolved_revision = str(data.get("resolved_revision") or "")
+    dimension = int(data.get("dimension") or 0)
+    if not schema_version or schema_version == "legacy":
+        raise ValueError("effective embedding identity schema is invalid")
+    if not wrapper_identity.startswith("embedding-sha256:"):
+        raise ValueError("effective wrapper model identity is invalid")
+    if dimension < 1:
+        raise ValueError("effective embedding dimension is invalid")
+    return (
+        f"AND {alias}.identity_eligible = 1 "
+        f"AND {alias}.identity_schema_version = ? "
+        f"AND {alias}.wrapper_model_identity = ? "
+        f"AND {alias}.resolved_revision = ? "
+        f"AND {alias}.embedding_dimension = ?",
+        (schema_version, wrapper_identity, resolved_revision, dimension),
+    )

@@ -41,7 +41,7 @@ class M4LearningServiceTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.directory.cleanup()
 
-    def test_fresh_schema_is_v6_with_learning_tables_indexes_and_immutable_events(self):
+    def test_fresh_schema_is_v7_with_learning_tables_indexes_and_immutable_events(self):
         with self.db.connect() as conn:
             version = conn.execute(
                 "SELECT version FROM schema_versions WHERE key='database'"
@@ -49,8 +49,8 @@ class M4LearningServiceTests(unittest.TestCase):
             tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
             indexes = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='index'")}
             triggers = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='trigger'")}
-        self.assertEqual(SCHEMA_VERSION, 6)
-        self.assertEqual(version, 6)
+        self.assertEqual(SCHEMA_VERSION, 7)
+        self.assertEqual(version, 7)
         self.assertTrue({"learning_goals", "learning_plans", "learning_tasks", "learning_events", "learner_target_states"}.issubset(tables))
         self.assertIn("idx_learning_states_review", indexes)
         self.assertEqual(triggers, {"trg_learning_events_no_update", "trg_learning_events_no_delete"})

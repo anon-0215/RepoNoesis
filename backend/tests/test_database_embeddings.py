@@ -9,8 +9,10 @@ from app.config import EmbeddingSettings
 from app.database import Database
 from app.services.embedding_service import (
     CODE_CHUNK_TEXT_FORMAT_VERSION,
+    EmbeddingModelIdentity,
     build_code_chunk_embedding_input_hash,
     build_embedding_config_hash,
+    build_effective_embedding_identity,
 )
 
 
@@ -216,6 +218,31 @@ class DatabaseEmbeddingTests(unittest.TestCase):
                         code_chunk_id, content_hash, model_name,
                         model_revision, text_format_version
                     );
+                    INSERT INTO projects (
+                        id, repo_url, owner, repo, default_branch, status
+                    ) VALUES (
+                        'legacy-project', 'https://github.com/demo/legacy',
+                        'demo', 'legacy', 'main', 'done'
+                    );
+                    INSERT INTO code_chunks (
+                        id, project_id, repository_revision, language, path,
+                        chunk_type, symbol_name, qualified_name, start_line,
+                        end_line, content, content_hash
+                    ) VALUES (
+                        1, 'legacy-project', 'abc123', 'python', 'src/a.py',
+                        'function', 'a', 'a', 1, 1, 'def a(): pass',
+                        'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+                    );
+                    INSERT INTO code_chunk_embeddings (
+                        code_chunk_id, content_hash, model_name, model_revision,
+                        text_format_version, embedding_dimension, embedding_dtype,
+                        normalized, vector_blob
+                    ) VALUES (
+                        1,
+                        'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+                        'legacy-model', 'legacy-revision', 'code-chunk-v1',
+                        2, 'float32', 1, X'0000803F00000000'
+                    );
                     """
                 )
                 conn.commit()
@@ -233,10 +260,108 @@ class DatabaseEmbeddingTests(unittest.TestCase):
                 version = reopened.execute(
                     "SELECT version FROM schema_versions WHERE key = 'database'"
                 ).fetchone()["version"]
+                legacy = reopened.execute(
+                    "SELECT identity_schema_version, identity_eligible "
+                    "FROM code_chunk_embeddings"
+                ).fetchone()
 
             self.assertIn("embedding_input_hash", columns)
             self.assertIn("embedding_config_hash", columns)
-            self.assertEqual(version, 6)
+            self.assertIn("wrapper_model_identity", columns)
+            self.assertIn("resolved_revision", columns)
+            self.assertEqual(version, 7)
+            self.assertEqual(legacy["identity_schema_version"], "legacy")
+            self.assertEqual(legacy["identity_eligible"], 0)
+
+            chunk = db.get_code_chunks("legacy-project")[0]
+            settings = _settings(model_name_or_path="legacy-model")
+            effective = build_effective_embedding_identity(
+                EmbeddingModelIdentity(
+                    "legacy-model", "legacy-revision", "cpu", None, None, None
+                ),
+                settings,
+                2,
+                is_real=False,
+            )
+            missing = db.get_code_chunks_missing_embeddings(
+                "legacy-project",
+                effective.model_name,
+                effective.backend_model_identity,
+                CODE_CHUNK_TEXT_FORMAT_VERSION,
+                effective.embedding_config_hash,
+                effective.normalized,
+                {
+                    chunk["id"]: build_code_chunk_embedding_input_hash(
+                        chunk, settings
+                    )
+                },
+                effective_identity=effective,
+            )
+            self.assertEqual([item["id"] for item in missing], [chunk["id"]])
+
+            Database(path)
+            with db.connect() as reopened:
+                self.assertEqual(
+                    reopened.execute("SELECT COUNT(*) FROM code_chunk_embeddings").fetchone()[0],
+                    1,
+                )
+
+    def test_identity_migration_failure_rolls_back_partial_columns(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "migration-failure.sqlite"
+            conn = sqlite3.connect(path)
+            try:
+                conn.executescript(
+                    """
+                    CREATE TABLE schema_versions (
+                        key TEXT PRIMARY KEY,
+                        version INTEGER NOT NULL,
+                        updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+                    );
+                    INSERT INTO schema_versions (key, version) VALUES ('database', 6);
+                    CREATE TABLE code_chunk_embeddings (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        code_chunk_id INTEGER NOT NULL,
+                        content_hash TEXT NOT NULL,
+                        model_name TEXT NOT NULL,
+                        model_revision TEXT NOT NULL DEFAULT '',
+                        text_format_version TEXT NOT NULL,
+                        embedding_dimension INTEGER NOT NULL,
+                        embedding_dtype TEXT NOT NULL DEFAULT 'float32',
+                        normalized INTEGER NOT NULL DEFAULT 1,
+                        vector_blob BLOB NOT NULL
+                    );
+                    CREATE VIEW idx_code_chunk_embeddings_unique AS
+                    SELECT id FROM code_chunk_embeddings;
+                    """
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            with self.assertRaises(sqlite3.OperationalError):
+                Database(path)
+
+            raw = sqlite3.connect(path)
+            try:
+                columns = {
+                    row[1]
+                    for row in raw.execute(
+                        "PRAGMA table_info(code_chunk_embeddings)"
+                    ).fetchall()
+                }
+                version = raw.execute(
+                    "SELECT version FROM schema_versions WHERE key='database'"
+                ).fetchone()[0]
+                self.assertNotIn("embedding_input_hash", columns)
+                self.assertNotIn("wrapper_model_identity", columns)
+                self.assertEqual(version, 6)
+                self.assertEqual(
+                    raw.execute("SELECT COUNT(*) FROM code_chunk_embeddings").fetchone()[0],
+                    0,
+                )
+            finally:
+                raw.close()
 
     def test_saves_and_reads_float32_vector_blob(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -360,6 +485,28 @@ class DatabaseEmbeddingTests(unittest.TestCase):
 
             with self.assertRaises(ValueError):
                 db.upsert_code_chunk_embeddings([_embedding_record(chunk, [2.0, 0.0, 0.0])])
+
+    def test_rejects_corrupt_non_unit_normalized_vector_on_read(self):
+        with tempfile.TemporaryDirectory() as directory:
+            db = Database(Path(directory) / "corrupt-normalized.sqlite")
+            project_id = _project_id(db)
+            chunk = _save_chunk(db, project_id)
+            db.upsert_code_chunk_embeddings([_embedding_record(chunk)])
+            with db.connect() as conn:
+                conn.execute(
+                    "UPDATE code_chunk_embeddings SET vector_blob = ?",
+                    (b"\x00\x00\x00\x40" + b"\x00" * 8,),
+                )
+
+            with self.assertRaises(ValueError):
+                db.get_code_chunk_embeddings_for_project(
+                    project_id,
+                    MODEL_NAME,
+                    MODEL_REVISION,
+                    CODE_CHUNK_TEXT_FORMAT_VERSION,
+                    build_embedding_config_hash(_settings()),
+                    True,
+                )
 
     def test_repeated_cache_upsert_does_not_grow_rows(self):
         with tempfile.TemporaryDirectory() as directory:

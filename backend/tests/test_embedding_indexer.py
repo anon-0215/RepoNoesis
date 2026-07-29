@@ -131,7 +131,7 @@ class EmbeddingIndexerTests(unittest.TestCase):
             self.assertEqual(stats.cached_chunks, 2)
             self.assertEqual(stats.generated_chunks, 0)
             self.assertEqual(stats.dimension, 2)
-            self.assertEqual(second_backend.load_calls, 0)
+            self.assertEqual(second_backend.load_calls, 1)
             self.assertEqual(second_backend.encode_calls, 0)
 
     def test_only_changed_chunk_is_reindexed(self):

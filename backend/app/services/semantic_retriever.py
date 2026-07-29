@@ -9,7 +9,6 @@ from app.services.embedding_service import (
     CODE_CHUNK_TEXT_FORMAT_VERSION,
     EmbeddingService,
     build_code_chunk_embedding_input_hash,
-    build_embedding_config_hash,
 )
 
 
@@ -72,14 +71,14 @@ class SemanticRetriever:
         if not cleaned_query:
             raise ValueError("semantic search query must not be empty")
         limit = _bounded_top_k(top_k)
-        identity = self.embedding_service.ensure_model_identity(
+        identity = self.embedding_service.ensure_effective_embedding_identity(
             local_files_only=local_files_only
         )
-        embedding_config_hash = build_embedding_config_hash(self.embedding_service.settings)
+        embedding_config_hash = identity.embedding_config_hash
         candidates = self.database.get_code_chunk_embeddings_for_project(
             project_id,
             identity.model_name,
-            identity.model_identity,
+            identity.backend_model_identity,
             CODE_CHUNK_TEXT_FORMAT_VERSION,
             embedding_config_hash,
             self.embedding_service.settings.normalize,
@@ -87,6 +86,7 @@ class SemanticRetriever:
             chunk_type=chunk_type,
             language=language,
             symbol=symbol,
+            effective_identity=identity,
         )
         candidates = [
             candidate

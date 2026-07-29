@@ -16,6 +16,7 @@ from app.database import _as_float32
 
 CODE_CHUNK_TEXT_FORMAT_VERSION = "code-chunk-v1"
 EMBEDDING_CONFIG_HASH_VERSION = "embedding-config-v1"
+EFFECTIVE_EMBEDDING_IDENTITY_VERSION = "embedding-effective-v1"
 
 
 class EmbeddingError(RuntimeError):
@@ -56,6 +57,58 @@ class EmbeddingModelIdentity:
             "configured_revision": self.configured_revision,
             "resolved_revision": self.resolved_revision,
             "local_snapshot_identity": self.local_snapshot_identity,
+        }
+
+
+@dataclass(frozen=True)
+class EffectiveEmbeddingIdentity:
+    identity_schema_version: str
+    provider: str
+    backend_type: str
+    model_name: str
+    configured_revision: str | None
+    resolved_revision: str | None
+    local_snapshot_identity: str | None
+    backend_model_identity: str
+    model_identity: str
+    dimension: int
+    normalized: bool
+    text_format_version: str
+    document_prefix_identity: str
+    query_prefix_identity: str
+    max_length: int
+    batch_size: int
+    pooling_identity: str
+    embedding_config_hash: str
+    device: str
+    dtype: str
+    cache_identity: str
+    is_real: bool
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "identity_schema_version": self.identity_schema_version,
+            "provider": self.provider,
+            "backend_type": self.backend_type,
+            "model_name": self.model_name,
+            "configured_revision": self.configured_revision,
+            "resolved_revision": self.resolved_revision,
+            "local_snapshot_identity": self.local_snapshot_identity,
+            "backend_model_identity": self.backend_model_identity,
+            "model_identity": self.model_identity,
+            "dimension": self.dimension,
+            "normalized": self.normalized,
+            "text_format_version": self.text_format_version,
+            "document_prefix_identity": self.document_prefix_identity,
+            "query_prefix_identity": self.query_prefix_identity,
+            "max_length": self.max_length,
+            "batch_size": self.batch_size,
+            "pooling_identity": self.pooling_identity,
+            "embedding_config_hash": self.embedding_config_hash,
+            "device": self.device,
+            "dtype": self.dtype,
+            "cache_identity": self.cache_identity,
+            "is_real": self.is_real,
         }
 
 
@@ -234,11 +287,19 @@ class EmbeddingService:
             )
             self._dimension = backend.get_embedding_dimension()
 
-    def encode_documents(self, texts: Sequence[str]) -> list[list[float]]:
+    def encode_documents(
+        self,
+        texts: Sequence[str],
+        local_files_only: bool = False,
+    ) -> list[list[float]]:
         if not texts:
             return []
         prefixed = [self.settings.document_prefix + text for text in texts]
-        return self._encode(prefixed, "documents")
+        return self._encode(
+            prefixed,
+            "documents",
+            local_files_only=local_files_only,
+        )
 
     def encode_query(self, text: str, local_files_only: bool = False) -> list[float]:
         query = text.strip()
@@ -264,6 +325,9 @@ class EmbeddingService:
             self.settings.model_revision,
         )
 
+    def get_backend_identity(self) -> EmbeddingModelIdentity:
+        return self.get_model_identity()
+
     def ensure_model_identity(
         self,
         local_files_only: bool = False,
@@ -272,9 +336,35 @@ class EmbeddingService:
             self.load_model(local_files_only=local_files_only)
         return self.get_model_identity()
 
-    def get_embedding_dimension(self) -> int | None:
+    def ensure_backend_identity(
+        self,
+        local_files_only: bool = False,
+    ) -> EmbeddingModelIdentity:
+        return self.ensure_model_identity(local_files_only=local_files_only)
+
+    def get_effective_embedding_identity(
+        self,
+        local_files_only: bool = False,
+    ) -> EffectiveEmbeddingIdentity:
+        dimension = self.get_embedding_dimension(local_files_only=local_files_only)
+        if dimension is None:
+            raise EmbeddingConfigurationError("embedding dimension is unavailable")
+        return build_effective_embedding_identity(
+            self.get_model_identity(),
+            self.settings,
+            dimension,
+            is_real=not self._backend_is_injected,
+        )
+
+    def ensure_effective_embedding_identity(
+        self,
+        local_files_only: bool = False,
+    ) -> EffectiveEmbeddingIdentity:
+        return self.get_effective_embedding_identity(local_files_only=local_files_only)
+
+    def get_embedding_dimension(self, local_files_only: bool = False) -> int | None:
         if self._dimension is None:
-            self.load_model()
+            self.load_model(local_files_only=local_files_only)
         return self._dimension
 
     def unload_model(self) -> None:
@@ -492,6 +582,58 @@ def build_embedding_config_hash(settings: EmbeddingSettings) -> str:
     }
     encoded = json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def build_effective_embedding_identity(
+    backend_identity: EmbeddingModelIdentity,
+    settings: EmbeddingSettings,
+    dimension: int,
+    *,
+    is_real: bool,
+) -> EffectiveEmbeddingIdentity:
+    if int(dimension) < 1:
+        raise EmbeddingConfigurationError("embedding dimension must be positive")
+    embedding_config_hash = build_embedding_config_hash(settings)
+    payload = {
+        "identity_schema_version": EFFECTIVE_EMBEDDING_IDENTITY_VERSION,
+        "provider": "sentence-transformers",
+        "backend_type": "sentence-transformers",
+        "model_name": backend_identity.model_name,
+        "configured_revision": backend_identity.configured_revision,
+        "resolved_revision": backend_identity.resolved_revision,
+        "local_snapshot_identity": backend_identity.local_snapshot_identity,
+        "backend_model_identity": backend_identity.model_identity,
+        "dimension": int(dimension),
+        "normalized": bool(settings.normalize),
+        "text_format_version": CODE_CHUNK_TEXT_FORMAT_VERSION,
+        "document_prefix_identity": _text_identity(settings.document_prefix),
+        "query_prefix_identity": _text_identity(settings.query_prefix),
+        "max_length": clamp_embedding_max_length(settings.max_length),
+        "batch_size": max(1, int(settings.batch_size)),
+        "pooling_identity": _text_identity(
+            f"model-defined:{backend_identity.model_identity}"
+        ),
+        "embedding_config_hash": embedding_config_hash,
+        "device": backend_identity.device,
+        "dtype": "float32",
+    }
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    digest = hashlib.sha256(encoded).hexdigest()
+    return EffectiveEmbeddingIdentity(
+        **payload,
+        model_identity=f"embedding-sha256:{digest}",
+        cache_identity=digest,
+        is_real=is_real,
+    )
+
+
+def _text_identity(value: str) -> str:
+    return f"text-sha256:{hashlib.sha256(value.encode('utf-8')).hexdigest()}"
 
 
 def build_embedding_input_hash(final_embedding_text: str) -> str:

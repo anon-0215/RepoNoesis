@@ -17,6 +17,7 @@ from app.database import Database
 from app.m5.contracts import BenchmarkConfig, EXPERIMENT_MODES, ProviderIdentity, RepositorySpec
 from app.m5.dataset import BenchmarkDatasetValidator, LoadedDataset
 from app.m5.embedding import M5EmbeddingProvider, fake_embedding_service
+from app.m5.identity import require_identity_digest
 from app.m5.metrics import aggregate_results, paired_delta, scenario_metrics
 from app.m5.modes import ModeExecutionError, execute_mode
 from app.m5.learning_sequence import run_adaptive_sequence
@@ -401,14 +402,8 @@ class BenchmarkRunner:
         cache_root = self._artifact_root / "cache"
         if not self.live:
             service = fake_embedding_service(cache_root / "fake-embedding")
-            return service, {
-                "provider": "fake-deterministic", "model": "fake-bge-m3",
-                "model_revision": "fixture-v1", "dimension": 16, "normalize": True,
-                "max_length": 512, "batch_size": 8,
-                "query_prefix_identity": _text_identity(""),
-                "document_prefix_identity": _text_identity(""),
-                "device": "cpu", "dtype": "float32",
-            }
+            identity = service.ensure_effective_embedding_identity()
+            return service, _manifest_embedding_identity(identity)
         settings = get_embedding_settings()
         if not get_env_value("EMBEDDING_MODEL_NAME_OR_PATH", "").strip():
             raise ValueError("live embedding model name/path must be explicitly configured")
@@ -423,8 +418,8 @@ class BenchmarkRunner:
             allow_model_load=_env_gate("M5_ALLOW_MODEL_LOAD"),
             allow_network=_env_gate("M5_ALLOW_NETWORK"),
         )
-        resolved_model = wrapper.ensure_model_identity()
-        if resolved_model.resolved_revision is None:
+        backend_identity = wrapper.ensure_backend_identity()
+        if backend_identity.resolved_revision is None:
             raise ValueError(
                 "live embedding requires a verified 40-character snapshot revision"
             )
@@ -434,23 +429,7 @@ class BenchmarkRunner:
                 f"configured embedding dimension {dimension_text} does not match loaded model dimension {actual_dimension}"
             )
         embedding_identity = wrapper.identity
-        return wrapper, {
-            "provider": embedding_identity.provider,
-            "model": embedding_identity.model_name,
-            "configured_revision": embedding_identity.configured_revision,
-            "resolved_revision": embedding_identity.resolved_revision,
-            "local_snapshot_identity": embedding_identity.local_snapshot_identity,
-            "model_identity": embedding_identity.model_identity,
-            "cache_identity": embedding_identity.cache_identity,
-            "dimension": int(dimension_text),
-            "normalize": embedding_identity.normalized,
-            "max_length": embedding_identity.max_length,
-            "batch_size": embedding_identity.batch_size,
-            "query_prefix_identity": _text_identity(settings.query_prefix),
-            "document_prefix_identity": _text_identity(settings.document_prefix),
-            "device": embedding_identity.device,
-            "dtype": embedding_identity.dtype,
-        }
+        return wrapper, _manifest_embedding_identity(embedding_identity)
 
     def _evaluator_identity(self) -> ProviderIdentity:
         if not self.live:
@@ -602,6 +581,17 @@ def build_run_identity(
     }
 
 
+def _manifest_embedding_identity(identity: Any) -> dict[str, Any]:
+    value = identity.to_dict()
+    # Keep the historical aliases readable while the canonical fields remain authoritative.
+    value["model"] = value["model_name"]
+    value["model_revision"] = (
+        value["resolved_revision"] or value["configured_revision"] or "unknown"
+    )
+    value["normalize"] = value["normalized"]
+    return value
+
+
 def compare_run_records(
     left_path: Path,
     right_path: Path,
@@ -697,13 +687,25 @@ def _load_checkpoint(path: Path) -> dict[str, Any]:
 
 
 def _verify_checkpoint_identity(checkpoint: dict[str, Any], run_id: str, digest: str) -> None:
-    if checkpoint.get("run_id") != run_id or checkpoint.get("run_identity_digest") != digest:
+    if checkpoint.get("run_id") != run_id:
         raise BenchmarkCheckpointError("checkpoint run identity mismatch")
+    require_identity_digest(
+        checkpoint,
+        digest,
+        field="run_identity_digest",
+        label="checkpoint run",
+        error_type=BenchmarkCheckpointError,
+    )
 
 
 def _verify_manifest_identity(manifest: dict[str, Any], digest: str) -> None:
-    if manifest.get("run_identity_digest") != digest:
-        raise BenchmarkCheckpointError("run directory manifest identity mismatch")
+    require_identity_digest(
+        manifest,
+        digest,
+        field="run_identity_digest",
+        label="run directory manifest",
+        error_type=BenchmarkCheckpointError,
+    )
 
 
 def _atomic_json(path: Path, value: Any) -> None:
