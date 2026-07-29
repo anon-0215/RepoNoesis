@@ -5,7 +5,9 @@ import tempfile
 import unittest
 from dataclasses import replace
 from pathlib import Path
+from unittest.mock import patch
 
+import app.m5.dense_artifact as dense_artifact_module
 from app.config import EmbeddingSettings
 from app.database import Database
 from app.m5.dense_artifact import (
@@ -130,8 +132,8 @@ class M5DenseArtifactTests(unittest.TestCase):
             root = Path(directory)
             db = Database(root / "dense.sqlite")
             project_id = self._project_id(db)
-            chunks = [self._chunk(name) for name in ("a", "b", "c", "d")]
-            db.save_code_chunks_for_project(project_id, chunks[:2])
+            chunks = [self._chunk(f"chunk_{index:03}") for index in range(79)]
+            db.save_code_chunks_for_project(project_id, chunks[:40])
             backend = CountingEmbeddingBackend(4)
             provider = self._provider(root, backend)
             artifact = self._artifact(root)
@@ -139,29 +141,146 @@ class M5DenseArtifactTests(unittest.TestCase):
             stage_a = EmbeddingIndexer(db, provider).index_project(
                 project_id, artifact=artifact, artifact_mode="create"
             )
-            self.assertEqual((stage_a.generated_chunks, stage_a.cached_chunks), (2, 0))
-            self.assertEqual(backend.encoded_text_count, 2)
+            self.assertEqual((stage_a.generated_chunks, stage_a.cached_chunks), (40, 0))
+            self.assertEqual(backend.encoded_text_count, 40)
+            stage_a_files = self._artifact_state(root / "artifact")
 
             db.save_code_chunks_for_project(project_id, chunks)
             stage_b = EmbeddingIndexer(db, provider).index_project(
                 project_id, artifact=artifact, artifact_mode="extend"
             )
-            self.assertEqual((stage_b.generated_chunks, stage_b.cached_chunks), (2, 2))
-            self.assertEqual(backend.encoded_text_count, 4)
+            self.assertEqual((stage_b.generated_chunks, stage_b.cached_chunks), (39, 40))
+            self.assertEqual(backend.encoded_text_count, 79)
+            stage_b_files = self._artifact_state(root / "artifact")
+            self.assertNotEqual(stage_a_files["manifest"]["sha256"], stage_b_files["manifest"]["sha256"])
+            self.assertNotEqual(stage_a_files["checkpoint"]["sha256"], stage_b_files["checkpoint"]["sha256"])
+            with db.connect() as conn:
+                rows_after_b = conn.execute(
+                    "SELECT COUNT(*) FROM code_chunk_embeddings WHERE identity_eligible = 1"
+                ).fetchone()[0]
+            self.assertEqual(rows_after_b, 79)
 
             stage_c = EmbeddingIndexer(db, provider).index_project(
                 project_id, artifact=artifact, artifact_mode="resume"
             )
-            self.assertEqual((stage_c.generated_chunks, stage_c.cached_chunks), (0, 4))
-            self.assertEqual(backend.encoded_text_count, 4)
+            self.assertEqual((stage_c.generated_chunks, stage_c.cached_chunks), (0, 79))
+            self.assertEqual(backend.encoded_text_count, 79)
+            stage_c_files = self._artifact_state(root / "artifact")
+            self.assertEqual(stage_c_files, stage_b_files)
+            with db.connect() as conn:
+                rows_after_c = conn.execute(
+                    "SELECT COUNT(*) FROM code_chunk_embeddings WHERE identity_eligible = 1"
+                ).fetchone()[0]
+            self.assertEqual(rows_after_c, 79)
             manifest = json.loads((root / "artifact" / "manifest.json").read_text())
             checkpoint = json.loads((root / "artifact" / "checkpoint.json").read_text())
-            self.assertEqual(manifest["indexed_chunk_count"], 4)
+            self.assertEqual(manifest["indexed_chunk_count"], 79)
             self.assertEqual(manifest["checkpoint_status"], "completed")
             self.assertEqual(
                 manifest["artifact_identity_digest"],
                 checkpoint["artifact_identity_digest"],
             )
+            self.assertEqual(list((root / "artifact").glob("*.tmp")), [])
+
+    def test_complete_is_byte_hash_timestamp_and_mtime_idempotent(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            db = Database(root / "dense.sqlite")
+            project_id = self._project_id(db)
+            db.save_code_chunks_for_project(project_id, [self._chunk("a")])
+            artifact = self._artifact(root)
+            EmbeddingIndexer(db, self._provider(root, CountingEmbeddingBackend(4))).index_project(
+                project_id, artifact=artifact, artifact_mode="create"
+            )
+            before = self._artifact_state(root / "artifact")
+
+            self.assertFalse(artifact.complete(1))
+
+            self.assertEqual(self._artifact_state(root / "artifact"), before)
+            self.assertEqual(list((root / "artifact").glob("*.tmp")), [])
+
+    def test_zero_encode_resume_updates_incomplete_persistent_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            db = Database(root / "dense.sqlite")
+            project_id = self._project_id(db)
+            db.save_code_chunks_for_project(project_id, [self._chunk("a")])
+            backend = CountingEmbeddingBackend(4)
+            provider = self._provider(root, backend)
+            artifact = self._artifact(root)
+            EmbeddingIndexer(db, provider).index_project(
+                project_id, artifact=artifact, artifact_mode="create"
+            )
+            with patch.object(dense_artifact_module, "_utc_now", return_value="2026-07-29T01:00:00+00:00"):
+                self.assertTrue(artifact.update_progress(0, status="indexing"))
+            incomplete = self._artifact_state(root / "artifact")
+            calls_before = backend.encoded_text_count
+
+            with patch.object(dense_artifact_module, "_utc_now", return_value="2026-07-29T02:00:00+00:00"):
+                stats = EmbeddingIndexer(db, provider).index_project(
+                    project_id, artifact=artifact, artifact_mode="resume"
+                )
+
+            recovered = self._artifact_state(root / "artifact")
+            self.assertEqual((stats.generated_chunks, stats.cached_chunks), (0, 1))
+            self.assertEqual(backend.encoded_text_count, calls_before)
+            self.assertNotEqual(recovered["manifest"]["bytes"], incomplete["manifest"]["bytes"])
+            self.assertNotEqual(recovered["checkpoint"]["bytes"], incomplete["checkpoint"]["bytes"])
+            self.assertEqual(recovered["manifest"]["json"]["indexed_chunk_count"], 1)
+            self.assertEqual(recovered["manifest"]["json"]["checkpoint_status"], "completed")
+            self.assertEqual(recovered["manifest"]["json"]["updated_at"], "2026-07-29T02:00:00+00:00")
+            self.assertEqual(recovered["checkpoint"]["json"]["status"], "completed")
+            self.assertEqual(recovered["checkpoint"]["json"]["updated_at"], "2026-07-29T02:00:00+00:00")
+
+    def test_metadata_write_failure_restores_pair_and_retry_succeeds(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            db = Database(root / "dense.sqlite")
+            project_id = self._project_id(db)
+            db.save_code_chunks_for_project(project_id, [self._chunk("a")])
+            artifact = self._artifact(root)
+            EmbeddingIndexer(db, self._provider(root, CountingEmbeddingBackend(4))).index_project(
+                project_id, artifact=artifact, artifact_mode="create"
+            )
+            original = self._artifact_state(root / "artifact")
+            real_atomic_json = dense_artifact_module._atomic_json
+
+            for failed_name in ("checkpoint.json", "manifest.json"):
+                def fail_selected(path, value, *, selected=failed_name):
+                    if path.name == selected:
+                        raise OSError(f"forced {selected} failure")
+                    return real_atomic_json(path, value)
+
+                with patch.object(dense_artifact_module, "_atomic_json", side_effect=fail_selected):
+                    with self.assertRaises(DenseArtifactError):
+                        artifact.update_progress(0, status="indexing")
+                restored = self._artifact_state(root / "artifact")
+                for name in ("manifest", "checkpoint"):
+                    self.assertEqual(restored[name]["bytes"], original[name]["bytes"])
+                    self.assertEqual(restored[name]["sha256"], original[name]["sha256"])
+                    self.assertEqual(restored[name]["json"], original[name]["json"])
+                self.assertEqual(list((root / "artifact").glob("*.tmp")), [])
+                self.assertEqual(list((root / "artifact").glob("*.rollback")), [])
+                with db.connect() as conn:
+                    self.assertEqual(
+                        conn.execute("SELECT COUNT(*) FROM code_chunk_embeddings").fetchone()[0],
+                        1,
+                    )
+
+            with patch.object(dense_artifact_module, "_utc_now", return_value="2026-07-29T03:00:00+00:00"):
+                self.assertTrue(artifact.update_progress(0, status="indexing"))
+            self.assertEqual(
+                json.loads((root / "artifact" / "manifest.json").read_text())["checkpoint_status"],
+                "indexing",
+            )
+            self.assertTrue(artifact.complete(1))
+            artifact.preflight(db.get_code_chunks(project_id), mode="resume")
+            final_manifest = json.loads((root / "artifact" / "manifest.json").read_text())
+            final_checkpoint = json.loads((root / "artifact" / "checkpoint.json").read_text())
+            self.assertEqual(final_manifest["checkpoint_status"], "completed")
+            self.assertEqual(final_manifest["indexed_chunk_count"], 1)
+            self.assertEqual(final_checkpoint["status"], "completed")
+            self.assertEqual(final_checkpoint["indexed_chunk_count"], 1)
 
     def test_tampered_identity_fields_fail_before_encode(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -176,6 +295,7 @@ class M5DenseArtifactTests(unittest.TestCase):
                 project_id, artifact=artifact, artifact_mode="create"
             )
             baseline_calls = backend.encoded_text_count
+            original_state = self._artifact_state(root / "artifact")
 
             mutations = [
                 ("effective_embedding_identity", "model_identity", "embedding-sha256:" + "9" * 64),
@@ -239,6 +359,7 @@ class M5DenseArtifactTests(unittest.TestCase):
             self.assertEqual(schema_backend.load_count, 0)
             self.assertEqual(schema_backend.encoded_text_count, 0)
             self.assertEqual(backend.encoded_text_count, baseline_calls)
+            self.assertEqual(self._artifact_state(root / "artifact"), original_state)
 
     def test_artifact_metadata_contains_no_paths_or_secret_markers(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -371,6 +492,26 @@ class M5DenseArtifactTests(unittest.TestCase):
             {chunk["id"]: build_code_chunk_embedding_input_hash(chunk, settings)},
             effective_identity=identity,
         )
+
+    @staticmethod
+    def _artifact_state(root: Path) -> dict:
+        result = {}
+        for name in ("manifest", "checkpoint"):
+            path = root / f"{name}.json"
+            content = path.read_bytes()
+            value = json.loads(content)
+            result[name] = {
+                "bytes": content,
+                "sha256": hashlib.sha256(content).hexdigest(),
+                "times": {
+                    key: value[key]
+                    for key in ("created_at", "updated_at")
+                    if key in value
+                },
+                "mtime_ns": path.stat().st_mtime_ns,
+                "json": value,
+            }
+        return result
 
 
 if __name__ == "__main__":

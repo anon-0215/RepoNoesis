@@ -56,6 +56,12 @@ identity used by SQLite. Resume rejects missing/old schemas and any repository, 
 revision, dimension, normalization, text-format, or configuration mismatch. Internally inconsistent
 metadata is rejected in a no-model preflight before the provider is asked to resolve its effective
 identity; a valid artifact is then compared with the current provider identity before any encoding.
+For these files, `updated_at` means the last actual persistent semantic-state change, not the most
+recent read or repeated resume attempt. Reopening an already completed artifact with the same
+repository, inventory, effective identity, inputs, indexed count, and completion state is a strict
+no-op: neither manifest nor checkpoint is rewritten. Zero encoding alone is not the no-op test;
+an incomplete status or stale persistent count is still repaired and receives a new timestamp even
+when every vector is already cached. Identity mismatches continue to fail closed before encoding.
 
 An exact finite pilot plan uses repeated `--cell <scenario-id>::<mode>` arguments. Eighteen arguments
 mean eighteen cells, not eighteen scenarios multiplied by all modes. `--batch-count N` and zero-based

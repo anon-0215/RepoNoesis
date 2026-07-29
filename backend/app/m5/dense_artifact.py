@@ -111,9 +111,9 @@ class StandaloneDenseArtifact:
                 "indexed_chunk_count": 0,
                 "checkpoint_status": "indexing",
             }
-            self._manifest = manifest
             self.root.mkdir(parents=True, exist_ok=True)
             self._write_state(manifest, indexed_count=0, status="indexing")
+            self._manifest = manifest
             return
 
         if mode == "create":
@@ -154,12 +154,12 @@ class StandaloneDenseArtifact:
                 "checkpoint_status": "indexing",
             }
         )
-        self._manifest = updated
         self._write_state(
             updated,
             indexed_count=int(existing.get("indexed_chunk_count", 0)),
             status="indexing",
         )
+        self._manifest = updated
 
     def _load_valid_state(self) -> dict[str, Any] | None:
         if not self.manifest_path.exists():
@@ -183,16 +183,38 @@ class StandaloneDenseArtifact:
         )
         return existing
 
-    def update_progress(self, indexed_count: int, *, status: str = "indexing") -> None:
+    def update_progress(self, indexed_count: int, *, status: str = "indexing") -> bool:
         if self._manifest is None:
             raise DenseArtifactError("standalone dense artifact was not prepared")
-        self._manifest["indexed_chunk_count"] = int(indexed_count)
-        self._manifest["checkpoint_status"] = status
-        self._manifest["updated_at"] = _utc_now()
-        self._write_state(self._manifest, indexed_count=indexed_count, status=status)
+        target = dict(self._manifest)
+        target["indexed_chunk_count"] = int(indexed_count)
+        target["checkpoint_status"] = status
+        checkpoint = _checkpoint_state(
+            target,
+            indexed_count=int(indexed_count),
+            status=status,
+            updated_at=None,
+        )
+        current_checkpoint = _load_json(self.checkpoint_path)
+        if (
+            _semantic_state(target) == _semantic_state(self._manifest)
+            and _semantic_state(checkpoint) == _semantic_state(current_checkpoint)
+        ):
+            return False
 
-    def complete(self, indexed_count: int, *, partial: bool = False) -> None:
-        self.update_progress(
+        now = _utc_now()
+        target["updated_at"] = now
+        self._write_state(
+            target,
+            indexed_count=int(indexed_count),
+            status=status,
+            updated_at=now,
+        )
+        self._manifest = target
+        return True
+
+    def complete(self, indexed_count: int, *, partial: bool = False) -> bool:
+        return self.update_progress(
             indexed_count,
             status="partial" if partial else "completed",
         )
@@ -203,19 +225,35 @@ class StandaloneDenseArtifact:
         *,
         indexed_count: int,
         status: str,
+        updated_at: str | None = None,
     ) -> None:
-        digest = str(manifest["artifact_identity_digest"])
-        checkpoint = {
-            "checkpoint_schema_version": DENSE_CHECKPOINT_SCHEMA_VERSION,
-            "artifact_identity_digest": digest,
-            "effective_embedding_identity": manifest["effective_embedding_identity"],
-            "chunk_inventory_identity": manifest["chunk_inventory_identity"],
-            "indexed_chunk_count": int(indexed_count),
-            "status": status,
-            "updated_at": _utc_now(),
+        timestamp = updated_at or str(manifest["updated_at"])
+        checkpoint = _checkpoint_state(
+            manifest,
+            indexed_count=indexed_count,
+            status=status,
+            updated_at=timestamp,
+        )
+        originals = {
+            self.checkpoint_path: _read_bytes_if_exists(self.checkpoint_path),
+            self.manifest_path: _read_bytes_if_exists(self.manifest_path),
         }
-        _atomic_json(self.checkpoint_path, checkpoint)
-        _atomic_json(self.manifest_path, manifest)
+        try:
+            _atomic_json(self.checkpoint_path, checkpoint)
+            _atomic_json(self.manifest_path, manifest)
+        except Exception as exc:
+            try:
+                for path, content in originals.items():
+                    _restore_bytes(path, content)
+            except Exception as rollback_exc:
+                raise DenseArtifactError(
+                    "standalone dense metadata write and rollback both failed"
+                ) from rollback_exc
+            raise DenseArtifactError("standalone dense metadata write failed") from exc
+        finally:
+            for path in (self.checkpoint_path, self.manifest_path):
+                path.with_name(path.name + ".tmp").unlink(missing_ok=True)
+                path.with_name(path.name + ".rollback").unlink(missing_ok=True)
 
 
 def build_chunk_inventory(chunks: Sequence[dict[str, Any]]) -> list[str]:
@@ -363,6 +401,43 @@ def _load_json(path: Path) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise DenseArtifactError(f"standalone dense metadata is invalid: {path.name}")
     return value
+
+
+def _checkpoint_state(
+    manifest: dict[str, Any],
+    *,
+    indexed_count: int,
+    status: str,
+    updated_at: str | None,
+) -> dict[str, Any]:
+    value = {
+        "checkpoint_schema_version": DENSE_CHECKPOINT_SCHEMA_VERSION,
+        "artifact_identity_digest": str(manifest["artifact_identity_digest"]),
+        "effective_embedding_identity": manifest["effective_embedding_identity"],
+        "chunk_inventory_identity": manifest["chunk_inventory_identity"],
+        "indexed_chunk_count": int(indexed_count),
+        "status": status,
+    }
+    if updated_at is not None:
+        value["updated_at"] = updated_at
+    return value
+
+
+def _semantic_state(value: dict[str, Any]) -> dict[str, Any]:
+    return {key: item for key, item in value.items() if key != "updated_at"}
+
+
+def _read_bytes_if_exists(path: Path) -> bytes | None:
+    return path.read_bytes() if path.exists() else None
+
+
+def _restore_bytes(path: Path, content: bytes | None) -> None:
+    if content is None:
+        path.unlink(missing_ok=True)
+        return
+    temporary = path.with_name(path.name + ".rollback")
+    temporary.write_bytes(content)
+    os.replace(temporary, path)
 
 
 def _atomic_json(path: Path, value: dict[str, Any]) -> None:
