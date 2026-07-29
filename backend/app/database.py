@@ -417,6 +417,11 @@ class Database:
         learning_steps: list[dict[str, Any]],
         code_chunks: list[dict[str, Any]] | None = None,
     ) -> None:
+        prepared_chunks = (
+            self._prepare_code_chunk_replacement(project_id, code_chunks)
+            if code_chunks is not None
+            else None
+        )
         with self.connect() as conn:
             conn.execute("DELETE FROM code_relations WHERE project_id = ?", (project_id,))
             conn.execute("DELETE FROM relation_nodes WHERE project_id = ?", (project_id,))
@@ -486,8 +491,8 @@ class Database:
                     ),
                 )
 
-            if code_chunks is not None:
-                self._replace_code_chunks_in_scope(conn, project_id, code_chunks)
+            if prepared_chunks is not None:
+                self._replace_code_chunks_in_scope(conn, project_id, prepared_chunks)
 
             conn.execute(
                 """
@@ -513,9 +518,10 @@ class Database:
         project_id: str,
         code_chunks: list[dict[str, Any]],
     ) -> None:
+        prepared = self._prepare_code_chunk_replacement(project_id, code_chunks)
         with self.connect() as conn:
             self._invalidate_relation_index(conn, project_id)
-            self._replace_code_chunks_in_scope(conn, project_id, code_chunks)
+            self._replace_code_chunks_in_scope(conn, project_id, prepared)
 
     def replace_code_chunks_for_file(
         self,
@@ -525,12 +531,18 @@ class Database:
         repository_revision: str | None = None,
     ) -> None:
         normalized_path = self._normalize_repo_path(path)
+        prepared = self._prepare_code_chunk_replacement(
+            project_id,
+            code_chunks,
+            path=normalized_path,
+            repository_revision=repository_revision,
+        )
         with self.connect() as conn:
             self._invalidate_relation_index(conn, project_id)
             self._replace_code_chunks_in_scope(
                 conn,
                 project_id,
-                code_chunks,
+                prepared,
                 path=normalized_path,
                 repository_revision=repository_revision,
             )
@@ -1285,14 +1297,14 @@ class Database:
             "DELETE FROM relation_index_runs WHERE project_id = ?", (project_id,)
         )
 
-    def _replace_code_chunks_in_scope(
+    def _prepare_code_chunk_replacement(
         self,
-        conn: sqlite3.Connection,
         project_id: str,
         code_chunks: list[dict[str, Any]],
+        *,
         path: str | None = None,
         repository_revision: str | None = None,
-    ) -> None:
+    ) -> list[dict[str, Any]]:
         prepared = [self._prepare_code_chunk(project_id, chunk) for chunk in code_chunks]
         if path is not None:
             for chunk in prepared:
@@ -1305,6 +1317,26 @@ class Database:
                         "code chunk repository revision does not match replacement scope"
                     )
 
+        target_keys: set[tuple[str, str, str, str, int, int]] = set()
+        for chunk in prepared:
+            key = self._code_chunk_match_key(chunk)
+            if key in target_keys:
+                raise ValueError(
+                    "duplicate code chunk persistence identity in replacement input: "
+                    f"{chunk['path']} {chunk['qualified_name']} "
+                    f"{chunk['start_line']}-{chunk['end_line']}"
+                )
+            target_keys.add(key)
+        return prepared
+
+    def _replace_code_chunks_in_scope(
+        self,
+        conn: sqlite3.Connection,
+        project_id: str,
+        prepared: list[dict[str, Any]],
+        path: str | None = None,
+        repository_revision: str | None = None,
+    ) -> None:
         conditions = ["project_id = ?"]
         params: list[Any] = [project_id]
         if path is not None:
@@ -1318,14 +1350,8 @@ class Database:
             params,
         ).fetchall()
 
-        counts: dict[tuple[str, str, str, str], int] = {}
-        for row in existing_rows:
-            key = self._code_chunk_match_key(row)
-            counts[key] = counts.get(key, 0) + 1
         existing_by_key = {
-            self._code_chunk_match_key(row): row
-            for row in existing_rows
-            if counts[self._code_chunk_match_key(row)] == 1
+            self._code_chunk_match_key(row): row for row in existing_rows
         }
 
         kept_ids: set[int] = set()
@@ -1453,12 +1479,16 @@ class Database:
         )
 
     @staticmethod
-    def _code_chunk_match_key(row: sqlite3.Row | dict[str, Any]) -> tuple[str, str, str, str]:
+    def _code_chunk_match_key(
+        row: sqlite3.Row | dict[str, Any],
+    ) -> tuple[str, str, str, str, int, int]:
         return (
             row["repository_revision"],
             row["path"],
             row["chunk_type"],
             row["qualified_name"],
+            int(row["start_line"]),
+            int(row["end_line"]),
         )
 
     def _prepare_relation_node(
