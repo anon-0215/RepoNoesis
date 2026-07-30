@@ -94,3 +94,12 @@ fail closed without explicit pricing and positive answer/evaluator cost budgets 
 
 Normal application startup never imports this package, runs a benchmark, downloads a model, or calls
 a paid provider.
+
+The authoritative live dense-only acceptance profile is
+`protocols/live-dense-acceptance-v1.json` (`m5-live-dense-acceptance`, version 1), with its exported
+schema at `schemas/live-dense-acceptance.schema.json`. Dataset validation loads this profile and fails
+closed on a missing/unsupported/incomplete profile or on a repository outside its applicability rule.
+The profile freezes the existing `chunk_identities`/`build_chunk_inventory` identity contract, UTF-8
+byte ascending A/B partition, strict zero-encode and physical-no-op C stage, dense Top-3 complete-gold
+matching, all-answerable-pass threshold, unanswerable skip behavior, and mandatory Hit@5 Top-3
+disclosure. It contains no repository-specific observed chunk count, identity set, or model result.

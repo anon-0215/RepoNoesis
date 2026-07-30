@@ -59,3 +59,11 @@ CI [-0.1111, 0.0556]；相对 M2，M3 relation-edge recall delta +0.1111，95% C
 当前结果只支持：dataset/identity/validator、模式隔离、预算、恢复、指标公式和 M1—M4 正式链路
 复用等工程结论。不能支持真实用户学习效果、mastery 准确性、M4 教学有效性、普遍优于 RAG、
 LLM judge 等价人工教师、跨语言泛化或论文级 benchmark 结论。
+
+## Live dense 验收协议状态
+
+在 Click 真实 inventory、embedding 和检索结果产生之前，M5 已将通用 live dense-only 验收规则
+冻结为 `benchmarks/m5/protocols/live-dense-acceptance-v1.json` 的 version 1。它规定 UTF-8 字节
+升序 A/B/C、C 严格零 document encode 和物理 no-op、Top 3 完整 gold 命中、全部 answerable
+场景通过以及 unanswerable skip。本节只记录协议已冻结，不表示 Click 或 HTTPX 真实 BGE-M3
+验收已经运行或通过；历史 fake-provider 数值也不是该协议的通过线。

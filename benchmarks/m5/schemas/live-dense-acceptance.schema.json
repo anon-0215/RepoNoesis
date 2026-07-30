@@ -1,0 +1,402 @@
+{
+  "$defs": {
+    "GoldAcceptanceProtocol": {
+      "additionalProperties": false,
+      "properties": {
+        "scenario_gold_policy": {
+          "const": "any-complete-valid-gold",
+          "title": "Scenario Gold Policy",
+          "type": "string"
+        },
+        "required_traceability_fields": {
+          "items": {
+            "enum": [
+              "repository_id",
+              "repository_revision",
+              "repository_content_identity",
+              "path",
+              "qualified_symbol",
+              "start_line",
+              "end_line",
+              "content_hash",
+              "chunk_identity",
+              "full_index_membership"
+            ],
+            "type": "string"
+          },
+          "maxItems": 10,
+          "minItems": 10,
+          "title": "Required Traceability Fields",
+          "type": "array"
+        },
+        "per_scenario_pass_condition": {
+          "const": "any-complete-valid-gold-in-top-3",
+          "title": "Per Scenario Pass Condition",
+          "type": "string"
+        },
+        "path_match": {
+          "const": "exact-posix-path",
+          "title": "Path Match",
+          "type": "string"
+        },
+        "symbol_span_hash_match": {
+          "const": "exact-source-span-identity",
+          "title": "Symbol Span Hash Match",
+          "type": "string"
+        }
+      },
+      "required": [
+        "scenario_gold_policy",
+        "required_traceability_fields",
+        "per_scenario_pass_condition",
+        "path_match",
+        "symbol_span_hash_match"
+      ],
+      "title": "GoldAcceptanceProtocol",
+      "type": "object"
+    },
+    "OverallAcceptanceProtocol": {
+      "additionalProperties": false,
+      "properties": {
+        "pass_condition": {
+          "const": "all-answerable-scenarios-pass",
+          "title": "Pass Condition",
+          "type": "string"
+        },
+        "answerable_pass_rate": {
+          "const": 1.0,
+          "title": "Answerable Pass Rate",
+          "type": "number"
+        },
+        "unanswerable_affects_pass_rate": {
+          "const": false,
+          "title": "Unanswerable Affects Pass Rate",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "pass_condition",
+        "answerable_pass_rate",
+        "unanswerable_affects_pass_rate"
+      ],
+      "title": "OverallAcceptanceProtocol",
+      "type": "object"
+    },
+    "PartitionProtocol": {
+      "additionalProperties": false,
+      "properties": {
+        "a_count_formula": {
+          "const": "(N + 1) // 2",
+          "title": "A Count Formula",
+          "type": "string"
+        },
+        "b_count_formula": {
+          "const": "N - A",
+          "title": "B Count Formula",
+          "type": "string"
+        },
+        "a_slice": {
+          "const": "sorted_chunks[0:A]",
+          "title": "A Slice",
+          "type": "string"
+        },
+        "b_slice": {
+          "const": "sorted_chunks[A:N]",
+          "title": "B Slice",
+          "type": "string"
+        },
+        "full_formula": {
+          "const": "A union B",
+          "title": "Full Formula",
+          "type": "string"
+        },
+        "c_target": {
+          "const": "FULL",
+          "title": "C Target",
+          "type": "string"
+        },
+        "stage_a": {
+          "$ref": "#/$defs/StageExpectation"
+        },
+        "stage_b": {
+          "$ref": "#/$defs/StageExpectation"
+        },
+        "stage_c": {
+          "$ref": "#/$defs/StageExpectation"
+        }
+      },
+      "required": [
+        "a_count_formula",
+        "b_count_formula",
+        "a_slice",
+        "b_slice",
+        "full_formula",
+        "c_target",
+        "stage_a",
+        "stage_b",
+        "stage_c"
+      ],
+      "title": "PartitionProtocol",
+      "type": "object"
+    },
+    "ProtocolApplicability": {
+      "additionalProperties": false,
+      "properties": {
+        "repository_rule": {
+          "const": "all_validated_m5_python_repositories",
+          "title": "Repository Rule",
+          "type": "string"
+        },
+        "languages": {
+          "items": {
+            "const": "python",
+            "type": "string"
+          },
+          "maxItems": 1,
+          "minItems": 1,
+          "title": "Languages",
+          "type": "array"
+        }
+      },
+      "required": [
+        "repository_rule",
+        "languages"
+      ],
+      "title": "ProtocolApplicability",
+      "type": "object"
+    },
+    "ReportingProtocol": {
+      "additionalProperties": false,
+      "properties": {
+        "reported_metrics": {
+          "items": {
+            "enum": [
+              "hit_at_1",
+              "hit_at_3",
+              "hit_at_5",
+              "mrr_at_10",
+              "ndcg_at_10",
+              "evidence_precision",
+              "evidence_recall",
+              "evidence_f1",
+              "expected_file_recall",
+              "gold_rank"
+            ],
+            "type": "string"
+          },
+          "maxItems": 10,
+          "minItems": 10,
+          "title": "Reported Metrics",
+          "type": "array"
+        },
+        "hit_at_5_disclosure": {
+          "const": "computed-from-at-most-top-3-not-five-retrieved",
+          "title": "Hit At 5 Disclosure",
+          "type": "string"
+        },
+        "fake_provider_metrics_can_set_acceptance_threshold": {
+          "const": false,
+          "title": "Fake Provider Metrics Can Set Acceptance Threshold",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "reported_metrics",
+        "hit_at_5_disclosure",
+        "fake_provider_metrics_can_set_acceptance_threshold"
+      ],
+      "title": "ReportingProtocol",
+      "type": "object"
+    },
+    "RetrievalProtocol": {
+      "additionalProperties": false,
+      "properties": {
+        "mode": {
+          "const": "dense",
+          "title": "Mode",
+          "type": "string"
+        },
+        "top_k": {
+          "const": 3,
+          "title": "Top K",
+          "type": "integer"
+        },
+        "answerable_query_encode_count": {
+          "const": 1,
+          "title": "Answerable Query Encode Count",
+          "type": "integer"
+        },
+        "unanswerable_query_behavior": {
+          "const": "skip",
+          "title": "Unanswerable Query Behavior",
+          "type": "string"
+        },
+        "forbidden_components": {
+          "items": {
+            "enum": [
+              "bm25",
+              "weighted_rrf",
+              "hybrid",
+              "relation_expansion",
+              "planner",
+              "agent_loop",
+              "llm",
+              "evaluator"
+            ],
+            "type": "string"
+          },
+          "maxItems": 8,
+          "minItems": 8,
+          "title": "Forbidden Components",
+          "type": "array"
+        }
+      },
+      "required": [
+        "mode",
+        "top_k",
+        "answerable_query_encode_count",
+        "unanswerable_query_behavior",
+        "forbidden_components"
+      ],
+      "title": "RetrievalProtocol",
+      "type": "object"
+    },
+    "StableOrderingProtocol": {
+      "additionalProperties": false,
+      "properties": {
+        "identity_builder": {
+          "const": "app.m5.dense_artifact.build_chunk_inventory",
+          "title": "Identity Builder",
+          "type": "string"
+        },
+        "manifest_field": {
+          "const": "chunk_identities",
+          "title": "Manifest Field",
+          "type": "string"
+        },
+        "identity_format": {
+          "const": "chunk-sha256:<64-lowercase-hex>",
+          "title": "Identity Format",
+          "type": "string"
+        },
+        "encoding": {
+          "const": "utf-8-bytes",
+          "title": "Encoding",
+          "type": "string"
+        },
+        "direction": {
+          "const": "ascending",
+          "title": "Direction",
+          "type": "string"
+        },
+        "uniqueness_scope": {
+          "const": "repository-revision-content-identity",
+          "title": "Uniqueness Scope",
+          "type": "string"
+        },
+        "persistent_identity_contract": {
+          "const": "existing-code-chunk-contract",
+          "title": "Persistent Identity Contract",
+          "type": "string"
+        }
+      },
+      "required": [
+        "identity_builder",
+        "manifest_field",
+        "identity_format",
+        "encoding",
+        "direction",
+        "uniqueness_scope",
+        "persistent_identity_contract"
+      ],
+      "title": "StableOrderingProtocol",
+      "type": "object"
+    },
+    "StageExpectation": {
+      "additionalProperties": false,
+      "properties": {
+        "generated_formula": {
+          "minLength": 1,
+          "title": "Generated Formula",
+          "type": "string"
+        },
+        "cached_formula": {
+          "minLength": 1,
+          "title": "Cached Formula",
+          "type": "string"
+        },
+        "document_encode_calls_formula": {
+          "minLength": 1,
+          "title": "Document Encode Calls Formula",
+          "type": "string"
+        },
+        "document_encode_batches_formula": {
+          "minLength": 1,
+          "title": "Document Encode Batches Formula",
+          "type": "string"
+        },
+        "document_encode_items_formula": {
+          "minLength": 1,
+          "title": "Document Encode Items Formula",
+          "type": "string"
+        }
+      },
+      "required": [
+        "generated_formula",
+        "cached_formula",
+        "document_encode_calls_formula",
+        "document_encode_batches_formula",
+        "document_encode_items_formula"
+      ],
+      "title": "StageExpectation",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "protocol_id": {
+      "const": "m5-live-dense-acceptance",
+      "title": "Protocol Id",
+      "type": "string"
+    },
+    "protocol_version": {
+      "const": 1,
+      "title": "Protocol Version",
+      "type": "integer"
+    },
+    "applicability": {
+      "$ref": "#/$defs/ProtocolApplicability"
+    },
+    "stable_ordering": {
+      "$ref": "#/$defs/StableOrderingProtocol"
+    },
+    "partition": {
+      "$ref": "#/$defs/PartitionProtocol"
+    },
+    "retrieval": {
+      "$ref": "#/$defs/RetrievalProtocol"
+    },
+    "gold_acceptance": {
+      "$ref": "#/$defs/GoldAcceptanceProtocol"
+    },
+    "overall_acceptance": {
+      "$ref": "#/$defs/OverallAcceptanceProtocol"
+    },
+    "reporting": {
+      "$ref": "#/$defs/ReportingProtocol"
+    }
+  },
+  "required": [
+    "protocol_id",
+    "protocol_version",
+    "applicability",
+    "stable_ordering",
+    "partition",
+    "retrieval",
+    "gold_acceptance",
+    "overall_acceptance",
+    "reporting"
+  ],
+  "title": "LiveDenseAcceptanceProtocol",
+  "type": "object"
+}

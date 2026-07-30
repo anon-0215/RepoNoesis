@@ -18,6 +18,12 @@ from app.m5.contracts import (
     RepositorySpec,
     Scenario,
 )
+from app.m5.live_dense_protocol import (
+    DEFAULT_LIVE_DENSE_PROTOCOL_PATH,
+    LiveDenseProtocolError,
+    load_live_dense_protocol,
+    validate_protocol_repository_coverage,
+)
 
 
 @dataclass
@@ -60,15 +66,27 @@ class DatasetValidationError(ValueError):
 
 
 class BenchmarkDatasetValidator:
-    def __init__(self, dataset_directory: Path, repository_root: Path) -> None:
+    def __init__(
+        self,
+        dataset_directory: Path,
+        repository_root: Path,
+        live_dense_protocol_path: Path = DEFAULT_LIVE_DENSE_PROTOCOL_PATH,
+    ) -> None:
         self.dataset_directory = dataset_directory.resolve()
         self.repository_root = repository_root.resolve()
+        self.live_dense_protocol_path = live_dense_protocol_path.resolve()
 
     def validate(self) -> ValidationReport:
         report = ValidationReport(valid=False)
         try:
             dataset = self._load()
-        except (OSError, json.JSONDecodeError, ValidationError, ValueError) as exc:
+        except (
+            OSError,
+            json.JSONDecodeError,
+            ValidationError,
+            LiveDenseProtocolError,
+            ValueError,
+        ) as exc:
             report.errors.append(f"dataset load failed: {type(exc).__name__}: {exc}")
             return report
         report.dataset_version = dataset.manifest.dataset_version
@@ -110,6 +128,8 @@ class BenchmarkDatasetValidator:
         if not isinstance(repositories_raw, list):
             raise ValueError("repositories.json must contain a JSON array")
         repositories = [RepositorySpec.model_validate(item) for item in repositories_raw]
+        protocol = load_live_dense_protocol(self.live_dense_protocol_path)
+        validate_protocol_repository_coverage(protocol, repositories)
         scenarios = [Scenario.model_validate(item) for item in _read_jsonl(self.dataset_directory / manifest.scenarios_file)]
         sequences = [AdaptiveSequence.model_validate(item) for item in _read_jsonl(self.dataset_directory / manifest.sequences_file)]
         return LoadedDataset(manifest, repositories, scenarios, sequences, self.dataset_directory)

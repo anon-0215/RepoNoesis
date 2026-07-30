@@ -13,6 +13,7 @@ from app.m5.contracts import (
     RepositorySpec,
     Scenario,
 )
+from app.m5.live_dense_protocol import LiveDenseAcceptanceProtocol
 
 
 def main(output: Path) -> None:
@@ -22,6 +23,7 @@ def main(output: Path) -> None:
         "repository.schema.json": RepositorySpec,
         "scenario.schema.json": Scenario,
         "sequence.schema.json": AdaptiveSequence,
+        "live-dense-acceptance.schema.json": LiveDenseAcceptanceProtocol,
     }
     for name, model in models.items():
         (output / name).write_text(

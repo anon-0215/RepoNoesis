@@ -1,0 +1,103 @@
+{
+  "protocol_id": "m5-live-dense-acceptance",
+  "protocol_version": 1,
+  "applicability": {
+    "repository_rule": "all_validated_m5_python_repositories",
+    "languages": [
+      "python"
+    ]
+  },
+  "stable_ordering": {
+    "identity_builder": "app.m5.dense_artifact.build_chunk_inventory",
+    "manifest_field": "chunk_identities",
+    "identity_format": "chunk-sha256:<64-lowercase-hex>",
+    "encoding": "utf-8-bytes",
+    "direction": "ascending",
+    "uniqueness_scope": "repository-revision-content-identity",
+    "persistent_identity_contract": "existing-code-chunk-contract"
+  },
+  "partition": {
+    "a_count_formula": "(N + 1) // 2",
+    "b_count_formula": "N - A",
+    "a_slice": "sorted_chunks[0:A]",
+    "b_slice": "sorted_chunks[A:N]",
+    "full_formula": "A union B",
+    "c_target": "FULL",
+    "stage_a": {
+      "generated_formula": "A",
+      "cached_formula": "0",
+      "document_encode_calls_formula": "implementation-recorded",
+      "document_encode_batches_formula": "implementation-recorded",
+      "document_encode_items_formula": "A"
+    },
+    "stage_b": {
+      "generated_formula": "B",
+      "cached_formula": "A",
+      "document_encode_calls_formula": "implementation-recorded",
+      "document_encode_batches_formula": "implementation-recorded",
+      "document_encode_items_formula": "B"
+    },
+    "stage_c": {
+      "generated_formula": "0",
+      "cached_formula": "N",
+      "document_encode_calls_formula": "0",
+      "document_encode_batches_formula": "0",
+      "document_encode_items_formula": "0"
+    }
+  },
+  "retrieval": {
+    "mode": "dense",
+    "top_k": 3,
+    "answerable_query_encode_count": 1,
+    "unanswerable_query_behavior": "skip",
+    "forbidden_components": [
+      "bm25",
+      "weighted_rrf",
+      "hybrid",
+      "relation_expansion",
+      "planner",
+      "agent_loop",
+      "llm",
+      "evaluator"
+    ]
+  },
+  "gold_acceptance": {
+    "scenario_gold_policy": "any-complete-valid-gold",
+    "required_traceability_fields": [
+      "repository_id",
+      "repository_revision",
+      "repository_content_identity",
+      "path",
+      "qualified_symbol",
+      "start_line",
+      "end_line",
+      "content_hash",
+      "chunk_identity",
+      "full_index_membership"
+    ],
+    "per_scenario_pass_condition": "any-complete-valid-gold-in-top-3",
+    "path_match": "exact-posix-path",
+    "symbol_span_hash_match": "exact-source-span-identity"
+  },
+  "overall_acceptance": {
+    "pass_condition": "all-answerable-scenarios-pass",
+    "answerable_pass_rate": 1.0,
+    "unanswerable_affects_pass_rate": false
+  },
+  "reporting": {
+    "reported_metrics": [
+      "hit_at_1",
+      "hit_at_3",
+      "hit_at_5",
+      "mrr_at_10",
+      "ndcg_at_10",
+      "evidence_precision",
+      "evidence_recall",
+      "evidence_f1",
+      "expected_file_recall",
+      "gold_rank"
+    ],
+    "hit_at_5_disclosure": "computed-from-at-most-top-3-not-five-retrieved",
+    "fake_provider_metrics_can_set_acceptance_threshold": false
+  }
+}
