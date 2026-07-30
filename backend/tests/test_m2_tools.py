@@ -216,6 +216,11 @@ class M2ToolTests(unittest.TestCase):
             [item["qualified_name"] for item in observation.structured_results],
             ["AuthService.authenticate_user"],
         )
+        exact = observation.structured_results[0]
+        self.assertEqual(exact["candidate_source"], "symbol")
+        self.assertEqual(exact["symbol_match_type"], "exact_qualified")
+        self.assertEqual(exact["symbol_rank"], 1)
+        self.assertIn("qualified_symbol_exact", exact["match_reasons"])
         _call, observation = self._call(
             "lookup_symbol",
             {"symbol": "auth", "match_mode": "prefix", "language": "python"},

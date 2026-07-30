@@ -31,6 +31,7 @@ from app.services.relation_graph import (
     RelationGraphService,
     RelationTraversalLimits,
 )
+from app.services.symbol_retriever import SymbolRetriever
 
 
 ToolHandler = Callable[["ToolContext", BaseModel], tuple[Any, list[str], bool]]
@@ -450,72 +451,51 @@ def _lookup_symbol(
 ) -> tuple[Any, list[str], bool]:
     values = LookupSymbolInput.model_validate(parameters)
     context.check_active()
-    chunks = context.database.get_code_chunks(
+    limit = min(values.top_k, context.limits.max_search_results)
+    ranked = SymbolRetriever(context.database).search(
         context.project_id,
+        values.symbol,
+        top_k=limit + 1,
         path=values.path,
         language=values.language,
+        match_mode=values.match_mode,
+        explicit_symbol=True,
+        repository_revision=context.repository_revision,
     )
-    needle = values.symbol.casefold()
-    ranked: list[tuple[int, dict[str, Any]]] = []
-    for chunk in chunks:
-        if str(chunk["repository_revision"]) != context.repository_revision:
-            continue
-        symbol = str(chunk["symbol_name"])
-        qualified = str(chunk["qualified_name"])
-        candidates = (symbol.casefold(), qualified.casefold())
-        score: int | None = None
-        if needle == candidates[1]:
-            score = 0
-        elif needle == candidates[0]:
-            score = 1
-        elif values.match_mode in {"prefix", "fuzzy"} and any(
-            candidate.startswith(needle) for candidate in candidates
-        ):
-            score = 2
-        elif values.match_mode == "fuzzy" and any(
-            needle in candidate for candidate in candidates
-        ):
-            score = 3
-        if score is not None:
-            ranked.append((score, chunk))
-    ranked.sort(
-        key=lambda item: (
-            item[0],
-            item[1]["path"],
-            int(item[1]["start_line"]),
-            item[1]["qualified_name"],
-            int(item[1]["id"]),
-        )
-    )
-    limit = min(values.top_k, context.limits.max_search_results)
+    truncated = len(ranked) > limit
     results = [
         {
-            "code_chunk_id": int(chunk["id"]),
-            "chunk_identity": _chunk_identity_from_chunk(context.project_id, chunk),
-            "symbol_name": chunk["symbol_name"],
-            "qualified_name": chunk["qualified_name"],
-            "symbol_kind": chunk["chunk_type"],
-            "path": chunk["path"],
-            "language": chunk["language"],
-            "start_line": int(chunk["start_line"]),
-            "end_line": int(chunk["end_line"]),
-            "repository_revision": chunk["repository_revision"],
-            "content_hash": chunk["content_hash"],
+            "code_chunk_id": item.code_chunk_id,
+            "chunk_identity": item.chunk_identity,
+            "symbol_name": item.symbol_name,
+            "qualified_name": item.qualified_name,
+            "symbol_kind": item.chunk_type,
+            "path": item.path,
+            "language": item.language,
+            "start_line": item.start_line,
+            "end_line": item.end_line,
+            "repository_revision": item.repository_revision,
+            "content_hash": item.content_hash,
+            "candidate_source": item.candidate_source,
+            "symbol_match_type": item.symbol_match_type,
+            "symbol_score": item.symbol_score,
+            "symbol_rank": item.symbol_rank,
+            "match_reasons": list(item.match_reasons),
             "relation_node_id": next(
                 (
                     str(node["node_id"])
                     for node in context.database.get_relation_nodes(
                         context.project_id,
                         context.repository_revision,
-                        code_chunk_ids=[int(chunk["id"])],
+                        code_chunk_ids=[item.code_chunk_id],
                     )
                 ),
                 None,
             ),
         }
-        for _score, chunk in ranked[:limit]
+        for item in ranked[:limit]
     ]
-    return results, [], len(ranked) > limit
+    return results, [], truncated
 
 
 def _read_source(
@@ -861,20 +841,6 @@ def _evidence_summary(item: Evidence) -> dict[str, Any]:
         "retrieval_sources": list(item.retrieval_sources),
         "fusion_rank": item.fusion_rank,
     }
-
-
-def _chunk_identity_from_chunk(project_id: str, chunk: dict[str, Any]) -> str:
-    return "|".join(
-        [
-            project_id,
-            str(chunk["repository_revision"]),
-            str(chunk["path"]),
-            str(chunk["start_line"]),
-            str(chunk["end_line"]),
-            str(chunk["content_hash"]),
-            str(chunk["id"]),
-        ]
-    )
 
 
 def _is_safe_relative_path(path: str) -> bool:
