@@ -41,6 +41,10 @@ from app.services.relation_graph import (
     EvidenceChain,
     RelationValidator,
 )
+from app.services.retrieval_v2 import (
+    RETRIEVAL_VERSION_V1,
+    validate_retrieval_version,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -197,7 +201,9 @@ def run_bounded_agent(
     cancellation: CancellationToken | None = None,
     registry: ToolRegistry | None = None,
     learning_context: dict[str, Any] | None = None,
+    retrieval_version: str = RETRIEVAL_VERSION_V1,
 ) -> dict[str, Any]:
+    retrieval_version = validate_retrieval_version(retrieval_version)
     limits = limits or AgentLimits()
     cancellation = cancellation or CancellationToken()
     started = time.monotonic()
@@ -215,6 +221,7 @@ def run_bounded_agent(
             cancellation=cancellation,
             deadline_monotonic=started + limits.total_deadline_ms / 1000,
             learning_context=learning_context,
+            retrieval_version=retrieval_version,
         )
     except ValueError as exc:
         result = answer_question(
@@ -227,6 +234,7 @@ def run_bounded_agent(
             language=language,
             symbol=symbol,
             evidence_count=evidence_count,
+            retrieval_version=retrieval_version,
         )
         result["warnings"] = [
             *result["warnings"],
@@ -822,6 +830,7 @@ def _fingerprint(
             "arguments": normalized_arguments,
             "project_id": context.project_id,
             "repository_revision": context.repository_revision,
+            "retrieval_version": context.retrieval_version,
         },
         ensure_ascii=False,
         sort_keys=True,

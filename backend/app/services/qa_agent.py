@@ -13,11 +13,9 @@ from app.services.evidence import (
     Evidence,
     EvidenceBuilder,
 )
-from app.services.hybrid_retriever import (
-    DEFAULT_EVIDENCE_COUNT,
-    HybridRetriever,
-)
+from app.services.hybrid_retriever import DEFAULT_EVIDENCE_COUNT
 from app.services.llm_client import LLMClient
+from app.services.retrieval_v2 import RETRIEVAL_VERSION_V1, retrieve_code
 
 
 INSUFFICIENT_ANSWER = "当前源码证据不足，无法可靠回答。"
@@ -48,6 +46,7 @@ def answer_question(
     language: str | None = None,
     symbol: str | None = None,
     evidence_count: int = DEFAULT_EVIDENCE_COUNT,
+    retrieval_version: str = RETRIEVAL_VERSION_V1,
 ) -> dict[str, Any]:
     """Answer from validated code-chunk Evidence.
 
@@ -70,15 +69,22 @@ def answer_question(
 
     project = bundle.get("project") or {}
     project_id = str(project.get("id", ""))
-    outcome = HybridRetriever(database, embedding_service).search(
+    outcome = retrieve_code(
+        database,
+        embedding_service,
         project_id,
         question,
+        retrieval_version=retrieval_version,
         evidence_count=evidence_count,
         path=path,
         language=language,
         symbol=symbol,
     )
-    built = EvidenceBuilder().build(outcome.results, project)
+    built = EvidenceBuilder().build(
+        outcome.results,
+        project,
+        retrieval_strategy_version=outcome.retrieval_strategy_version,
+    )
     return answer_from_evidence(
         question,
         built,

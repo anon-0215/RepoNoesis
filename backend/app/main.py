@@ -64,6 +64,7 @@ class AskRequest(BaseModel):
     language: str | None = None
     symbol: str | None = None
     evidence_count: int = Field(default=5, ge=1, le=8)
+    retrieval_version: Literal["v1", "v2"] = "v1"
 
 
 class CitationResponse(BaseModel):
@@ -303,6 +304,7 @@ def ask_project(project_id: str, request: AskRequest) -> dict[str, Any]:
         evidence_count=request.evidence_count,
         limits=agent_limits,
         learning_context=learning_context,
+        retrieval_version=request.retrieval_version,
     )
     db.save_chat_answer(project_id, request.question, result["answer"], result["citations"])
     return result

@@ -56,6 +56,8 @@ class EvidenceBuilder:
         self,
         candidates: list[HybridSearchResult],
         project: dict[str, Any],
+        *,
+        retrieval_strategy_version: str = RETRIEVAL_STRATEGY_VERSION,
     ) -> list[Evidence]:
         repository_id = _repository_id(project)
         repository_url = str(project.get("repo_url", ""))
@@ -91,6 +93,7 @@ class EvidenceBuilder:
                         f"Selected at fusion rank {candidate.fusion_rank} "
                         f"from {source_names} retrieval."
                     ),
+                    retrieval_strategy_version=retrieval_strategy_version,
                 )
             )
         return evidence

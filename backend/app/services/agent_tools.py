@@ -25,11 +25,15 @@ from app.services.agent_contracts import (
 )
 from app.services.embedding_service import EmbeddingService
 from app.services.evidence import CitationValidator, Evidence, EvidenceBuilder
-from app.services.hybrid_retriever import HybridRetriever
 from app.services.relation_graph import (
     EvidenceChainStore,
     RelationGraphService,
     RelationTraversalLimits,
+)
+from app.services.retrieval_v2 import (
+    RETRIEVAL_VERSION_V1,
+    retrieve_code,
+    validate_retrieval_version,
 )
 from app.services.symbol_retriever import SymbolRetriever
 
@@ -100,6 +104,7 @@ class ToolContext:
     cancellation: CancellationToken
     deadline_monotonic: float
     learning_context: dict[str, Any] = field(default_factory=dict)
+    retrieval_version: str = RETRIEVAL_VERSION_V1
 
     def check_active(self) -> None:
         if self.cancellation.cancelled:
@@ -354,6 +359,7 @@ def build_tool_context(
     cancellation: CancellationToken,
     deadline_monotonic: float,
     learning_context: dict[str, Any] | None = None,
+    retrieval_version: str = RETRIEVAL_VERSION_V1,
 ) -> ToolContext:
     project = bundle.get("project") or {}
     project_id = str(project.get("id", ""))
@@ -381,6 +387,7 @@ def build_tool_context(
         cancellation=cancellation,
         deadline_monotonic=deadline_monotonic,
         learning_context=dict(learning_context or {}),
+        retrieval_version=validate_retrieval_version(retrieval_version),
     )
 
 
@@ -412,16 +419,23 @@ def _search_code(
 ) -> tuple[Any, list[str], bool]:
     values = SearchCodeInput.model_validate(parameters)
     context.check_active()
-    outcome = HybridRetriever(context.database, context.embedding_service).search(
+    outcome = retrieve_code(
+        context.database,
+        context.embedding_service,
         context.project_id,
         values.query,
+        retrieval_version=context.retrieval_version,
         evidence_count=min(values.top_k, context.limits.max_search_results),
         path=values.path,
         language=values.language,
         symbol=values.symbol,
     )
     project = context.bundle.get("project") or {}
-    built = EvidenceBuilder().build(outcome.results, project)
+    built = EvidenceBuilder().build(
+        outcome.results,
+        project,
+        retrieval_strategy_version=outcome.retrieval_strategy_version,
+    )
     built = [
         item
         for item in built
@@ -430,16 +444,25 @@ def _search_code(
     ]
     added = context.evidence_store.add(context.request_id, built)
     results = [_evidence_summary(item) for item in added]
-    return (
-        {
-            "evidence": results,
-            "retrieval_mode": outcome.retrieval_mode,
-            "grounding": "unvalidated",
-            "retrieval_metrics": {
-                "candidate_count": len(outcome.results),
-                "new_evidence_count": len(added),
-            },
+    payload = {
+        "evidence": results,
+        "retrieval_mode": outcome.retrieval_mode,
+        "grounding": "unvalidated",
+        "retrieval_metrics": {
+            "candidate_count": len(outcome.results),
+            "new_evidence_count": len(added),
         },
+    }
+    if context.retrieval_version != RETRIEVAL_VERSION_V1:
+        payload.update(
+            {
+                "retrieval_version": outcome.retrieval_version,
+                "retrieval_strategy_version": outcome.retrieval_strategy_version,
+                "retrieval_audit": outcome.audit,
+            }
+        )
+    return (
+        payload,
         outcome.warnings,
         len(outcome.results) > context.limits.max_search_results,
     )

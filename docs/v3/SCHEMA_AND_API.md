@@ -29,7 +29,9 @@ v6 保留 v5 的全部 M1/M2/M3 表和数据，新增 `learner_profiles`、`lear
 {"question": "函数 a 跨文件调用了什么？"}
 ```
 
-M1 filter `path`、`language`、`symbol`、`evidence_count` 仍是可选字段；不接受 learner、
+M1 filter `path`、`language`、`symbol`、`evidence_count` 仍是可选字段。Retrieval v2 Phase 2
+新增可选 `retrieval_version`，只接受精确的 `v1` 或 `v2`；省略时默认 `v1`，未知值由请求
+校验明确拒绝。该值由服务器绑定到单次 Agent/tool context，Planner 不能改写；不接受 learner、
 project、repository、revision、图预算或学习预算。
 
 响应继续保留 M1/M2/M3 字段，并新增：
