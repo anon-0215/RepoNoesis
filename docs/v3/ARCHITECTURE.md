@@ -56,6 +56,15 @@ EvidenceBuilder 和 CitationValidator，不创建第二套 citation。
 
 M1 已实现以代码块为单元的 BM25；语义复用 `SemanticRetriever`；Weighted RRF 保留独立分数、选择原因、去重与裁剪。Validator 以当前 revision 的 SQLite `repo_files` 和 `code_chunks` 快照校验路径、行号、哈希和片段，并在回答生成后复验。无有效证据时返回 insufficient，不让 LLM 补写来源。
 
+Retrieval v2 Phase 2 仅在请求显式选择 `retrieval_version=v2` 时复用 QueryAnalyzer、dense、
+lexical 和 symbol 三源，并以 `weighted_rrf_v2@1` 做 exact chunk identity fusion。Phase 3
+继续保持 v1 和 plain v2 冻结；只有请求同时选择 `hierarchy_mode=normalize_v1`，才在 RRF
+之后、final top-k 之前执行 `hierarchy_normalization_v1@1`。该层只识别同 project、revision、
+normalized path 内的精确 span hierarchy，不使用 relation graph，也不传播或伪造检索分数。
+resolver 查询、深度、derived candidate、family occupancy 和最终结果均有硬上限；查询不完整或
+metadata 冲突时保留 direct candidates 并记录 warning。最终选中的每个成员仍是 SQLite 中的
+真实完整 chunk，继续进入原 Citation/Relation/Evidence 边界。
+
 ### 5. Agent Core
 
 M2 已实现请求级单 Agent 有限状态机：

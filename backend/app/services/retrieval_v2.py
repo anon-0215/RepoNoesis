@@ -6,6 +6,14 @@ from typing import Any, Literal
 
 from app.database import Database
 from app.services.embedding_service import EmbeddingService
+from app.services.hierarchy_normalization import (
+    HIERARCHY_MODE_OFF,
+    HIERARCHY_MODE_NORMALIZE_V1,
+    HierarchyLimits,
+    HierarchyResolver,
+    normalize_hierarchy_candidates,
+    validate_hierarchy_mode,
+)
 from app.services.hybrid_retriever import HybridRetriever, HybridSearchResult
 from app.services.lexical_retriever import LexicalRetriever, LexicalSearchResult
 from app.services.query_analyzer import QueryAnalysis, QueryAnalyzer
@@ -267,6 +275,7 @@ class RetrievalV2Orchestrator:
         semantic_retriever: SemanticRetriever | None = None,
         symbol_retriever: SymbolRetriever | None = None,
         config: RetrievalV2Config | None = None,
+        hierarchy_limits: HierarchyLimits | None = None,
     ) -> None:
         self.database = database
         self.embedding_service = embedding_service
@@ -277,6 +286,7 @@ class RetrievalV2Orchestrator:
         )
         self.symbol_retriever = symbol_retriever or SymbolRetriever(database)
         self.config = config or RetrievalV2Config()
+        self.hierarchy_limits = hierarchy_limits or HierarchyLimits()
 
     def search(
         self,
@@ -286,9 +296,14 @@ class RetrievalV2Orchestrator:
         path: str | None = None,
         language: str | None = None,
         symbol: str | None = None,
+        hierarchy_mode: str = HIERARCHY_MODE_OFF,
     ) -> RetrievalExecutionOutcome:
         if not str(query).strip():
             raise ValueError("retrieval query must not be empty")
+        hierarchy_mode = validate_hierarchy_mode(
+            hierarchy_mode,
+            retrieval_version=RETRIEVAL_VERSION_V2,
+        )
         analysis = self.query_analyzer.analyze(query)
         weights, budgets, policy_warnings = _validated_policy(analysis, self.config)
         source_candidates: list[RetrievalSourceCandidate] = []
@@ -391,6 +406,22 @@ class RetrievalV2Orchestrator:
             max(1, int(evidence_count)),
         )
         selected = merged[:limit]
+        normalized_results: list[HybridSearchResult] | None = None
+        hierarchy_audit: dict[str, Any] | None = None
+        if hierarchy_mode == HIERARCHY_MODE_NORMALIZE_V1:
+            resolution = HierarchyResolver(
+                self.database,
+                self.hierarchy_limits,
+            ).resolve(merged)
+            normalized = normalize_hierarchy_candidates(
+                merged,
+                resolution,
+                final_top_k=limit,
+                limits=self.hierarchy_limits,
+            )
+            normalized_results = normalized.results
+            hierarchy_audit = normalized.audit
+            warnings.extend(normalized.warnings)
         query_summary = _query_summary(analysis)
         audit = {
             "retrieval_version": RETRIEVAL_VERSION_V2,
@@ -414,8 +445,14 @@ class RetrievalV2Orchestrator:
                 item.to_audit_dict(query_summary) for item in selected
             ],
         }
+        if hierarchy_audit is not None:
+            audit["hierarchy"] = hierarchy_audit
         return RetrievalExecutionOutcome(
-            results=[item.to_hybrid_result() for item in selected],
+            results=(
+                normalized_results
+                if normalized_results is not None
+                else [item.to_hybrid_result() for item in selected]
+            ),
             retrieval_mode=(
                 "hybrid"
                 if any("dense" in item.source_records for item in selected)
@@ -481,8 +518,13 @@ def retrieve_code(
     path: str | None = None,
     language: str | None = None,
     symbol: str | None = None,
+    hierarchy_mode: str = HIERARCHY_MODE_OFF,
 ) -> RetrievalExecutionOutcome:
     version = validate_retrieval_version(retrieval_version)
+    hierarchy_mode = validate_hierarchy_mode(
+        hierarchy_mode,
+        retrieval_version=version,
+    )
     if version == RETRIEVAL_VERSION_V1:
         outcome = HybridRetriever(database, embedding_service).search(
             project_id,
@@ -506,6 +548,7 @@ def retrieve_code(
         path=path,
         language=language,
         symbol=symbol,
+        hierarchy_mode=hierarchy_mode,
     )
 
 

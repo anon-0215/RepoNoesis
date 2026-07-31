@@ -29,6 +29,10 @@ from app.services.agent_tools import (
 )
 from app.services.embedding_service import EmbeddingService
 from app.services.evidence import CitationValidator
+from app.services.hierarchy_normalization import (
+    HIERARCHY_MODE_OFF,
+    validate_hierarchy_mode,
+)
 from app.services.llm_client import LLMClient
 from app.services.learning_service import LearningService
 from app.services.qa_agent import (
@@ -202,8 +206,13 @@ def run_bounded_agent(
     registry: ToolRegistry | None = None,
     learning_context: dict[str, Any] | None = None,
     retrieval_version: str = RETRIEVAL_VERSION_V1,
+    hierarchy_mode: str = HIERARCHY_MODE_OFF,
 ) -> dict[str, Any]:
     retrieval_version = validate_retrieval_version(retrieval_version)
+    hierarchy_mode = validate_hierarchy_mode(
+        hierarchy_mode,
+        retrieval_version=retrieval_version,
+    )
     limits = limits or AgentLimits()
     cancellation = cancellation or CancellationToken()
     started = time.monotonic()
@@ -222,6 +231,7 @@ def run_bounded_agent(
             deadline_monotonic=started + limits.total_deadline_ms / 1000,
             learning_context=learning_context,
             retrieval_version=retrieval_version,
+            hierarchy_mode=hierarchy_mode,
         )
     except ValueError as exc:
         result = answer_question(
@@ -235,6 +245,7 @@ def run_bounded_agent(
             symbol=symbol,
             evidence_count=evidence_count,
             retrieval_version=retrieval_version,
+            hierarchy_mode=hierarchy_mode,
         )
         result["warnings"] = [
             *result["warnings"],
@@ -831,6 +842,7 @@ def _fingerprint(
             "project_id": context.project_id,
             "repository_revision": context.repository_revision,
             "retrieval_version": context.retrieval_version,
+            "hierarchy_mode": context.hierarchy_mode,
         },
         ensure_ascii=False,
         sort_keys=True,

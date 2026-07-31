@@ -25,6 +25,10 @@ from app.services.agent_contracts import (
 )
 from app.services.embedding_service import EmbeddingService
 from app.services.evidence import CitationValidator, Evidence, EvidenceBuilder
+from app.services.hierarchy_normalization import (
+    HIERARCHY_MODE_OFF,
+    validate_hierarchy_mode,
+)
 from app.services.relation_graph import (
     EvidenceChainStore,
     RelationGraphService,
@@ -105,6 +109,7 @@ class ToolContext:
     deadline_monotonic: float
     learning_context: dict[str, Any] = field(default_factory=dict)
     retrieval_version: str = RETRIEVAL_VERSION_V1
+    hierarchy_mode: str = HIERARCHY_MODE_OFF
 
     def check_active(self) -> None:
         if self.cancellation.cancelled:
@@ -360,6 +365,7 @@ def build_tool_context(
     deadline_monotonic: float,
     learning_context: dict[str, Any] | None = None,
     retrieval_version: str = RETRIEVAL_VERSION_V1,
+    hierarchy_mode: str = HIERARCHY_MODE_OFF,
 ) -> ToolContext:
     project = bundle.get("project") or {}
     project_id = str(project.get("id", ""))
@@ -372,6 +378,11 @@ def build_tool_context(
     if len(revisions) != 1:
         raise ValueError("project must have exactly one bound repository revision")
     repository_id = f"{project.get('owner', '')}/{project.get('repo', '')}".strip("/")
+    retrieval_version = validate_retrieval_version(retrieval_version)
+    hierarchy_mode = validate_hierarchy_mode(
+        hierarchy_mode,
+        retrieval_version=retrieval_version,
+    )
     return ToolContext(
         request_id=request_id,
         project_id=project_id,
@@ -387,7 +398,8 @@ def build_tool_context(
         cancellation=cancellation,
         deadline_monotonic=deadline_monotonic,
         learning_context=dict(learning_context or {}),
-        retrieval_version=validate_retrieval_version(retrieval_version),
+        retrieval_version=retrieval_version,
+        hierarchy_mode=hierarchy_mode,
     )
 
 
@@ -429,6 +441,7 @@ def _search_code(
         path=values.path,
         language=values.language,
         symbol=values.symbol,
+        hierarchy_mode=context.hierarchy_mode,
     )
     project = context.bundle.get("project") or {}
     built = EvidenceBuilder().build(

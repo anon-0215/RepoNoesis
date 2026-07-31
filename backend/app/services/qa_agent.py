@@ -14,6 +14,7 @@ from app.services.evidence import (
     EvidenceBuilder,
 )
 from app.services.hybrid_retriever import DEFAULT_EVIDENCE_COUNT
+from app.services.hierarchy_normalization import HIERARCHY_MODE_OFF
 from app.services.llm_client import LLMClient
 from app.services.retrieval_v2 import RETRIEVAL_VERSION_V1, retrieve_code
 
@@ -47,6 +48,7 @@ def answer_question(
     symbol: str | None = None,
     evidence_count: int = DEFAULT_EVIDENCE_COUNT,
     retrieval_version: str = RETRIEVAL_VERSION_V1,
+    hierarchy_mode: str = HIERARCHY_MODE_OFF,
 ) -> dict[str, Any]:
     """Answer from validated code-chunk Evidence.
 
@@ -79,6 +81,7 @@ def answer_question(
         path=path,
         language=language,
         symbol=symbol,
+        hierarchy_mode=hierarchy_mode,
     )
     built = EvidenceBuilder().build(
         outcome.results,

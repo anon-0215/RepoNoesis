@@ -581,6 +581,44 @@ class Database:
             ).fetchall()
         return [self._code_chunk_from_row(row) for row in rows]
 
+    def get_code_chunks_for_hierarchy(
+        self,
+        project_id: str,
+        repository_revision: str,
+        path: str,
+        *,
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        """Read one exact hierarchy scope with a caller-owned hard row limit."""
+        if (
+            not isinstance(limit, int)
+            or isinstance(limit, bool)
+            or limit < 1
+            or limit > 2_049
+        ):
+            raise ValueError("hierarchy row limit must be between 1 and 2049")
+        normalized_path = self._normalize_repo_path(path)
+        if not project_id or not repository_revision or not normalized_path:
+            raise ValueError("hierarchy lookup requires project, revision, and path")
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM code_chunks
+                WHERE project_id = ?
+                  AND repository_revision = ?
+                  AND path = ?
+                ORDER BY start_line, end_line DESC, qualified_name, chunk_type, id
+                LIMIT ?
+                """,
+                (
+                    project_id,
+                    repository_revision,
+                    normalized_path,
+                    limit,
+                ),
+            ).fetchall()
+        return [self._code_chunk_from_row(row) for row in rows]
+
     def replace_relation_index(
         self,
         project_id: str,

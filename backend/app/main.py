@@ -5,7 +5,7 @@ from typing import Any, Literal
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from app.config import (
     get_agent_limits,
@@ -20,6 +20,7 @@ from app.services.code_chunker import extract_python_code_chunks_from_files
 from app.services.embedding_indexer import EmbeddingIndexer
 from app.services.embedding_service import EmbeddingService
 from app.services.github_client import fetch_repository
+from app.services.hierarchy_normalization import validate_hierarchy_mode
 from app.services.learning_agent import build_learning_path
 from app.services.learning_contracts import (
     CreateGoalRequest,
@@ -65,6 +66,15 @@ class AskRequest(BaseModel):
     symbol: str | None = None
     evidence_count: int = Field(default=5, ge=1, le=8)
     retrieval_version: Literal["v1", "v2"] = "v1"
+    hierarchy_mode: Literal["off", "normalize_v1"] = "off"
+
+    @model_validator(mode="after")
+    def validate_retrieval_hierarchy_pair(self) -> "AskRequest":
+        validate_hierarchy_mode(
+            self.hierarchy_mode,
+            retrieval_version=self.retrieval_version,
+        )
+        return self
 
 
 class CitationResponse(BaseModel):
@@ -305,6 +315,7 @@ def ask_project(project_id: str, request: AskRequest) -> dict[str, Any]:
         limits=agent_limits,
         learning_context=learning_context,
         retrieval_version=request.retrieval_version,
+        hierarchy_mode=request.hierarchy_mode,
     )
     db.save_chat_answer(project_id, request.question, result["answer"], result["citations"])
     return result

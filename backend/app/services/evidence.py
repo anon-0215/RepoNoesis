@@ -64,6 +64,7 @@ class EvidenceBuilder:
         evidence: list[Evidence] = []
         for index, candidate in enumerate(candidates, start=1):
             source_names = "+".join(candidate.retrieval_sources)
+            hierarchy_only = candidate.retrieval_sources == ["hierarchy"]
             evidence.append(
                 Evidence(
                     evidence_id=f"E{index}",
@@ -90,8 +91,13 @@ class EvidenceBuilder:
                     fusion_score=candidate.fusion_score,
                     fusion_rank=candidate.fusion_rank,
                     selection_reason=(
-                        f"Selected at fusion rank {candidate.fusion_rank} "
-                        f"from {source_names} retrieval."
+                        "Selected by versioned chunk hierarchy normalization from "
+                        "a real stored chunk; no direct retrieval score was assigned."
+                        if hierarchy_only
+                        else (
+                            f"Selected at fusion rank {candidate.fusion_rank} "
+                            f"from {source_names} retrieval."
+                        )
                     ),
                     retrieval_strategy_version=retrieval_strategy_version,
                 )

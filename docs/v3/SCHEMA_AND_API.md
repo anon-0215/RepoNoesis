@@ -30,9 +30,34 @@ v6 保留 v5 的全部 M1/M2/M3 表和数据，新增 `learner_profiles`、`lear
 ```
 
 M1 filter `path`、`language`、`symbol`、`evidence_count` 仍是可选字段。Retrieval v2 Phase 2
-新增可选 `retrieval_version`，只接受精确的 `v1` 或 `v2`；省略时默认 `v1`，未知值由请求
-校验明确拒绝。该值由服务器绑定到单次 Agent/tool context，Planner 不能改写；不接受 learner、
-project、repository、revision、图预算或学习预算。
+新增可选 `retrieval_version`，只接受精确的 `v1` 或 `v2`；省略时默认 `v1`。Retrieval v2
+Phase 3 新增可选 `hierarchy_mode`，只接受精确的 `off` 或 `normalize_v1`，省略时默认
+`off`。未知值、空白、大小写变体和 `retrieval_version=v1 + hierarchy_mode=normalize_v1`
+均由请求校验明确拒绝。两个值由服务器绑定到单次 Agent/tool context，Planner 不能改写；
+不接受 learner、project、repository、revision、hierarchy/图预算或学习预算。
+
+三条兼容路径为：
+
+```text
+retrieval_version omitted/v1 + hierarchy_mode omitted/off
+  -> 原 v1
+retrieval_version=v2 + hierarchy_mode omitted/off
+  -> Phase 2 weighted_rrf_v2@1 plain v2
+retrieval_version=v2 + hierarchy_mode=normalize_v1
+  -> weighted_rrf_v2@1 后执行 hierarchy_normalization_v1@1，再做 final top-k
+```
+
+Phase 3 复用现有 `code_chunks` ID、project/revision/path、`parent_symbol`、kind、inclusive
+span、content hash 和完整 chunk 内容；没有数据库 migration，也没有修改 chunk identity、
+boundary、embedding cache 或 relation graph。resolver 只对 direct candidate 涉及的
+`project + revision + path` 执行带硬上限的查询。纯 hierarchy-derived candidate 不伪造
+dense/lexical/symbol rank、raw score 或 RRF contribution，并继续通过原 EvidenceBuilder、
+CitationValidator 和 RelationValidator。
+
+normalization 的详细 group/member/provenance/selection/suppression/budget trace 保留在内部
+`search_code@1` observation 的 retrieval audit；公共回答 schema 不增加大型 audit 字段。
+受控截断、metadata 不足或 ambiguous hierarchy 通过既有 `warnings[]` 降级，并保留 direct
+Phase 2 candidates。
 
 响应继续保留 M1/M2/M3 字段，并新增：
 
