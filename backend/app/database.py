@@ -619,6 +619,44 @@ class Database:
             ).fetchall()
         return [self._code_chunk_from_row(row) for row in rows]
 
+    def get_code_chunks_by_ids_bounded(
+        self,
+        project_id: str,
+        repository_revision: str,
+        code_chunk_ids: list[int],
+        *,
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        """Resolve exact relation node targets without scanning the chunk index."""
+        if not project_id or not repository_revision:
+            raise ValueError("relation chunk lookup requires project and revision")
+        if not code_chunk_ids:
+            return []
+        if len(code_chunk_ids) > 64:
+            raise ValueError("relation chunk lookup accepts at most 64 identities")
+        if (
+            not isinstance(limit, int)
+            or isinstance(limit, bool)
+            or limit < 1
+            or limit > 65
+        ):
+            raise ValueError("relation chunk row limit must be between 1 and 65")
+        normalized_ids = sorted({int(value) for value in code_chunk_ids})
+        placeholders = ",".join("?" for _ in normalized_ids)
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT * FROM code_chunks
+                WHERE project_id = ?
+                  AND repository_revision = ?
+                  AND id IN ({placeholders})
+                ORDER BY id, path, start_line, end_line, qualified_name
+                LIMIT ?
+                """,
+                [project_id, repository_revision, *normalized_ids, limit],
+            ).fetchall()
+        return [self._code_chunk_from_row(row) for row in rows]
+
     def replace_relation_index(
         self,
         project_id: str,
@@ -824,6 +862,123 @@ class Database:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def get_relation_nodes_bounded(
+        self,
+        project_id: str,
+        repository_revision: str,
+        *,
+        node_ids: list[str] | None = None,
+        code_chunk_ids: list[int] | None = None,
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        """Read exact relation nodes with a mandatory identity filter and LIMIT."""
+        if not project_id or not repository_revision:
+            raise ValueError("bounded relation node lookup requires project and revision")
+        if node_ids is None and code_chunk_ids is None:
+            raise ValueError("bounded relation node lookup requires exact identities")
+        if (
+            not isinstance(limit, int)
+            or isinstance(limit, bool)
+            or limit < 1
+            or limit > 65
+        ):
+            raise ValueError("relation node row limit must be between 1 and 65")
+        conditions = ["project_id = ?", "repository_revision = ?"]
+        params: list[Any] = [project_id, repository_revision]
+        if node_ids is not None:
+            normalized_node_ids = sorted(set(node_ids))
+            if not normalized_node_ids:
+                return []
+            if len(normalized_node_ids) > 64:
+                raise ValueError("relation node lookup accepts at most 64 node IDs")
+            placeholders = ",".join("?" for _ in normalized_node_ids)
+            conditions.append(f"node_id IN ({placeholders})")
+            params.extend(normalized_node_ids)
+        if code_chunk_ids is not None:
+            normalized_chunk_ids = sorted({int(value) for value in code_chunk_ids})
+            if not normalized_chunk_ids:
+                return []
+            if len(normalized_chunk_ids) > 64:
+                raise ValueError("relation node lookup accepts at most 64 chunk IDs")
+            placeholders = ",".join("?" for _ in normalized_chunk_ids)
+            conditions.append(f"code_chunk_id IN ({placeholders})")
+            params.extend(normalized_chunk_ids)
+        params.append(limit)
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT * FROM relation_nodes
+                WHERE {' AND '.join(conditions)}
+                ORDER BY path, start_line, end_line, qualified_name, node_id
+                LIMIT ?
+                """,
+                params,
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_relation_neighbors_bounded(
+        self,
+        project_id: str,
+        repository_revision: str,
+        *,
+        seed_node_ids: list[str],
+        relation_types: list[str],
+        direction: str,
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        """Read one deterministic, scoped batch of one-hop relation edges."""
+        if not project_id or not repository_revision:
+            raise ValueError("relation neighbor lookup requires project and revision")
+        if direction not in {"outgoing", "incoming", "both"}:
+            raise ValueError("invalid bounded relation direction")
+        node_ids = sorted(set(seed_node_ids))
+        types = sorted(set(relation_types))
+        if not node_ids or not types:
+            return []
+        if len(node_ids) > 12:
+            raise ValueError("relation neighbor lookup accepts at most 12 seeds")
+        if not set(types).issubset({"imports", "calls", "references", "defines"}):
+            raise ValueError("unknown relation type")
+        if (
+            not isinstance(limit, int)
+            or isinstance(limit, bool)
+            or limit < 1
+            or limit > 97
+        ):
+            raise ValueError("relation row limit must be between 1 and 97")
+        type_placeholders = ",".join("?" for _ in types)
+        node_placeholders = ",".join("?" for _ in node_ids)
+        params: list[Any] = [project_id, repository_revision, *types]
+        if direction == "outgoing":
+            endpoint_clause = f"source_node_id IN ({node_placeholders})"
+            params.extend(node_ids)
+        elif direction == "incoming":
+            endpoint_clause = f"target_node_id IN ({node_placeholders})"
+            params.extend(node_ids)
+        else:
+            endpoint_clause = (
+                f"(source_node_id IN ({node_placeholders}) "
+                f"OR target_node_id IN ({node_placeholders}))"
+            )
+            params.extend([*node_ids, *node_ids])
+        params.append(limit)
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT * FROM code_relations
+                WHERE project_id = ?
+                  AND repository_revision = ?
+                  AND relation_type IN ({type_placeholders})
+                  AND {endpoint_clause}
+                ORDER BY source_path, source_start_line, relation_type,
+                         raw_target_name, COALESCE(target_path, ''),
+                         COALESCE(target_start_line, 0), edge_id
+                LIMIT ?
+                """,
+                params,
+            ).fetchall()
+        return [dict(row) for row in rows]
+
     def get_relations(
         self,
         project_id: str,
@@ -833,10 +988,13 @@ class Database:
         source_node_ids: list[str] | None = None,
         target_node_ids: list[str] | None = None,
         resolution_statuses: list[str] | None = None,
+        edge_ids: list[str] | None = None,
+        limit: int | None = None,
     ) -> list[dict[str, Any]]:
         conditions = ["project_id = ?", "repository_revision = ?"]
         params: list[Any] = [project_id, repository_revision]
         for column, values in (
+            ("edge_id", edge_ids),
             ("relation_type", relation_types),
             ("source_node_id", source_node_ids),
             ("target_node_id", target_node_ids),
@@ -848,6 +1006,17 @@ class Database:
                 placeholders = ",".join("?" for _ in values)
                 conditions.append(f"{column} IN ({placeholders})")
                 params.extend(values)
+        limit_clause = ""
+        if limit is not None:
+            if (
+                not isinstance(limit, int)
+                or isinstance(limit, bool)
+                or limit < 1
+                or limit > 129
+            ):
+                raise ValueError("relation query limit must be between 1 and 129")
+            limit_clause = "LIMIT ?"
+            params.append(limit)
         with self.connect() as conn:
             rows = conn.execute(
                 f"""
@@ -856,6 +1025,7 @@ class Database:
                 ORDER BY source_path, source_start_line, relation_type,
                          raw_target_name, COALESCE(target_path, ''),
                          COALESCE(target_start_line, 0), edge_id
+                {limit_clause}
                 """,
                 params,
             ).fetchall()

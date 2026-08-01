@@ -62,6 +62,8 @@ class EvidenceChain:
     resolution_status: str
     truncated: bool
     warnings: list[str] = field(default_factory=list)
+    contract_version: str = "m3_agent_relation_v1@1"
+    ordered_directions: list[str] = field(default_factory=list)
 
     def public_summary(self) -> dict[str, Any]:
         return {
@@ -91,6 +93,8 @@ class EvidenceChainStore:
         edges_by_id: dict[str, dict[str, Any]],
         truncated: bool,
         warnings: list[str],
+        contract_version: str = "m3_agent_relation_v1@1",
+        ordered_directions: list[str] | None = None,
     ) -> EvidenceChain:
         chain_id = _chain_id(
             owner_id=owner_id,
@@ -108,6 +112,32 @@ class EvidenceChainStore:
                 if edge_id in edges_by_id
             }
         )
+        directions = list(ordered_directions or [])
+        if not directions:
+            for index, edge_id in enumerate(path.edge_ids):
+                if index >= len(path.node_ids):
+                    break
+                current = path.node_ids[index]
+                next_node = (
+                    path.node_ids[index + 1]
+                    if index + 1 < len(path.node_ids)
+                    else None
+                )
+                edge = edges_by_id.get(edge_id)
+                if edge is None or next_node is None:
+                    directions.append("unknown")
+                elif (
+                    str(edge.get("source_node_id", "")) == current
+                    and str(edge.get("target_node_id", "")) == next_node
+                ):
+                    directions.append("outgoing")
+                elif (
+                    str(edge.get("target_node_id", "")) == current
+                    and str(edge.get("source_node_id", "")) == next_node
+                ):
+                    directions.append("incoming")
+                else:
+                    directions.append("unknown")
         chain = EvidenceChain(
             chain_id=chain_id,
             owner_id=owner_id,
@@ -121,6 +151,8 @@ class EvidenceChainStore:
             resolution_status=path.resolution_status,
             truncated=truncated,
             warnings=list(dict.fromkeys(warnings)),
+            contract_version=contract_version,
+            ordered_directions=directions,
         )
         self._items[chain_id] = chain
         return chain
@@ -339,6 +371,7 @@ class RelationValidator:
         repository_revision: str,
         chains: list[EvidenceChain],
         valid_evidence_ids: set[str],
+        evidence_by_chunk_id: dict[int, str] | None = None,
     ) -> tuple[list[EvidenceChain], list[str]]:
         valid: list[EvidenceChain] = []
         warnings: list[str] = []
@@ -349,6 +382,7 @@ class RelationValidator:
                 project_id,
                 repository_revision,
                 valid_evidence_ids,
+                evidence_by_chunk_id or {},
             )
             if reason is None:
                 valid.append(chain)
@@ -365,6 +399,7 @@ class RelationValidator:
         project_id: str,
         revision: str,
         valid_evidence_ids: set[str],
+        evidence_by_chunk_id: dict[int, str],
     ) -> str | None:
         if chain.owner_id != owner_id:
             return "chain is not owned by this request"
@@ -385,14 +420,24 @@ class RelationValidator:
             return "seed Evidence is invalid"
         if not set(chain.supporting_evidence_ids).issubset(valid_evidence_ids):
             return "supporting Evidence is invalid"
-        nodes = self.database.get_relation_nodes(
-            project_id, revision, node_ids=chain.ordered_node_ids
+        if len(chain.ordered_node_ids) > 64 or len(chain.ordered_edge_ids) > 128:
+            return "chain exceeds validator limits"
+        nodes = self.database.get_relation_nodes_bounded(
+            project_id,
+            revision,
+            node_ids=chain.ordered_node_ids,
+            limit=max(1, len(chain.ordered_node_ids) + 1),
         )
         if {str(item["node_id"]) for item in nodes} != set(chain.ordered_node_ids):
             return "relation node no longer exists"
         if any(str(item["node_id"]) != _expected_node_id(item) for item in nodes):
             return "relation node identity is invalid"
-        edges = self.database.get_relations(project_id, revision)
+        edges = self.database.get_relations(
+            project_id,
+            revision,
+            edge_ids=chain.ordered_edge_ids,
+            limit=max(1, len(chain.ordered_edge_ids) + 1),
+        )
         edges_by_id = {str(item["edge_id"]): item for item in edges}
         if not set(chain.ordered_edge_ids).issubset(edges_by_id):
             return "relation edge no longer exists"
@@ -401,6 +446,11 @@ class RelationValidator:
             for edge_id in chain.ordered_edge_ids
         ):
             return "relation edge identity is invalid"
+        expected_types = sorted(
+            {str(edges_by_id[edge_id]["relation_type"]) for edge_id in chain.ordered_edge_ids}
+        )
+        if chain.relation_types != expected_types:
+            return "relation types do not match persisted edges"
         if len(chain.ordered_node_ids) not in {
             len(chain.ordered_edge_ids),
             len(chain.ordered_edge_ids) + 1,
@@ -418,12 +468,83 @@ class RelationValidator:
                 if index + 1 < len(chain.ordered_node_ids)
                 else None
             )
-            endpoints = {str(edge["source_node_id"]), str(edge["target_node_id"])}
-            if source not in endpoints or (target is not None and target not in endpoints):
-                return "edge ordering does not match nodes"
-        if not self._nodes_match_snapshot(project_id, revision, nodes):
+            direction = (
+                chain.ordered_directions[index]
+                if index < len(chain.ordered_directions)
+                else "unknown"
+            )
+            if target is None:
+                return "invalid chain ordering"
+            if direction == "outgoing":
+                if not (
+                    str(edge["source_node_id"]) == source
+                    and str(edge["target_node_id"]) == target
+                ):
+                    return "outgoing relation direction is invalid"
+            elif direction == "incoming":
+                if not (
+                    str(edge["target_node_id"]) == source
+                    and str(edge["source_node_id"]) == target
+                ):
+                    return "incoming relation direction is invalid"
+            else:
+                endpoints = {str(edge["source_node_id"]), str(edge["target_node_id"])}
+                if source not in endpoints or target not in endpoints:
+                    return "edge ordering does not match nodes"
+        if chain.contract_version == "relation_expansion_v1@1":
+            if len(chain.ordered_edge_ids) != 1 or len(chain.ordered_node_ids) != 2:
+                return "Phase 4 relation chain must contain exactly one hop"
+            if chain.resolution_status != "resolved":
+                return "Phase 4 relation chain must be resolved"
+            nodes_by_id = {str(item["node_id"]): item for item in nodes}
+            seed_node = nodes_by_id.get(chain.ordered_node_ids[0])
+            target_node = nodes_by_id.get(chain.ordered_node_ids[1])
+            if seed_node is None or target_node is None:
+                return "Phase 4 relation endpoints are missing"
+            if seed_node.get("code_chunk_id") is None or target_node.get("code_chunk_id") is None:
+                return "Phase 4 relation endpoints must map to code chunks"
+            seed_evidence = evidence_by_chunk_id.get(int(seed_node["code_chunk_id"]))
+            target_evidence = evidence_by_chunk_id.get(int(target_node["code_chunk_id"]))
+            if seed_evidence not in chain.seed_evidence_ids:
+                return "Phase 4 seed Evidence does not match the relation node"
+            if target_evidence not in chain.supporting_evidence_ids:
+                return "Phase 4 target Evidence does not match the relation node"
+            if not self._chunk_nodes_match_snapshot(project_id, revision, nodes):
+                return "relation node content is stale"
+        elif not self._nodes_match_snapshot(project_id, revision, nodes):
             return "relation node content is stale"
         return None
+
+    def _chunk_nodes_match_snapshot(
+        self,
+        project_id: str,
+        revision: str,
+        nodes: list[dict[str, Any]],
+    ) -> bool:
+        chunk_ids = [int(item["code_chunk_id"]) for item in nodes]
+        chunks = self.database.get_code_chunks_by_ids_bounded(
+            project_id,
+            revision,
+            chunk_ids,
+            limit=min(65, len(chunk_ids) + 1),
+        )
+        chunks_by_id = {int(item["id"]): item for item in chunks}
+        if len(chunks_by_id) != len(set(chunk_ids)):
+            return False
+        return all(
+            int(node["code_chunk_id"]) in chunks_by_id
+            and str(node["path"])
+            == str(chunks_by_id[int(node["code_chunk_id"])]["path"])
+            and str(node["qualified_name"])
+            == str(chunks_by_id[int(node["code_chunk_id"])]["qualified_name"])
+            and int(node["start_line"])
+            == int(chunks_by_id[int(node["code_chunk_id"])]["start_line"])
+            and int(node["end_line"])
+            == int(chunks_by_id[int(node["code_chunk_id"])]["end_line"])
+            and str(node["content_hash"])
+            == str(chunks_by_id[int(node["code_chunk_id"])]["content_hash"])
+            for node in nodes
+        )
 
     def _nodes_match_snapshot(
         self,

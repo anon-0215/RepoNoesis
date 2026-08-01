@@ -32,7 +32,13 @@ from app.services.hierarchy_normalization import (
 from app.services.relation_graph import (
     EvidenceChainStore,
     RelationGraphService,
+    RelationPath,
     RelationTraversalLimits,
+)
+from app.services.relation_retrieval import (
+    RELATION_MODE_EXPAND_V1,
+    RELATION_MODE_OFF,
+    validate_relation_mode,
 )
 from app.services.retrieval_v2 import (
     RETRIEVAL_VERSION_V1,
@@ -110,6 +116,7 @@ class ToolContext:
     learning_context: dict[str, Any] = field(default_factory=dict)
     retrieval_version: str = RETRIEVAL_VERSION_V1
     hierarchy_mode: str = HIERARCHY_MODE_OFF
+    relation_mode: str = RELATION_MODE_OFF
 
     def check_active(self) -> None:
         if self.cancellation.cancelled:
@@ -366,6 +373,7 @@ def build_tool_context(
     learning_context: dict[str, Any] | None = None,
     retrieval_version: str = RETRIEVAL_VERSION_V1,
     hierarchy_mode: str = HIERARCHY_MODE_OFF,
+    relation_mode: str = RELATION_MODE_OFF,
 ) -> ToolContext:
     project = bundle.get("project") or {}
     project_id = str(project.get("id", ""))
@@ -381,6 +389,10 @@ def build_tool_context(
     retrieval_version = validate_retrieval_version(retrieval_version)
     hierarchy_mode = validate_hierarchy_mode(
         hierarchy_mode,
+        retrieval_version=retrieval_version,
+    )
+    relation_mode = validate_relation_mode(
+        relation_mode,
         retrieval_version=retrieval_version,
     )
     return ToolContext(
@@ -400,6 +412,7 @@ def build_tool_context(
         learning_context=dict(learning_context or {}),
         retrieval_version=retrieval_version,
         hierarchy_mode=hierarchy_mode,
+        relation_mode=relation_mode,
     )
 
 
@@ -442,6 +455,7 @@ def _search_code(
         language=values.language,
         symbol=values.symbol,
         hierarchy_mode=context.hierarchy_mode,
+        relation_mode=context.relation_mode,
     )
     project = context.bundle.get("project") or {}
     built = EvidenceBuilder().build(
@@ -456,6 +470,44 @@ def _search_code(
         and item.repository_revision == context.repository_revision
     ]
     added = context.evidence_store.add(context.request_id, built)
+    if context.relation_mode == RELATION_MODE_EXPAND_V1:
+        relation_audit = outcome.audit.get("relation", {})
+        selected_paths = relation_audit.get("selected_relation_paths", [])
+        evidence_by_identity = {
+            item.chunk_identity: item
+            for item in context.evidence_store.all(context.request_id)
+        }
+        for item in selected_paths:
+            if not isinstance(item, dict):
+                continue
+            seed = evidence_by_identity.get(str(item.get("seed_chunk_identity", "")))
+            target = evidence_by_identity.get(str(item.get("target_chunk_identity", "")))
+            if seed is None or target is None:
+                continue
+            edge_id = str(item.get("edge_id", ""))
+            relation_type = str(item.get("relation_type", ""))
+            direction = str(item.get("direction", ""))
+            if not edge_id or not relation_type or direction not in {"incoming", "outgoing"}:
+                continue
+            context.chain_store.add(
+                owner_id=context.request_id,
+                project_id=context.project_id,
+                repository_revision=context.repository_revision,
+                seed_evidence_ids=[seed.evidence_id],
+                supporting_evidence_ids=[target.evidence_id],
+                path=RelationPath(
+                    [str(item["seed_node_id"]), str(item["target_node_id"])],
+                    [edge_id],
+                    "resolved",
+                ),
+                edges_by_id={
+                    edge_id: {"edge_id": edge_id, "relation_type": relation_type}
+                },
+                truncated=bool(relation_audit.get("truncated", False)),
+                warnings=list(relation_audit.get("warnings", [])),
+                contract_version="relation_expansion_v1@1",
+                ordered_directions=[direction],
+            )
     results = [_evidence_summary(item) for item in added]
     payload = {
         "evidence": results,
@@ -622,6 +674,10 @@ def _expand_relations(
 ) -> tuple[Any, list[str], bool]:
     values = ExpandRelationsInput.model_validate(parameters)
     context.check_active()
+    if context.relation_mode == RELATION_MODE_EXPAND_V1:
+        raise ToolError(
+            "retrieval-time relation expansion already owns the request relation budget"
+        )
     index_status = context.database.get_relation_index_status(
         context.project_id, context.repository_revision
     )

@@ -65,6 +65,7 @@ class EvidenceBuilder:
         for index, candidate in enumerate(candidates, start=1):
             source_names = "+".join(candidate.retrieval_sources)
             hierarchy_only = candidate.retrieval_sources == ["hierarchy"]
+            relation_only = candidate.retrieval_sources == ["relation"]
             evidence.append(
                 Evidence(
                     evidence_id=f"E{index}",
@@ -95,8 +96,13 @@ class EvidenceBuilder:
                         "a real stored chunk; no direct retrieval score was assigned."
                         if hierarchy_only
                         else (
-                            f"Selected at fusion rank {candidate.fusion_rank} "
-                            f"from {source_names} retrieval."
+                            "Selected by versioned relation-aware Evidence selection "
+                            "from a real stored chunk; no direct retrieval score was assigned."
+                            if relation_only
+                            else (
+                                f"Selected at fusion rank {candidate.fusion_rank} "
+                                f"from {source_names} retrieval."
+                            )
                         )
                     ),
                     retrieval_strategy_version=retrieval_strategy_version,

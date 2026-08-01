@@ -17,6 +17,11 @@ from app.services.hybrid_retriever import DEFAULT_EVIDENCE_COUNT
 from app.services.hierarchy_normalization import HIERARCHY_MODE_OFF
 from app.services.llm_client import LLMClient
 from app.services.retrieval_v2 import RETRIEVAL_VERSION_V1, retrieve_code
+from app.services.relation_retrieval import (
+    RELATION_MODE_EXPAND_V1,
+    RELATION_MODE_OFF,
+    validate_relation_mode,
+)
 
 
 INSUFFICIENT_ANSWER = "当前源码证据不足，无法可靠回答。"
@@ -49,6 +54,7 @@ def answer_question(
     evidence_count: int = DEFAULT_EVIDENCE_COUNT,
     retrieval_version: str = RETRIEVAL_VERSION_V1,
     hierarchy_mode: str = HIERARCHY_MODE_OFF,
+    relation_mode: str = RELATION_MODE_OFF,
 ) -> dict[str, Any]:
     """Answer from validated code-chunk Evidence.
 
@@ -71,6 +77,17 @@ def answer_question(
 
     project = bundle.get("project") or {}
     project_id = str(project.get("id", ""))
+    relation_mode = validate_relation_mode(
+        relation_mode,
+        retrieval_version=retrieval_version,
+    )
+    relation_warning: str | None = None
+    if relation_mode == RELATION_MODE_EXPAND_V1:
+        relation_mode = RELATION_MODE_OFF
+        relation_warning = (
+            "Relation expansion requires the bounded request Evidence/chain context; "
+            "the frozen base retrieval path was preserved."
+        )
     outcome = retrieve_code(
         database,
         embedding_service,
@@ -82,6 +99,7 @@ def answer_question(
         language=language,
         symbol=symbol,
         hierarchy_mode=hierarchy_mode,
+        relation_mode=relation_mode,
     )
     built = EvidenceBuilder().build(
         outcome.results,
@@ -94,7 +112,7 @@ def answer_question(
         llm,
         database,
         retrieval_mode=outcome.retrieval_mode,
-        warnings=outcome.warnings,
+        warnings=[*outcome.warnings, *([relation_warning] if relation_warning else [])],
     )
 
 

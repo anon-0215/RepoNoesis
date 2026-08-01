@@ -32,19 +32,25 @@ v6 保留 v5 的全部 M1/M2/M3 表和数据，新增 `learner_profiles`、`lear
 M1 filter `path`、`language`、`symbol`、`evidence_count` 仍是可选字段。Retrieval v2 Phase 2
 新增可选 `retrieval_version`，只接受精确的 `v1` 或 `v2`；省略时默认 `v1`。Retrieval v2
 Phase 3 新增可选 `hierarchy_mode`，只接受精确的 `off` 或 `normalize_v1`，省略时默认
-`off`。未知值、空白、大小写变体和 `retrieval_version=v1 + hierarchy_mode=normalize_v1`
-均由请求校验明确拒绝。两个值由服务器绑定到单次 Agent/tool context，Planner 不能改写；
+`off`。Phase 4 新增可选 `relation_mode`，只接受精确的 `off` 或 `expand_v1`，省略时默认
+`off`。未知值、空白、大小写变体、`retrieval_version=v1 + hierarchy_mode=normalize_v1`
+和 `retrieval_version=v1 + relation_mode=expand_v1` 均由请求校验明确拒绝。三个值由服务器
+绑定到单次 Agent/tool context，Planner 不能改写；
 不接受 learner、project、repository、revision、hierarchy/图预算或学习预算。
 
-三条兼容路径为：
+五条兼容路径为：
 
 ```text
 retrieval_version omitted/v1 + hierarchy_mode omitted/off
   -> 原 v1
-retrieval_version=v2 + hierarchy_mode omitted/off
+retrieval_version=v2 + hierarchy_mode omitted/off + relation_mode omitted/off
   -> Phase 2 weighted_rrf_v2@1 plain v2
-retrieval_version=v2 + hierarchy_mode=normalize_v1
+retrieval_version=v2 + hierarchy_mode=normalize_v1 + relation_mode=off
   -> weighted_rrf_v2@1 后执行 hierarchy_normalization_v1@1，再做 final top-k
+retrieval_version=v2 + hierarchy_mode=off + relation_mode=expand_v1
+  -> weighted_rrf_v2@1 后执行一跳 relation expansion/selection
+retrieval_version=v2 + hierarchy_mode=normalize_v1 + relation_mode=expand_v1
+  -> hierarchy_normalization_v1@1 后执行一跳 relation expansion/selection
 ```
 
 Phase 3 复用现有 `code_chunks` ID、project/revision/path、`parent_symbol`、kind、inclusive
@@ -58,6 +64,28 @@ normalization 的详细 group/member/provenance/selection/suppression/budget tra
 `search_code@1` observation 的 retrieval audit；公共回答 schema 不增加大型 audit 字段。
 受控截断、metadata 不足或 ambiguous hierarchy 通过既有 `warnings[]` 降级，并保留 direct
 Phase 2 candidates。
+
+Phase 4 使用 `relation_expansion_v1@1`、`relation_selection_v1@1`、
+`relation_whitelist_v1@1` 和 `relation_priority_v1@1`。whitelist 仅包含 M3 真实持久化的
+`imports/calls/references/defines`；incoming view 仍引用同一真实 edge，不交换或伪造
+source/target。所有查询绑定 `project_id + repository_revision` 并带硬 LIMIT；默认预算为
+12 seeds、8 edges/seed、96 total rows、24 unique targets、depth 1、8 paths/target 和 16
+warnings。relation target 只有通过 `code_chunk_id + path/span/hash/qualified name` 唯一映射
+到当前 revision 的完整 chunk 才能进入 Evidence。external、unresolved、ambiguous、stale、
+scope conflict 和受控不可用都保留 base candidates，并通过内部 audit 与 `warnings[]` 区分。
+
+relation priority 与 RRF/hierarchy priority 分层；relation-only Evidence 的公共
+`fusion_score=0.0/fusion_rank=0` 仍只是既有 schema 的兼容占位，不作为排序信号。
+selection 保证 direct Evidence 下限、relation slot 上限、每 seed/family 占用上限和 direct
+backfill，并以稳定 identity 完成 tie-break。选中路径在 EvidenceStore 分配 ID 后写入请求级
+EvidenceChainStore，CitationValidator 和 RelationValidator 在生成前后验证真实 chunk、edge、
+type、direction、scope 与 Evidence 绑定。详细 expansion/selection trace 只存在于内部
+`search_code@1` retrieval audit，不扩大公共 response schema。
+
+本阶段没有数据库 migration、公共 Evidence schema 变化、chunk identity/boundary 变化、
+embedding/cache/index 变化或 relation graph 重建。测试使用内存数据库、fake provider 和
+`EMBEDDING_ENABLED=false`；这些测试只证明契约、版本隔离、有界性、provenance、selection、
+validator 与兼容性，不代表真实 BGE-M3、Click Hit@K/MRR 或真实仓库质量提升。
 
 响应继续保留 M1/M2/M3 字段，并新增：
 

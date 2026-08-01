@@ -65,6 +65,26 @@ resolver 查询、深度、derived candidate、family occupancy 和最终结果�
 metadata 冲突时保留 direct candidates 并记录 warning。最终选中的每个成员仍是 SQLite 中的
 真实完整 chunk，继续进入原 Citation/Relation/Evidence 边界。
 
+Retrieval v2 Phase 4 在上述冻结输出之后增加独立的请求级 `relation_mode`。默认值 `off`
+完全不调用新 expander；只有 `retrieval_version=v2 + relation_mode=expand_v1` 才执行
+`relation_expansion_v1@1` 和 `relation_selection_v1@1`。它只读取 M3 已持久化的
+`imports/calls/references/defines` edge，不从同名 symbol、文本、embedding、LLM 或 hierarchy
+猜测关系。查询同时绑定 project/revision、edge type、seed node、确定排序和显式 LIMIT；v1
+固定为一跳，默认最多 12 seeds、每 seed 8 edges、总计 96 rows、24 unique targets、每 target
+8 paths、16 warnings。node 必须通过权威 `code_chunk_id` 和 path/span/hash/qualified name
+唯一映射到真实完整 chunk；external、unresolved、ambiguous、stale 或 scope conflict 只进入
+内部 audit/warning，不进入 Evidence。
+
+relation path priority 使用独立的 `relation_priority_v1@1`：
+`1 / (1 + seed_selection_rank) * relation_type_weight * depth_decay`，不覆盖 raw score、source
+rank、RRF contribution、fused score 或 Phase 3 group priority。`relation_selection_v1@1` 在
+`top_k >= 3` 时最多分配 3 个且不超过 30% 的 relation slots，并限制每 seed 1 个、每 relation
+family 2 个；relation 不足时按冻结顺序回填 direct candidates。direct、hierarchy、relation
+provenance 分离，多 seed/edge/path 命中同一 target 时按原 chunk identity 去重但保留有界路径。
+选中 relation chunk 仍经 EvidenceBuilder、CitationValidator 和带准确 direction 的
+RelationValidator 前后复验。大型 expansion/selection trace 只保留在内部 retrieval audit，
+不注入回答正文。
+
 ### 5. Agent Core
 
 M2 已实现请求级单 Agent 有限状态机：
@@ -88,6 +108,11 @@ M3 把新 edge/node/path/chain/Evidence 纳入进展判断和规范化 fingerpri
 前后都验证 relation chain；关系在生成期间变化时丢弃关系依赖文本。无关系索引时
 保持 M2 retrieval-only，不让 `/ask` 整体失败。
 
+Phase 4 的 `relation_mode` 同样进入请求级 ToolContext 与工具指纹，Planner 和 tool arguments
+都不能设置或覆盖。显式 `expand_v1` 请求由 `search_code@1` 的 retrieval-time expander 持有
+唯一的一套 relation budget；该请求内再次调用 M3 `expand_relations@1` 会被拒绝以避免重复
+扩展。`relation_mode=off` 时 M3 tool 的 schema 和行为保持不变。
+
 ### 6. Static Relation Layer
 
 `relation_analysis.py` 从 SQLite snapshot 的 Python AST 抽取 imports、calls、
@@ -99,6 +124,11 @@ schema v5 的 `relation_nodes`、`code_relations`、`relation_index_runs` 全部
 project/repository revision；node/edge ID 包含内容或 revision 身份。默认 depth 1、
 最大 2，且有 seed、neighbor、node、edge、path、Evidence 和字节硬上限。该层不
 宣称恢复运行时调用图。
+
+Phase 4 不重建或改写上述 graph。它把原 edge 的 source→target 定义为 outgoing view，把同一
+edge 的 target→source 定义为 incoming view；inverse view 不创建第二条 edge identity。
+relation-derived Evidence chain 固定一跳，并额外校验 seed/target Evidence 与对应 chunk node、
+原 edge type、方向、project/revision 和内容身份。
 
 ### 7. Learning State
 

@@ -17,6 +17,13 @@ from app.services.hierarchy_normalization import (
 from app.services.hybrid_retriever import HybridRetriever, HybridSearchResult
 from app.services.lexical_retriever import LexicalRetriever, LexicalSearchResult
 from app.services.query_analyzer import QueryAnalysis, QueryAnalyzer
+from app.services.relation_retrieval import (
+    RELATION_MODE_EXPAND_V1,
+    RELATION_MODE_OFF,
+    RelationRetrievalExpander,
+    select_relation_aware_candidates,
+    validate_relation_mode,
+)
 from app.services.semantic_retriever import SemanticRetriever, SemanticSearchResult
 from app.services.symbol_retriever import SymbolRetriever, SymbolSearchResult
 
@@ -297,11 +304,16 @@ class RetrievalV2Orchestrator:
         language: str | None = None,
         symbol: str | None = None,
         hierarchy_mode: str = HIERARCHY_MODE_OFF,
+        relation_mode: str = RELATION_MODE_OFF,
     ) -> RetrievalExecutionOutcome:
         if not str(query).strip():
             raise ValueError("retrieval query must not be empty")
         hierarchy_mode = validate_hierarchy_mode(
             hierarchy_mode,
+            retrieval_version=RETRIEVAL_VERSION_V2,
+        )
+        relation_mode = validate_relation_mode(
+            relation_mode,
             retrieval_version=RETRIEVAL_VERSION_V2,
         )
         analysis = self.query_analyzer.analyze(query)
@@ -447,12 +459,55 @@ class RetrievalV2Orchestrator:
         }
         if hierarchy_audit is not None:
             audit["hierarchy"] = hierarchy_audit
+        base_results = (
+            normalized_results
+            if normalized_results is not None
+            else [item.to_hybrid_result() for item in selected]
+        )
+        final_results = base_results
+        if relation_mode == RELATION_MODE_EXPAND_V1:
+            try:
+                expansion = RelationRetrievalExpander(self.database).expand(
+                    project_id=project_id,
+                    repository_revision=_project_revision(self.database, project_id) or "",
+                    base_candidates=base_results,
+                    hierarchy_mode=hierarchy_mode,
+                    hierarchy_audit=hierarchy_audit,
+                )
+                selection = select_relation_aware_candidates(
+                    base_results,
+                    expansion.candidates,
+                    top_k=limit,
+                    base_order={
+                        _exact_chunk_identity(item): rank
+                        for rank, item in enumerate(base_results, start=1)
+                    },
+                )
+                final_results = selection.results
+                warnings.extend(expansion.warnings)
+                warnings.extend(selection.warnings)
+                audit["relation"] = {
+                    **expansion.audit,
+                    "selection": selection.audit,
+                    "selected_relation_paths": [
+                        item
+                        for item in selection.audit["selected_relation_paths"]
+                    ],
+                }
+            except Exception as exc:
+                warning = (
+                    "Relation expansion failed safely; the frozen base retrieval "
+                    f"candidates were preserved: {type(exc).__name__}."
+                )
+                warnings.append(warning)
+                audit["relation"] = {
+                    "relation_mode": relation_mode,
+                    "controlled_unavailable": False,
+                    "unexpected_error": type(exc).__name__,
+                    "warnings": [warning],
+                }
         return RetrievalExecutionOutcome(
-            results=(
-                normalized_results
-                if normalized_results is not None
-                else [item.to_hybrid_result() for item in selected]
-            ),
+            results=final_results,
             retrieval_mode=(
                 "hybrid"
                 if any("dense" in item.source_records for item in selected)
@@ -519,10 +574,15 @@ def retrieve_code(
     language: str | None = None,
     symbol: str | None = None,
     hierarchy_mode: str = HIERARCHY_MODE_OFF,
+    relation_mode: str = RELATION_MODE_OFF,
 ) -> RetrievalExecutionOutcome:
     version = validate_retrieval_version(retrieval_version)
     hierarchy_mode = validate_hierarchy_mode(
         hierarchy_mode,
+        retrieval_version=version,
+    )
+    relation_mode = validate_relation_mode(
+        relation_mode,
         retrieval_version=version,
     )
     if version == RETRIEVAL_VERSION_V1:
@@ -549,6 +609,7 @@ def retrieve_code(
         language=language,
         symbol=symbol,
         hierarchy_mode=hierarchy_mode,
+        relation_mode=relation_mode,
     )
 
 

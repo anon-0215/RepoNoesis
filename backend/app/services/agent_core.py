@@ -45,6 +45,11 @@ from app.services.relation_graph import (
     EvidenceChain,
     RelationValidator,
 )
+from app.services.relation_retrieval import (
+    RELATION_MODE_EXPAND_V1,
+    RELATION_MODE_OFF,
+    validate_relation_mode,
+)
 from app.services.retrieval_v2 import (
     RETRIEVAL_VERSION_V1,
     validate_retrieval_version,
@@ -207,10 +212,15 @@ def run_bounded_agent(
     learning_context: dict[str, Any] | None = None,
     retrieval_version: str = RETRIEVAL_VERSION_V1,
     hierarchy_mode: str = HIERARCHY_MODE_OFF,
+    relation_mode: str = RELATION_MODE_OFF,
 ) -> dict[str, Any]:
     retrieval_version = validate_retrieval_version(retrieval_version)
     hierarchy_mode = validate_hierarchy_mode(
         hierarchy_mode,
+        retrieval_version=retrieval_version,
+    )
+    relation_mode = validate_relation_mode(
+        relation_mode,
         retrieval_version=retrieval_version,
     )
     limits = limits or AgentLimits()
@@ -232,6 +242,7 @@ def run_bounded_agent(
             learning_context=learning_context,
             retrieval_version=retrieval_version,
             hierarchy_mode=hierarchy_mode,
+            relation_mode=relation_mode,
         )
     except ValueError as exc:
         result = answer_question(
@@ -246,6 +257,7 @@ def run_bounded_agent(
             evidence_count=evidence_count,
             retrieval_version=retrieval_version,
             hierarchy_mode=hierarchy_mode,
+            relation_mode=relation_mode,
         )
         result["warnings"] = [
             *result["warnings"],
@@ -843,6 +855,7 @@ def _fingerprint(
             "repository_revision": context.repository_revision,
             "retrieval_version": context.retrieval_version,
             "hierarchy_mode": context.hierarchy_mode,
+            "relation_mode": context.relation_mode,
         },
         ensure_ascii=False,
         sort_keys=True,
@@ -973,6 +986,9 @@ def _validated_relation_context(
         repository_revision=state.context.repository_revision,
         chains=state.context.chain_store.all(state.request_id),
         valid_evidence_ids=valid_ids,
+        evidence_by_chunk_id={
+            item.code_chunk_id: item.evidence_id for item in valid_evidence
+        },
     )
     all_relation_ids = state.context.chain_store.supporting_ids(state.request_id)
     valid_relation_ids = {
@@ -996,6 +1012,32 @@ def _attach_relation_fields(
 ) -> dict[str, Any]:
     summaries = [chain.public_summary() for chain in chains]
     relation_summary = dict(state.relation_summary)
+    if chains:
+        relation_summary["seed_count"] = max(
+            int(relation_summary.get("seed_count", 0)),
+            len(
+                {
+                    evidence_id
+                    for chain in chains
+                    for evidence_id in chain.seed_evidence_ids
+                }
+            ),
+        )
+        relation_summary["resolved_edge_count"] = max(
+            int(relation_summary.get("resolved_edge_count", 0)),
+            len(
+                {
+                    edge_id
+                    for chain in chains
+                    for edge_id in chain.ordered_edge_ids
+                    if chain.resolution_status == "resolved"
+                }
+            ),
+        )
+        relation_summary["truncated"] = bool(
+            relation_summary.get("truncated", False)
+            or any(chain.truncated for chain in chains)
+        )
     relation_summary["validated_chain_count"] = len(chains)
     relation_summary["warnings"] = list(
         dict.fromkeys(
@@ -1007,6 +1049,7 @@ def _attach_relation_fields(
                     if "relation" in warning.casefold()
                     or "chain" in warning.casefold()
                 ],
+                *[warning for chain in chains for warning in chain.warnings],
             ]
         )
     )
@@ -1045,16 +1088,22 @@ def _relation_answer_context(
         for item in state.context.database.get_relations(
             state.context.project_id,
             state.context.repository_revision,
+            edge_ids=sorted(edge_ids),
+            limit=max(1, len(edge_ids) + 1),
         )
-        if str(item["edge_id"]) in edge_ids
     }
     evidence_by_chunk = {
         item.code_chunk_id: item.evidence_id
         for item in state.context.evidence_store.all(state.request_id)
     }
-    node_rows = state.context.database.get_relation_nodes(
+    node_ids = sorted(
+        {node_id for chain in chains for node_id in chain.ordered_node_ids}
+    )
+    node_rows = state.context.database.get_relation_nodes_bounded(
         state.context.project_id,
         state.context.repository_revision,
+        node_ids=node_ids,
+        limit=max(1, len(node_ids) + 1),
     )
     nodes = {str(item["node_id"]): item for item in node_rows}
     summaries: dict[str, dict[str, Any]] = {}
@@ -1200,6 +1249,23 @@ def _run_deterministic_fallback(
         warnings.append(
             "Accumulated Evidence context was truncated at the server byte limit."
         )
+    relation_state: AgentState | None = None
+    valid_chains: list[EvidenceChain] = []
+    if context.relation_mode == RELATION_MODE_EXPAND_V1:
+        relation_state = AgentState(
+            request_id=context.request_id,
+            user_goal=question,
+            context=context,
+            limits=limits,
+            started_monotonic=started,
+            steps=steps,
+            tool_call_count=tool_calls,
+            planner_token_usage=planner_tokens,
+        )
+        evidence, valid_chains, relation_warnings = _validated_relation_context(
+            relation_state, evidence
+        )
+        warnings.extend(relation_warnings)
     final_llm = (
         llm
         if llm
@@ -1221,7 +1287,39 @@ def _run_deterministic_fallback(
             context.deadline_monotonic - time.monotonic(),
         ),
         learning_context=context.learning_context,
+        relation_context=(
+            _relation_answer_context(relation_state, valid_chains)
+            if relation_state is not None
+            else None
+        ),
     )
+    if relation_state is not None:
+        post_evidence, post_chains, relation_warnings = _validated_relation_context(
+            relation_state,
+            context.evidence_store.all(context.request_id),
+        )
+        warnings.extend(relation_warnings)
+        if {item.chain_id for item in post_chains} != {
+            item.chain_id for item in valid_chains
+        }:
+            result = answer_from_evidence(
+                question,
+                post_evidence,
+                None,
+                database,
+                retrieval_mode=retrieval_mode,
+                warnings=warnings,
+                max_answer_tokens=limits.max_final_answer_tokens,
+                answer_timeout_seconds=max(
+                    0.1,
+                    context.deadline_monotonic - time.monotonic(),
+                ),
+                relation_context=_relation_answer_context(
+                    relation_state, post_chains
+                ),
+                learning_context=context.learning_context,
+            )
+        valid_chains = post_chains
     if context.cancellation.cancelled:
         status = "cancelled"
     elif (
@@ -1242,6 +1340,8 @@ def _run_deterministic_fallback(
         planner_usage_mode="estimated",
         limits=limits,
     )
+    if relation_state is not None:
+        response = _attach_relation_fields(response, relation_state, valid_chains)
     response = _attach_learning_fields(response, context.learning_context)
     logger.info(
         "agent_run_completed",

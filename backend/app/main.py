@@ -35,6 +35,7 @@ from app.services.learning_service import LearningError, LearningService
 from app.services.llm_client import LLMClient
 from app.services.report import generate_report
 from app.services.relation_analysis import index_project_relations
+from app.services.relation_retrieval import validate_relation_mode
 
 
 load_environment()
@@ -67,11 +68,16 @@ class AskRequest(BaseModel):
     evidence_count: int = Field(default=5, ge=1, le=8)
     retrieval_version: Literal["v1", "v2"] = "v1"
     hierarchy_mode: Literal["off", "normalize_v1"] = "off"
+    relation_mode: Literal["off", "expand_v1"] = "off"
 
     @model_validator(mode="after")
     def validate_retrieval_hierarchy_pair(self) -> "AskRequest":
         validate_hierarchy_mode(
             self.hierarchy_mode,
+            retrieval_version=self.retrieval_version,
+        )
+        validate_relation_mode(
+            self.relation_mode,
             retrieval_version=self.retrieval_version,
         )
         return self
@@ -316,6 +322,7 @@ def ask_project(project_id: str, request: AskRequest) -> dict[str, Any]:
         learning_context=learning_context,
         retrieval_version=request.retrieval_version,
         hierarchy_mode=request.hierarchy_mode,
+        relation_mode=request.relation_mode,
     )
     db.save_chat_answer(project_id, request.question, result["answer"], result["citations"])
     return result
