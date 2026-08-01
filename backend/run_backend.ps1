@@ -1,17 +1,11 @@
 $ErrorActionPreference = "Stop"
 Set-Location $PSScriptRoot
 
-$CondaPython = "D:\Programme\Anaconda\envs\gitlearnagent\python.exe"
-
-if (Test-Path $CondaPython) {
-  $Python = $CondaPython
+$Python = if (Test-Path ".\.venv\Scripts\python.exe") {
+  ".\.venv\Scripts\python.exe"
 } else {
-  if (-not (Test-Path ".\.venv\Scripts\python.exe")) {
-    python -m venv .venv
-  }
-  $Python = ".\.venv\Scripts\python.exe"
-  & $Python -m pip install -r requirements.txt
+  (Get-Command python -ErrorAction Stop).Source
 }
 
 $env:PYTHONUTF8 = "1"
-& $Python -m uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
+& $Python -m app.run_server

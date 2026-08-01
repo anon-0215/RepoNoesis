@@ -11,6 +11,8 @@ from app.config import (
     get_agent_limits,
     get_embedding_settings,
     get_env_value,
+    get_product_config_status,
+    get_repository_settings,
     load_environment,
 )
 from app.database import Database, SCHEMA_VERSION
@@ -32,7 +34,8 @@ from app.services.learning_contracts import (
     SubmitAttemptRequest,
 )
 from app.services.learning_service import LearningError, LearningService
-from app.services.llm_client import LLMClient
+from app.services.llm_client import LLMClient, ProviderError
+from app.services.repository_import import RepositoryImportError, import_repository
 from app.services.report import generate_report
 from app.services.relation_analysis import index_project_relations
 from app.services.relation_retrieval import validate_relation_mode
@@ -54,10 +57,23 @@ llm = LLMClient()
 learning_service = LearningService(db, llm)
 embedding_service = EmbeddingService(get_embedding_settings())
 agent_limits = get_agent_limits()
+repository_settings = get_repository_settings()
 
 
 class AnalyzeRequest(BaseModel):
-    repo_url: str = Field(..., examples=["https://github.com/tiangolo/fastapi"])
+    repo_url: str | None = Field(default=None, examples=["https://github.com/tiangolo/fastapi"])
+    source_type: Literal["local", "git_url"] | None = None
+    source: str | None = None
+
+    @model_validator(mode="after")
+    def validate_source(self) -> "AnalyzeRequest":
+        product_source = self.source_type is not None or self.source is not None
+        if product_source:
+            if self.repo_url is not None or self.source_type is None or not (self.source or "").strip():
+                raise ValueError("Provide source_type and source for product imports, without repo_url.")
+        elif not (self.repo_url or "").strip():
+            raise ValueError("A repository source is required.")
+        return self
 
 
 class AskRequest(BaseModel):
@@ -87,6 +103,9 @@ class CitationResponse(BaseModel):
     path: str
     summary: str
     snippet: str
+    qualified_name: str = ""
+    start_line: int = 0
+    end_line: int = 0
 
 
 class EvidenceResponse(BaseModel):
@@ -159,6 +178,7 @@ class AskResponse(BaseModel):
     learning_plan_summary: dict[str, Any]
     recommended_next_action: dict[str, Any] | None
     learning_warnings: list[str]
+    answer_mode: Literal["llm_grounded", "deterministic"]
 
 
 class LearningResponse(BaseModel):
@@ -185,17 +205,54 @@ def health() -> dict[str, Any]:
         "embedding_device": embedding_identity.device,
         "database": str(Path(db.path)),
         "database_schema_version": SCHEMA_VERSION,
+        "configuration": get_product_config_status(),
     }
+
+
+@app.get("/api/config/status")
+def configuration_status() -> dict[str, Any]:
+    return get_product_config_status()
 
 
 @app.post("/api/projects/analyze")
 def analyze_project(request: AnalyzeRequest) -> dict[str, Any]:
-    try:
-        snapshot = fetch_repository(request.repo_url)
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-    project_id = db.create_project(snapshot.to_dict())
+    product_import = request.source_type is not None
+    if product_import:
+        embedding_status = get_product_config_status()["embedding"]
+        if not embedding_status["ready"]:
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "code": "embedding_not_configured",
+                    "message": "Configure the local BGE-M3 provider in the backend .env and restart the backend.",
+                    "retryable": False,
+                },
+            )
+        try:
+            imported = import_repository(
+                request.source_type or "", request.source or "", repository_settings
+            )
+            snapshot = imported.snapshot
+        except RepositoryImportError as exc:
+            raise HTTPException(status_code=exc.status_code, detail=exc.to_safe_dict()) from exc
+        existing = db.get_project_by_source_identity(imported.source_identity)
+        if existing and existing["status"] in {"done", "analyzing"}:
+            return {
+                "project_id": existing["id"],
+                "status": existing["status"],
+                "import_action": "reused",
+            }
+        if existing:
+            project_id = existing["id"]
+            db.begin_reanalysis(project_id)
+        else:
+            project_id = db.create_project(snapshot.to_dict())
+    else:
+        try:
+            snapshot = fetch_repository(request.repo_url or "")
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        project_id = db.create_project(snapshot.to_dict())
     embedding_index: dict[str, Any] | None = None
     relation_index: dict[str, Any] | None = None
     try:
@@ -213,7 +270,11 @@ def analyze_project(request: AnalyzeRequest) -> dict[str, Any]:
             "repo": snapshot.repo,
             "repo_url": snapshot.repo_url,
         }
-        learning_steps = build_learning_path(project, analysis, llm)
+        # Product imports are deterministic until the user explicitly asks a
+        # question; importing/indexing a repository must never incur LLM cost.
+        learning_steps = build_learning_path(
+            project, analysis, None if product_import else llm
+        )
         enriched_files = [file.to_dict() for file in snapshot.files]
         enriched_by_path = {file["path"]: file for file in enriched_files}
         for public_file in analysis["files"]:
@@ -252,15 +313,31 @@ def analyze_project(request: AnalyzeRequest) -> dict[str, Any]:
                     project_id
                 ).to_dict()
             except Exception as exc:
+                if product_import:
+                    raise HTTPException(
+                        status_code=503,
+                        detail={
+                            "code": "embedding_unavailable",
+                            "message": "Local BGE-M3 indexing failed in offline mode. Verify the configured model path, device, and installed backend dependencies.",
+                            "retryable": False,
+                        },
+                    ) from exc
                 embedding_index = {
                     "status": "warning",
                     "warnings": [f"Embedding indexing failed after analysis was saved: {exc}"],
                 }
+    except HTTPException:
+        db.mark_failed(project_id, "Product analysis failed; see the API diagnostic.")
+        raise
     except Exception as exc:
         db.mark_failed(project_id, str(exc))
         raise HTTPException(status_code=500, detail=f"分析失败：{exc}") from exc
 
-    response: dict[str, Any] = {"project_id": project_id, "status": "done"}
+    response: dict[str, Any] = {
+        "project_id": project_id,
+        "status": "done",
+        "import_action": "analyzed" if product_import else "legacy_analyzed",
+    }
     if embedding_index is not None:
         response["embedding_index"] = embedding_index
     if relation_index is not None:
@@ -307,23 +384,44 @@ def get_learning_path(project_id: str) -> dict[str, Any]:
 @app.post("/api/projects/{project_id}/ask", response_model=AskResponse)
 def ask_project(project_id: str, request: AskRequest) -> dict[str, Any]:
     bundle = _bundle_or_404(project_id)
+    product_project = bundle["project"].get("source_type") in {"local", "git_url"}
+    if product_project:
+        try:
+            llm.require_available()
+        except ProviderError as exc:
+            raise HTTPException(status_code=exc.status_code, detail=exc.to_safe_dict()) from exc
     learning_context = learning_service.get_learning_context(project_id)
-    result = run_bounded_agent(
-        request.question,
-        bundle,
-        llm,
-        db,
-        embedding_service,
-        path=request.path,
-        language=request.language,
-        symbol=request.symbol,
-        evidence_count=request.evidence_count,
-        limits=agent_limits,
-        learning_context=learning_context,
-        retrieval_version=request.retrieval_version,
-        hierarchy_mode=request.hierarchy_mode,
-        relation_mode=request.relation_mode,
-    )
+    try:
+        result = run_bounded_agent(
+            request.question,
+            bundle,
+            llm,
+            db,
+            embedding_service,
+            path=request.path,
+            language=request.language,
+            symbol=request.symbol,
+            evidence_count=request.evidence_count,
+            limits=agent_limits,
+            learning_context=learning_context,
+            retrieval_version=request.retrieval_version,
+            hierarchy_mode=request.hierarchy_mode,
+            relation_mode=request.relation_mode,
+        )
+    except ProviderError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.to_safe_dict()) from exc
+    if product_project and (
+        result.get("answer_mode") != "llm_grounded"
+        or result.get("agent_mode") != "bounded"
+    ):
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "code": "provider_grounding_failed",
+                "message": "The provider response did not pass the source-evidence citation constraints. No fallback answer was presented as a model answer.",
+                "retryable": False,
+            },
+        )
     db.save_chat_answer(project_id, request.question, result["answer"], result["citations"])
     return result
 

@@ -269,7 +269,7 @@ class DatabaseEmbeddingTests(unittest.TestCase):
             self.assertIn("embedding_config_hash", columns)
             self.assertIn("wrapper_model_identity", columns)
             self.assertIn("resolved_revision", columns)
-            self.assertEqual(version, 7)
+            self.assertEqual(version, 8)
             self.assertEqual(legacy["identity_schema_version"], "legacy")
             self.assertEqual(legacy["identity_eligible"], 0)
 

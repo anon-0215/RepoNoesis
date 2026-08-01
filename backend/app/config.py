@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 import os
 from pathlib import Path
+from typing import Any
+from urllib.parse import urlsplit
 
 from app.services.agent_contracts import AgentLimits
 
@@ -19,17 +21,16 @@ def load_environment() -> None:
     Existing process environment values win over .env values, so users can still
     override settings from the command line when they want to.
     """
-    for env_path in (PROJECT_ROOT / ".env", BACKEND_ROOT / ".env"):
-        if env_path.exists():
-            _load_env_file(env_path)
+    env_path = PROJECT_ROOT / ".env"
+    if env_path.exists():
+        _load_env_file(env_path)
 
 
 def get_env_value(key: str, default: str = "") -> str:
     if key in os.environ:
         return os.environ[key]
-    for env_path in (BACKEND_ROOT / ".env", PROJECT_ROOT / ".env"):
-        if not env_path.exists():
-            continue
+    env_path = PROJECT_ROOT / ".env"
+    if env_path.exists():
         values = _read_env_file(env_path)
         if key in values:
             return values[key]
@@ -48,14 +49,56 @@ class EmbeddingSettings:
     query_prefix: str
     document_prefix: str
     model_revision: str = ""
+    provider: str = "local_bge_m3"
+    offline: bool = True
+
+
+@dataclass(frozen=True)
+class LLMSettings:
+    provider: str
+    base_url: str
+    api_key: str
+    model: str
+    timeout_seconds: float = 45.0
+    max_tokens: int = 1600
+    temperature: float = 0.2
+    max_retries: int = 2
+
+    @property
+    def missing(self) -> tuple[str, ...]:
+        missing: list[str] = []
+        if self.provider != "openai_compatible":
+            missing.append("LLM_PROVIDER")
+        if not _valid_provider_base_url(self.base_url):
+            missing.append("LLM_BASE_URL")
+        if not self.api_key:
+            missing.append("LLM_API_KEY")
+        if not self.model:
+            missing.append("LLM_MODEL")
+        return tuple(missing)
+
+    @property
+    def configured(self) -> bool:
+        return not self.missing
+
+
+@dataclass(frozen=True)
+class RepositorySettings:
+    runtime_dir: Path
+    clone_timeout_seconds: float = 120.0
+    max_files: int = 2000
+    max_file_bytes: int = 1_000_000
+    max_total_bytes: int = 50_000_000
 
 
 def get_embedding_settings() -> EmbeddingSettings:
     cache_dir = _env_path("EMBEDDING_CACHE_DIR", PROJECT_ROOT / "embedding_cache")
+    model = get_env_value("EMBEDDING_MODEL", "").strip()
+    if not model:
+        model = get_env_value("EMBEDDING_MODEL_NAME_OR_PATH", "BAAI/bge-m3").strip()
     return EmbeddingSettings(
         enabled=_env_bool("EMBEDDING_ENABLED", False),
-        model_name_or_path=get_env_value("EMBEDDING_MODEL_NAME_OR_PATH", "BAAI/bge-m3").strip()
-        or "BAAI/bge-m3",
+        model_name_or_path=model or "BAAI/bge-m3",
         device=(get_env_value("EMBEDDING_DEVICE", "auto").strip() or "auto").lower(),
         batch_size=max(1, _env_int("EMBEDDING_BATCH_SIZE", 8)),
         max_length=clamp_embedding_max_length(_env_int("EMBEDDING_MAX_LENGTH", 8192)),
@@ -64,7 +107,85 @@ def get_embedding_settings() -> EmbeddingSettings:
         query_prefix=get_env_value("EMBEDDING_QUERY_PREFIX", ""),
         document_prefix=get_env_value("EMBEDDING_DOCUMENT_PREFIX", ""),
         model_revision=get_env_value("EMBEDDING_MODEL_REVISION", "").strip(),
+        provider=(get_env_value("EMBEDDING_PROVIDER", "local_bge_m3").strip() or "local_bge_m3"),
+        offline=_env_bool("EMBEDDING_OFFLINE", True),
     )
+
+
+def get_llm_settings() -> LLMSettings:
+    return LLMSettings(
+        provider=get_env_value("LLM_PROVIDER", "").strip(),
+        base_url=get_env_value("LLM_BASE_URL", "").strip().rstrip("/"),
+        api_key=get_env_value("LLM_API_KEY", ""),
+        model=get_env_value("LLM_MODEL", "").strip(),
+        timeout_seconds=_bounded_env_float("LLM_TIMEOUT_SECONDS", 45.0, 1.0, 300.0),
+        max_tokens=_bounded_env_int("LLM_MAX_TOKENS", 1600, 1, 32768),
+        temperature=_bounded_env_float("LLM_TEMPERATURE", 0.2, 0.0, 2.0),
+        max_retries=_bounded_env_int("LLM_MAX_RETRIES", 2, 0, 4),
+    )
+
+
+def get_repository_settings() -> RepositorySettings:
+    return RepositorySettings(
+        runtime_dir=_env_path("RUNTIME_DATA_DIR", BACKEND_ROOT / "data" / "runtime"),
+        clone_timeout_seconds=_bounded_env_float(
+            "GIT_CLONE_TIMEOUT_SECONDS", 120.0, 5.0, 600.0
+        ),
+        max_files=_bounded_env_int("REPOSITORY_MAX_FILES", 2000, 1, 10000),
+        max_file_bytes=_bounded_env_int(
+            "REPOSITORY_MAX_FILE_BYTES", 1_000_000, 1024, 10_000_000
+        ),
+        max_total_bytes=_bounded_env_int(
+            "REPOSITORY_MAX_TOTAL_BYTES", 50_000_000, 1024, 500_000_000
+        ),
+    )
+
+
+def get_product_config_status() -> dict[str, Any]:
+    """Return diagnostics that intentionally contain no credential value or metadata."""
+    llm = get_llm_settings()
+    embedding = get_embedding_settings()
+    repository = get_repository_settings()
+    embedding_missing: list[str] = []
+    configured_embedding_provider = get_env_value("EMBEDDING_PROVIDER", "").strip()
+    configured_embedding_model = (
+        get_env_value("EMBEDDING_MODEL", "").strip()
+        or get_env_value("EMBEDDING_MODEL_NAME_OR_PATH", "").strip()
+    )
+    configured_embedding_offline = get_env_value("EMBEDDING_OFFLINE", "").strip().lower()
+    if not embedding.enabled:
+        embedding_missing.append("EMBEDDING_ENABLED")
+    if configured_embedding_provider != "local_bge_m3":
+        embedding_missing.append("EMBEDDING_PROVIDER")
+    if not configured_embedding_model:
+        embedding_missing.append("EMBEDDING_MODEL")
+    if configured_embedding_offline not in {"1", "true", "yes", "on"}:
+        embedding_missing.append("EMBEDDING_OFFLINE")
+    return {
+        "configuration_file": str(PROJECT_ROOT / ".env"),
+        "llm": {
+            "provider": llm.provider or None,
+            "model": llm.model or None,
+            "base_url_configured": bool(llm.base_url),
+            "api_key_configured": bool(llm.api_key),
+            "ready": llm.configured,
+            "missing": list(llm.missing),
+        },
+        "embedding": {
+            "provider": embedding.provider,
+            "model": _safe_model_label(embedding.model_name_or_path),
+            "device": embedding.device,
+            "offline": embedding.offline,
+            "enabled": embedding.enabled,
+            "ready": not embedding_missing,
+            "missing": embedding_missing,
+        },
+        "runtime": {
+            "database": str(_env_path("GITLEARN_DB", BACKEND_ROOT / "data" / "gitlearn.sqlite")),
+            "data_dir": str(repository.runtime_dir),
+            "clone_dir": str(repository.runtime_dir / "repositories"),
+        },
+    }
 
 
 def get_agent_limits() -> AgentLimits:
@@ -175,8 +296,25 @@ def _env_int(key: str, default: int) -> int:
         return default
 
 
+def _env_float(key: str, default: float) -> float:
+    value = get_env_value(key, str(default)).strip()
+    try:
+        return float(value)
+    except ValueError:
+        return default
+
+
 def _bounded_env_int(key: str, default: int, minimum: int, maximum: int) -> int:
     value = _env_int(key, default)
+    if value < minimum or value > maximum:
+        return default
+    return value
+
+
+def _bounded_env_float(
+    key: str, default: float, minimum: float, maximum: float
+) -> float:
+    value = _env_float(key, default)
     if value < minimum or value > maximum:
         return default
     return value
@@ -204,3 +342,27 @@ def _read_env_file(path: Path) -> dict[str, str]:
         if key:
             values[key] = value
     return values
+
+
+def _valid_provider_base_url(value: str) -> bool:
+    if not value:
+        return False
+    try:
+        parsed = urlsplit(value)
+        return bool(
+            parsed.scheme in {"http", "https"}
+            and parsed.hostname
+            and not parsed.username
+            and not parsed.password
+            and not parsed.query
+            and not parsed.fragment
+        )
+    except ValueError:
+        return False
+
+
+def _safe_model_label(value: str) -> str:
+    path = Path(value)
+    if path.is_absolute() or "\\" in value or value.startswith("."):
+        return f"local:{path.name or 'embedding-model'}"
+    return value

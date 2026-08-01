@@ -12,16 +12,18 @@ import {
   Send,
   Waypoints
 } from 'lucide-react';
-import { FormEvent, useMemo, useState } from 'react';
+import { FormEvent, useEffect, useMemo, useState } from 'react';
 import {
   analyzeProject,
   askProject,
+  getConfigStatus,
   getLearningPath,
   getProject,
   getProjectMap,
   getReport
 } from './lib/api';
-import type { ChatAnswer, LearningStep, ProjectMap, ProjectResponse, TreeNode } from './types';
+import { citationLabel, providerSummary, type SourceType } from './lib/product';
+import type { ChatAnswer, ConfigStatus, LearningStep, ProjectMap, ProjectResponse, TreeNode } from './types';
 
 type Tab = 'dashboard' | 'map' | 'learning' | 'ask' | 'report';
 
@@ -34,7 +36,9 @@ const tabs: Array<{ id: Tab; label: string; icon: typeof LayoutDashboard }> = [
 ];
 
 export default function App() {
-  const [repoUrl, setRepoUrl] = useState('https://github.com/tiangolo/fastapi');
+  const [sourceType, setSourceType] = useState<SourceType>('local');
+  const [source, setSource] = useState('');
+  const [configStatus, setConfigStatus] = useState<ConfigStatus | null>(null);
   const [projectId, setProjectId] = useState('');
   const [project, setProject] = useState<ProjectResponse | null>(null);
   const [projectMap, setProjectMap] = useState<ProjectMap | null>(null);
@@ -47,6 +51,12 @@ export default function App() {
   const [message, setMessage] = useState('');
 
   const hasProject = Boolean(project && projectId);
+
+  useEffect(() => {
+    getConfigStatus().then(setConfigStatus).catch((error) => {
+      setMessage(error instanceof Error ? error.message : '无法读取配置状态');
+    });
+  }, []);
 
   async function loadAll(nextProjectId: string) {
     const [projectData, mapData, learningData, reportData] = await Promise.all([
@@ -67,11 +77,11 @@ export default function App() {
     setMessage('正在抓取仓库并生成学习导读...');
     setAnswers([]);
     try {
-      const result = await analyzeProject(repoUrl);
+      const result = await analyzeProject(sourceType, source);
       setProjectId(result.project_id);
       await loadAll(result.project_id);
       setActiveTab('dashboard');
-      setMessage('分析完成，可以开始按路线阅读项目。');
+      setMessage(result.import_action === 'reused' ? '已载入持久化项目和索引。' : '分析和本地索引完成。');
     } catch (error) {
       setMessage(error instanceof Error ? error.message : '分析失败');
     } finally {
@@ -133,24 +143,35 @@ export default function App() {
             <span>开源项目学习导读系统</span>
           </div>
         </div>
-        <div className="status-line">{message || '输入公开 GitHub 仓库地址开始分析。'}</div>
+        <div className="status-line">{message || providerSummary(configStatus)}</div>
       </header>
 
       <main className="workspace">
         <aside className="sidebar">
           <form className="analyze-form" onSubmit={handleAnalyze}>
-            <label htmlFor="repo-url">GitHub 仓库</label>
+            <label htmlFor="repo-source">仓库来源</label>
+            <div className="source-toggle" role="group" aria-label="仓库来源">
+              <button type="button" className={sourceType === 'local' ? 'active' : ''} onClick={() => setSourceType('local')}>本地目录</button>
+              <button type="button" className={sourceType === 'git_url' ? 'active' : ''} onClick={() => setSourceType('git_url')}>公开 HTTPS Git</button>
+            </div>
             <input
-              id="repo-url"
-              value={repoUrl}
-              onChange={(event) => setRepoUrl(event.target.value)}
-              placeholder="https://github.com/owner/repo"
+              id="repo-source"
+              value={source}
+              onChange={(event) => setSource(event.target.value)}
+              placeholder={sourceType === 'local' ? 'D:\\Project\\my-python-repo' : 'https://host/owner/repo.git'}
+              required
             />
             <button type="submit" disabled={loading}>
               {loading ? <RefreshCw className="spin" aria-hidden="true" /> : <GitBranch aria-hidden="true" />}
               <span>{loading ? '分析中' : '开始分析'}</span>
             </button>
           </form>
+
+          <div className="provider-card">
+            <strong>{providerSummary(configStatus)}</strong>
+            <span>BGE-M3：{configStatus ? `${configStatus.embedding.model} / ${configStatus.embedding.device} / ${configStatus.embedding.offline ? 'offline' : 'online'}${configStatus.embedding.ready ? '' : `；缺少 ${configStatus.embedding.missing.join(', ')}`}` : '读取中'}</span>
+            <small>API Key 只保存在后端根目录 .env，不会发送到浏览器或写入项目数据库。</small>
+          </div>
 
           <nav className="tabs" aria-label="结果导航">
             {tabs.map((tab) => {
@@ -374,7 +395,7 @@ function AskView({
             <div className="citation-grid">
               {item.result.citations.map((citation) => (
                 <details key={citation.path} open>
-                  <summary>{citation.path}</summary>
+                  <summary>{citationLabel(citation)}</summary>
                   <pre>{citation.snippet}</pre>
                 </details>
               ))}

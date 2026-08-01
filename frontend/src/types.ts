@@ -8,6 +8,8 @@ export interface ProjectInfo {
   primary_language: string;
   frameworks: string[];
   error_message?: string;
+  source_type?: 'local' | 'git_url' | 'legacy_github';
+  source_location?: string;
 }
 
 export interface FileSummary {
@@ -72,10 +74,36 @@ export interface Citation {
   path: string;
   summary: string;
   snippet: string;
+  qualified_name: string;
+  start_line: number;
+  end_line: number;
 }
 
 export interface ChatAnswer {
   answer: string;
   citations: Citation[];
+  answer_mode: 'llm_grounded' | 'deterministic';
+  grounding_status: 'grounded' | 'insufficient_evidence' | 'degraded';
+  warnings: string[];
+}
+
+export interface ConfigStatus {
+  llm: {
+    provider: string | null;
+    model: string | null;
+    base_url_configured: boolean;
+    api_key_configured: boolean;
+    ready: boolean;
+    missing: string[];
+  };
+  embedding: {
+    provider: string;
+    model: string;
+    device: string;
+    offline: boolean;
+    enabled: boolean;
+    ready: boolean;
+    missing: string[];
+  };
 }
 

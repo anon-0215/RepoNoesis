@@ -135,6 +135,50 @@ button:disabled {
   height: 18px;
 }
 
+.source-toggle {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 6px;
+}
+
+.source-toggle button {
+  min-height: 36px;
+  border: 1px solid #cbd5df;
+  border-radius: 8px;
+  background: #fff;
+  color: #405466;
+}
+
+.source-toggle button.active {
+  background: #dfeaf2;
+  border-color: #215a88;
+  color: #16354f;
+  font-weight: 800;
+}
+
+.provider-card {
+  display: grid;
+  gap: 6px;
+  margin: 0 0 18px;
+  padding: 10px;
+  border: 1px solid #d7dee8;
+  border-radius: 8px;
+  background: #fff;
+  overflow-wrap: anywhere;
+}
+
+.provider-card strong,
+.provider-card span,
+.provider-card small {
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.provider-card span,
+.provider-card small {
+  color: #667789;
+}
+
 .tabs {
   display: grid;
   gap: 8px;

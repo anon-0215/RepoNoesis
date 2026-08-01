@@ -148,6 +148,7 @@ def answer_from_evidence(
         )
 
     answer: str | None = None
+    generated_with_llm = False
     if llm and llm.available:
         candidate_answer = _answer_with_grounded_llm(
             question,
@@ -170,6 +171,7 @@ def answer_from_evidence(
             )
         if candidate_answer and _has_only_valid_references(candidate_answer, valid):
             answer = candidate_answer
+            generated_with_llm = True
         else:
             warnings.append(
                 "The generation model returned missing or invalid evidence references; "
@@ -184,6 +186,7 @@ def answer_from_evidence(
         item.evidence_id for item in valid
     }:
         answer = None
+        generated_with_llm = False
         warnings.append(
             "Source changed during answer generation; stale generated text was discarded."
         )
@@ -212,6 +215,7 @@ def answer_from_evidence(
         retrieval_mode=retrieval_mode,
         warnings=warnings,
         grounding_status=grounding_status,
+        answer_mode="llm_grounded" if generated_with_llm else "deterministic",
     )
 
 
@@ -222,12 +226,16 @@ def _m1_response(
     retrieval_mode: str,
     warnings: list[str],
     grounding_status: str,
+    answer_mode: str = "deterministic",
 ) -> dict[str, Any]:
     citations = [
         {
             "path": item.path,
             "summary": item.qualified_name or item.symbol_name,
             "snippet": item.excerpt,
+            "qualified_name": item.qualified_name or item.symbol_name,
+            "start_line": item.start_line,
+            "end_line": item.end_line,
         }
         for item in evidence
         if item.validation_status == "valid"
@@ -240,6 +248,7 @@ def _m1_response(
         "grounding_status": grounding_status,
         "retrieval_mode": retrieval_mode,
         "warnings": list(dict.fromkeys(warnings)),
+        "answer_mode": answer_mode,
     }
 
 

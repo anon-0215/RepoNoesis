@@ -235,6 +235,11 @@ class EmbeddingService:
                 return
             if not self.settings.enabled:
                 raise EmbeddingConfigurationError("embeddings are disabled by EMBEDDING_ENABLED")
+            if self.settings.provider != "local_bge_m3":
+                raise EmbeddingConfigurationError(
+                    "EMBEDDING_PROVIDER must be local_bge_m3 for the local product path"
+                )
+            local_files_only = bool(local_files_only or self.settings.offline)
             device = resolve_embedding_device(self.settings.device, self._cuda_available)
             identity = build_model_identity(
                 self.settings.model_name_or_path,
@@ -255,8 +260,13 @@ class EmbeddingService:
             except EmbeddingError:
                 raise
             except Exception as exc:
+                suffix = (
+                    "; offline mode is enabled, so place BGE-M3 in the configured local path or cache"
+                    if local_files_only
+                    else ""
+                )
                 raise EmbeddingModelLoadError(
-                    f"failed to load embedding model {identity.model_name} on {device}"
+                    f"failed to load embedding model {identity.model_name} on {device}{suffix}"
                 ) from exc
             backend_revision = _normalize_commit_sha(_backend_model_revision(backend))
             resolved_revision = identity.resolved_revision

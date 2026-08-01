@@ -30,6 +30,9 @@ class RepositorySnapshot:
     default_branch: str
     files: list[RepoFile]
     repository_revision: str = ""
+    source_type: str = "legacy_github"
+    source_location: str = ""
+    source_identity: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -38,6 +41,9 @@ class RepositorySnapshot:
             "repo": self.repo,
             "default_branch": self.default_branch,
             "repository_revision": self.repository_revision,
+            "source_type": self.source_type,
+            "source_location": self.source_location,
+            "source_identity": self.source_identity,
             "files": [file.to_dict() for file in self.files],
         }
 

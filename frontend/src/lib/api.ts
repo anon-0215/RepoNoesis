@@ -1,4 +1,5 @@
-import type { ChatAnswer, LearningStep, ProjectMap, ProjectResponse } from '../types';
+import type { ChatAnswer, ConfigStatus, LearningStep, ProjectMap, ProjectResponse } from '../types';
+import { buildAnalyzePayload, type SourceType } from './product';
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL ?? 'http://127.0.0.1:8000';
 
@@ -23,7 +24,7 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
     let detail = text;
     try {
       const data = JSON.parse(text);
-      detail = data.detail ?? text;
+      detail = typeof data.detail === 'object' ? data.detail.message : (data.detail ?? text);
     } catch {
       detail = text;
     }
@@ -32,11 +33,18 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
   return response.json() as Promise<T>;
 }
 
-export async function analyzeProject(repoUrl: string): Promise<{ project_id: string; status: string }> {
+export async function analyzeProject(
+  sourceType: SourceType,
+  source: string
+): Promise<{ project_id: string; status: string; import_action: string }> {
   return request('/api/projects/analyze', {
     method: 'POST',
-    body: JSON.stringify({ repo_url: repoUrl })
+    body: JSON.stringify(buildAnalyzePayload(sourceType, source))
   });
+}
+
+export async function getConfigStatus(): Promise<ConfigStatus> {
+  return request('/api/config/status');
 }
 
 export async function getProject(projectId: string): Promise<ProjectResponse> {

@@ -15,7 +15,7 @@ from app.learning_schema import LEARNING_SCHEMA_STATEMENTS
 
 
 DEFAULT_DB_PATH = Path(__file__).resolve().parents[1] / "data" / "gitlearn.sqlite"
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 
 SCHEMA = """
@@ -32,6 +32,9 @@ CREATE TABLE IF NOT EXISTS projects (
     repo TEXT NOT NULL,
     default_branch TEXT NOT NULL,
     repository_revision TEXT NOT NULL DEFAULT '',
+    source_type TEXT NOT NULL DEFAULT 'legacy_github',
+    source_location TEXT NOT NULL DEFAULT '',
+    source_identity TEXT NOT NULL DEFAULT '',
     status TEXT NOT NULL,
     primary_language TEXT DEFAULT '',
     frameworks_json TEXT DEFAULT '[]',
@@ -294,6 +297,22 @@ class Database:
                 ADD COLUMN repository_revision TEXT NOT NULL DEFAULT ''
                 """
             )
+        for column, default_sql in (
+            ("source_type", "'legacy_github'"),
+            ("source_location", "''"),
+            ("source_identity", "''"),
+        ):
+            if column not in project_columns:
+                conn.execute(
+                    f"ALTER TABLE projects ADD COLUMN {column} TEXT NOT NULL DEFAULT {default_sql}"
+                )
+        conn.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_projects_source_identity
+            ON projects (source_identity)
+            WHERE source_identity != ''
+            """
+        )
         embedding_columns = {
             row["name"]
             for row in conn.execute("PRAGMA table_info(code_chunk_embeddings)").fetchall()
@@ -383,9 +402,10 @@ class Database:
                 """
                 INSERT INTO projects (
                     id, repo_url, owner, repo, default_branch,
-                    repository_revision, status
+                    repository_revision, source_type, source_location,
+                    source_identity, status
                 )
-                VALUES (?, ?, ?, ?, ?, ?, 'analyzing')
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'analyzing')
                 """,
                 (
                     project_id,
@@ -394,6 +414,9 @@ class Database:
                     snapshot["repo"],
                     snapshot["default_branch"],
                     snapshot.get("repository_revision", ""),
+                    snapshot.get("source_type", "legacy_github"),
+                    snapshot.get("source_location", ""),
+                    snapshot.get("source_identity", ""),
                 ),
             )
         return project_id
@@ -407,6 +430,17 @@ class Database:
                 WHERE id = ?
                 """,
                 (message[:2000], project_id),
+            )
+
+    def begin_reanalysis(self, project_id: str) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE projects
+                SET status = 'analyzing', error_message = '', updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (project_id,),
             )
 
     def save_analysis(
@@ -1365,6 +1399,18 @@ class Database:
             return None
         return self._project_from_row(row)
 
+    def get_project_by_source_identity(
+        self, source_identity: str
+    ) -> dict[str, Any] | None:
+        if not source_identity:
+            return None
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM projects WHERE source_identity = ?",
+                (source_identity,),
+            ).fetchone()
+        return self._project_from_row(row) if row else None
+
     def get_bundle(self, project_id: str) -> dict[str, Any] | None:
         project = self.get_project(project_id)
         if not project:
@@ -1437,6 +1483,9 @@ class Database:
             "repo": row["repo"],
             "default_branch": row["default_branch"],
             "repository_revision": row["repository_revision"],
+            "source_type": row["source_type"],
+            "source_location": row["source_location"],
+            "source_identity": row["source_identity"],
             "status": row["status"],
             "primary_language": row["primary_language"],
             "frameworks": self._json(row["frameworks_json"], []),

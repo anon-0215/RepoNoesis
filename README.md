@@ -1,5 +1,11 @@
 # GitLearnAgent
 
+> Local Product Phase 1 adds a persistent local/public-HTTPS repository import
+> path, real offline BGE-M3 indexing, a product `openai_compatible` provider,
+> safe configuration diagnostics, and a minimal local UI. Setup, security
+> boundaries, and Gate A/B/C commands are documented in
+> [`docs/v3/LOCAL_PRODUCT_PHASE1.md`](docs/v3/LOCAL_PRODUCT_PHASE1.md).
+
 面向编程初学者的 GitHub 开源项目学习 Agent。
 
 GitLearnAgent 可以输入一个公开 GitHub 仓库地址，自动抓取仓库结构与关键源码，进行静态分析、模块划分、核心文件排序，并生成适合初学者阅读的项目地图、学习路线、源码问答和 Markdown 报告。
@@ -55,7 +61,7 @@ GitLearnAgent 的目标是把一个 GitHub 开源仓库转化为一套适合初�
 | 自适应学习状态 | 本地单用户下持久化目标、版本化计划、Evidence 约束任务、学习事件与复习状态。 |
 | 源码问答 | 根据已抓取源码进行检索式问答，并返回引用文件和代码片段。 |
 | 报告导出 | 生成 Markdown 格式的项目学习报告。 |
-| 可选大模型增强 | 配置 `LLM_API_KEY` 后，可使用 OpenAI 兼容模型增强部分自然语言表达。未配置时仍可运行。 |
+| 产品生成模型 | 本地产品问答要求完整的 `openai_compatible` 配置；未配置时导入/离线测试可运行，但产品问答会明确拒绝而不会冒充模型回答。 |
 | 可复现实验 | M5 CLI 可在固定真实仓库 revision 上验证数据集并运行隔离的 fake/live provider 对照；默认关闭。 |
 
 ## 技术栈
@@ -157,10 +163,10 @@ start_all.bat
 http://127.0.0.1:5173
 ```
 
-输入一个公开 GitHub 仓库地址，例如：
+选择“本地目录”并输入干净 Git 工作树的绝对路径，或选择“公开 HTTPS Git”并输入仓库 URL。
 
 ```text
-https://github.com/tiangolo/fastapi
+D:\Project\my-python-repository
 ```
 
 ## 环境变量
@@ -169,14 +175,17 @@ https://github.com/tiangolo/fastapi
 
 | 变量 | 必填 | 说明 |
 | --- | --- | --- |
-| `GITHUB_TOKEN` | 推荐 | GitHub Personal Access Token，用于提高 GitHub API 请求额度。 |
-| `LLM_BASE_URL` | 否 | OpenAI 兼容接口地址，例如 DeepSeek、通义、智谱等服务的 base URL。 |
-| `LLM_API_KEY` | 否 | 大模型 API Key。未配置时，系统使用本地规则生成学习路线和问答结果。 |
-| `LLM_MODEL` | 否 | 模型名称，默认可使用 `deepseek-chat` 一类 OpenAI 兼容模型名。 |
-| `EMBEDDING_ENABLED` | 否 | V2 稠密向量能力开关，默认 `false`，避免首次启动自动下载大型模型。 |
-| `EMBEDDING_MODEL_NAME_OR_PATH` | 否 | Sentence Transformers 模型名或本地模型目录，默认 `BAAI/bge-m3`。 |
+| `LLM_PROVIDER` | 产品必填 | 固定为内部名称 `openai_compatible`。 |
+| `LLM_BASE_URL` | 产品必填 | 服务商当前官方文档给出的兼容 API 根地址；代码不写死服务商。 |
+| `LLM_API_KEY` | 产品必填 | 只保存在后端 `.env`，不得进入浏览器、数据库、日志或 Git。 |
+| `LLM_MODEL` | 产品必填 | 从服务商当前官方文档/控制台确认，不在仓库中硬编码。 |
+| `LLM_TIMEOUT_SECONDS` / `LLM_MAX_TOKENS` / `LLM_TEMPERATURE` / `LLM_MAX_RETRIES` | 否 | 产品请求边界；重试次数受服务端上限约束。 |
+| `EMBEDDING_ENABLED` | 产品必填 | 产品路径设置为 `true`。 |
+| `EMBEDDING_PROVIDER` | 产品必填 | 固定为 `local_bge_m3`。 |
+| `EMBEDDING_MODEL` | 产品必填 | 本地 BGE-M3 快照绝对路径，或已完整缓存的模型 ID。旧变量 `EMBEDDING_MODEL_NAME_OR_PATH` 只作为兼容别名。 |
 | `EMBEDDING_MODEL_REVISION` | 否 | Hugging Face 模型 revision 或 commit。建议生产环境填写固定 commit；本地目录模型不会扫描模型文件内容做指纹。 |
-| `EMBEDDING_DEVICE` | 否 | `auto`、`cpu` 或 `cuda`。`cuda` 不可用时会明确报错。 |
+| `EMBEDDING_DEVICE` | 否 | `auto`、`cpu`、`cuda` 或 `cuda:N`。CUDA 不可用时会明确报错。 |
+| `EMBEDDING_OFFLINE` | 产品必填 | 设置为 `true`，缺少模型时明确失败且不静默下载。 |
 | `EMBEDDING_BATCH_SIZE` | 否 | Embedding 批量编码大小，默认 `8`。 |
 | `EMBEDDING_MAX_LENGTH` | 否 | 模型最大文本长度，默认 `8192`，运行时限制在 `16` 到 `8192`。 |
 | `EMBEDDING_NORMALIZE` | 否 | 是否保存 L2 归一化向量，默认 `true`。 |
@@ -188,14 +197,16 @@ https://github.com/tiangolo/fastapi
 `.env.example` 示例：
 
 ```text
-GITHUB_TOKEN=
-LLM_BASE_URL=https://api.deepseek.com
+LLM_PROVIDER=openai_compatible
+LLM_BASE_URL=
 LLM_API_KEY=
-LLM_MODEL=deepseek-chat
-EMBEDDING_ENABLED=false
-EMBEDDING_MODEL_NAME_OR_PATH=BAAI/bge-m3
+LLM_MODEL=
+EMBEDDING_ENABLED=true
+EMBEDDING_PROVIDER=local_bge_m3
+EMBEDDING_MODEL=
 EMBEDDING_MODEL_REVISION=
 EMBEDDING_DEVICE=auto
+EMBEDDING_OFFLINE=true
 EMBEDDING_BATCH_SIZE=8
 EMBEDDING_MAX_LENGTH=8192
 EMBEDDING_NORMALIZE=true
@@ -261,7 +272,7 @@ http://127.0.0.1:8000/api/health
   "ok": true,
   "llm_available": false,
   "github_token_configured": true,
-  "database": "D:\\Project\\GitLearnAgent\\backend\\data\\gitlearn.sqlite"
+  "database": "D:\\Project\\RepoNoesis-v3\\backend\\data\\gitlearn.sqlite"
 }
 ```
 

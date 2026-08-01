@@ -87,8 +87,8 @@ class M3ApiTests(unittest.TestCase):
             ),
         ):
             result = self.main.health()
-        self.assertEqual(SCHEMA_VERSION, 7)
-        self.assertEqual(result["database_schema_version"], 7)
+        self.assertEqual(SCHEMA_VERSION, 8)
+        self.assertEqual(result["database_schema_version"], 8)
 
 
 if __name__ == "__main__":
