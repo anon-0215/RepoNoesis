@@ -1,0 +1,141 @@
+{
+  "acceptance_contract": {
+    "artifact_immutability": true,
+    "benchmark_must_be_frozen_before_formal_httpx_retrieval": true,
+    "click_benchmark_unchanged": true,
+    "dependency_changes_allowed": false,
+    "fake_provider_allowed_for_contract_tests_only": true,
+    "formal_provider_fallback_allowed": false,
+    "gold_or_matcher_posthoc_changes_allowed": false,
+    "model_download_allowed": false,
+    "network_allowed_during_formal_embedding_and_retrieval": false,
+    "production_retrieval_changes_allowed": false,
+    "relation_or_hierarchy_policy_changes_allowed": false
+  },
+  "benchmark_version": "cross-repo-v1",
+  "bootstrap": {
+    "method": "repository-stratified paired bootstrap: independently resample paired answerable queries with replacement within each repository, then recompute micro and macro deltas",
+    "samples": 2000,
+    "seed": 20260726
+  },
+  "cache_namespace_contract": [
+    "repository_id",
+    "repository_revision",
+    "chunk_identity",
+    "model_name",
+    "model_revision",
+    "dimension",
+    "normalize",
+    "max_length",
+    "query_prefix",
+    "document_prefix",
+    "pooling",
+    "provider_contract"
+  ],
+  "embedding": {
+    "batch_size": 8,
+    "device": "cuda",
+    "dimension": 1024,
+    "document_prefix": "",
+    "dtype": "float32",
+    "max_length": 8192,
+    "model": "BAAI/bge-m3 local snapshot",
+    "model_revision": "5617a9f61b028005a4858fdac845db406aefb181",
+    "normalize": true,
+    "pooling": "CLS/model-defined",
+    "provider": "sentence-transformers",
+    "query_prefix": ""
+  },
+  "evaluation_version": "retrieval-v2-phase6@1",
+  "failure_taxonomy": [
+    "all paths hit",
+    "all paths miss",
+    "v2 fixes v1",
+    "v2 regresses v1",
+    "cross-repo v2 replication",
+    "cross-repo v2 non-replication",
+    "hierarchy eligible but no-op",
+    "hierarchy resolution failure",
+    "hierarchy gain",
+    "hierarchy noise",
+    "relation opportunity uncovered",
+    "relation graph covered but not selected",
+    "relation new strict gain",
+    "relation rank gain",
+    "relation noise",
+    "relation gold loss",
+    "relation duplicate-support only",
+    "correct file wrong chunk",
+    "correct symbol wrong span",
+    "gold below K",
+    "lexical-only success",
+    "semantic-only success",
+    "fusion failure",
+    "seed mapping failure",
+    "target mapping failure",
+    "budget truncation",
+    "slot-cap suppression",
+    "external/unresolved/ambiguous/stale",
+    "matcher limitation",
+    "possible gold issue"
+  ],
+  "formal_top_k": 8,
+  "hierarchy_mode": "normalize_v1",
+  "metrics": [
+    "Hit@1",
+    "Hit@3",
+    "Hit@5",
+    "Hit@8",
+    "MRR@8",
+    "Recall@8",
+    "nDCG@8"
+  ],
+  "paths": {
+    "A": {
+      "hierarchy_mode": "off",
+      "label": "v1",
+      "relation_mode": "off",
+      "retrieval_version": "v1"
+    },
+    "B": {
+      "hierarchy_mode": "off",
+      "label": "plain v2",
+      "relation_mode": "off",
+      "retrieval_version": "v2"
+    },
+    "C": {
+      "hierarchy_mode": "normalize_v1",
+      "label": "v2 + hierarchy",
+      "relation_mode": "off",
+      "retrieval_version": "v2"
+    },
+    "D": {
+      "hierarchy_mode": "off",
+      "label": "v2 + relation",
+      "relation_mode": "expand_v1",
+      "retrieval_version": "v2"
+    },
+    "E": {
+      "hierarchy_mode": "normalize_v1",
+      "label": "hierarchy + relation",
+      "relation_mode": "expand_v1",
+      "retrieval_version": "v2"
+    }
+  },
+  "relation_mode": "expand_v1",
+  "repositories": [
+    "click",
+    "httpx"
+  ],
+  "source_first": true,
+  "top_10_disclosure": "Top-8-truncated Hit@10 and MRR@10 lower bounds only",
+  "versioned_production_contracts": {
+    "hierarchy_normalization_version": "hierarchy_normalization_v1@1",
+    "relation_expansion_version": "relation_expansion_v1@1",
+    "relation_graph_version": "relation_schema_v1@1",
+    "relation_priority_version": "relation_priority_v1@1",
+    "relation_selection_version": "relation_selection_v1@1",
+    "relation_whitelist_version": "relation_whitelist_v1@1",
+    "weighted_rrf_version": "weighted_rrf_v2@1"
+  }
+}

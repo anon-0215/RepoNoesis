@@ -1,0 +1,14 @@
+{
+  "click-explain-1": "direct_behavior_location",
+  "click-explain-2": "direct_behavior_location",
+  "click-explain-3": "direct_behavior_location",
+  "click-impact-1": "symbol_focused",
+  "click-impact-2": "symbol_focused",
+  "click-locate-1": "symbol_focused",
+  "click-locate-2": "symbol_focused",
+  "click-locate-3": "symbol_focused",
+  "click-relation-1": "relation_dependent",
+  "click-relation-2": "relation_dependent",
+  "click-relation-3": "relation_dependent",
+  "click-unanswerable-1": "unanswerable"
+}

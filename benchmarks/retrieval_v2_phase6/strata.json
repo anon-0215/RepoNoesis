@@ -1,0 +1,19 @@
+{
+  "click_overlay_boundary": "Click strata are a frozen reporting overlay on the unchanged Phase 5 queries. Only the new HTTPX benchmark is used to satisfy the Phase 6 source-first inclusion minima.",
+  "definitions": {
+    "direct_behavior_location": "The answer is directly evidenced by the named implementation or source location without requiring a relation hop or hierarchy normalization.",
+    "hierarchy_sensitive": "The query targets a nested function, nested class member, or qualified structural context for which parent/child identity may affect localization.",
+    "relation_dependent": "The query names a reasonable seed or entry concept while the strict gold is a different related symbol or implementation location connected by a source-level call, import, definition, or reference.",
+    "symbol_focused": "The query asks for a specific qualified symbol whose exact symbol identity is central to the evidence.",
+    "unanswerable": "No strict source gold exists in the fixed revision; the query is skipped from retrieval-quality denominators."
+  },
+  "new_repository_minimums": {
+    "direct_behavior_location": 6,
+    "hierarchy_sensitive": 4,
+    "relation_dependent": 6,
+    "symbol_focused": 4,
+    "unanswerable": 2
+  },
+  "primary_strata_are_mutually_exclusive": true,
+  "version": "retrieval-v2-phase6-strata@1"
+}
