@@ -140,6 +140,16 @@ class LLMPlanner:
             if repair_hint
             else ""
         )
+        chat_arguments: dict[str, Any] = {
+            "temperature": 0.0,
+            "max_tokens": self.limits.max_planner_output_tokens_per_step,
+            "timeout_seconds": max(1.0, state["remaining_budget"]["time_ms"] / 1000),
+        }
+        planner_thinking = getattr(
+            getattr(self.llm, "settings", None), "planner_thinking", None
+        )
+        if planner_thinking is not None:
+            chat_arguments["thinking"] = planner_thinking
         response = self.llm.chat(
             [
                 {
@@ -185,9 +195,7 @@ class LLMPlanner:
                     + repair,
                 },
             ],
-            temperature=0.0,
-            max_tokens=self.limits.max_planner_output_tokens_per_step,
-            timeout_seconds=max(1.0, state["remaining_budget"]["time_ms"] / 1000),
+            **chat_arguments,
         )
         if response is None:
             return None, 0

@@ -160,6 +160,16 @@ def _run_pipeline(snapshot: Any, *, require_provider: bool) -> dict[str, Any]:
             "answer": {
                 "provider": llm.provider_name if llm else "none",
                 "model": llm.model if llm else None,
+                "planner_thinking": (
+                    (llm.settings.planner_thinking or "omitted")
+                    if llm
+                    else "omitted"
+                ),
+                "answer_thinking": (
+                    (llm.settings.answer_thinking or "omitted")
+                    if llm
+                    else "omitted"
+                ),
                 "agent_mode": result.get("agent_mode"),
                 "answer_mode": result.get("answer_mode"),
                 "grounding_status": result.get("grounding_status"),

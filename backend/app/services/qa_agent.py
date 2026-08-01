@@ -328,6 +328,11 @@ def _answer_with_grounded_llm(
         chat_arguments["max_tokens"] = max_tokens
     if timeout_seconds is not None:
         chat_arguments["timeout_seconds"] = max(0.1, timeout_seconds)
+    answer_thinking = getattr(
+        getattr(llm, "settings", None), "answer_thinking", None
+    )
+    if answer_thinking is not None:
+        chat_arguments["thinking"] = answer_thinking
     return llm.chat(
         [
             {

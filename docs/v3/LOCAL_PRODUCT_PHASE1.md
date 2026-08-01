@@ -35,6 +35,17 @@ Required product generation values:
   official documentation
 - `LLM_TIMEOUT_SECONDS`, `LLM_MAX_TOKENS`, `LLM_TEMPERATURE`, and
   `LLM_MAX_RETRIES`: bounded request controls
+- `LLM_PLANNER_THINKING` and `LLM_ANSWER_THINKING`: optional, independent
+  provider capabilities. Leave blank to omit `thinking` entirely, or set to
+  `enabled` / `disabled` only when the configured provider and model document
+  support. For DeepSeek V4 Gate C, set `LLM_PLANNER_THINKING=disabled`; the
+  final-answer setting remains independent and may stay blank.
+
+The client does not send `reasoning_effort`, `response_format`, or `stream` by
+default. It never substitutes `reasoning_content` for final `content`. A
+length-limited empty final answer is reported as `provider_output_truncated`,
+while a stopped empty final answer is `provider_empty_content`; neither is
+automatically retried with the unchanged token budget.
 
 Required real embedding values:
 

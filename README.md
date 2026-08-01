@@ -180,6 +180,7 @@ D:\Project\my-python-repository
 | `LLM_API_KEY` | 产品必填 | 只保存在后端 `.env`，不得进入浏览器、数据库、日志或 Git。 |
 | `LLM_MODEL` | 产品必填 | 从服务商当前官方文档/控制台确认，不在仓库中硬编码。 |
 | `LLM_TIMEOUT_SECONDS` / `LLM_MAX_TOKENS` / `LLM_TEMPERATURE` / `LLM_MAX_RETRIES` | 否 | 产品请求边界；重试次数受服务端上限约束。 |
+| `LLM_PLANNER_THINKING` / `LLM_ANSWER_THINKING` | 否 | 可选且相互独立；留空时不发送 `thinking`，仅在服务商明确支持时填写 `enabled` 或 `disabled`。 |
 | `EMBEDDING_ENABLED` | 产品必填 | 产品路径设置为 `true`。 |
 | `EMBEDDING_PROVIDER` | 产品必填 | 固定为 `local_bge_m3`。 |
 | `EMBEDDING_MODEL` | 产品必填 | 本地 BGE-M3 快照绝对路径，或已完整缓存的模型 ID。旧变量 `EMBEDDING_MODEL_NAME_OR_PATH` 只作为兼容别名。 |

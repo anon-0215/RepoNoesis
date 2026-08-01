@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import os
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal, cast
 from urllib.parse import urlsplit
 
 from app.services.agent_contracts import AgentLimits
@@ -13,6 +13,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 BACKEND_ROOT = Path(__file__).resolve().parents[1]
 EMBEDDING_MAX_LENGTH_MIN = 16
 EMBEDDING_MAX_LENGTH_MAX = 8192
+ThinkingMode = Literal["enabled", "disabled"]
 
 
 def load_environment() -> None:
@@ -63,6 +64,8 @@ class LLMSettings:
     max_tokens: int = 1600
     temperature: float = 0.2
     max_retries: int = 2
+    planner_thinking: ThinkingMode | None = None
+    answer_thinking: ThinkingMode | None = None
 
     @property
     def missing(self) -> tuple[str, ...]:
@@ -122,6 +125,8 @@ def get_llm_settings() -> LLMSettings:
         max_tokens=_bounded_env_int("LLM_MAX_TOKENS", 1600, 1, 32768),
         temperature=_bounded_env_float("LLM_TEMPERATURE", 0.2, 0.0, 2.0),
         max_retries=_bounded_env_int("LLM_MAX_RETRIES", 2, 0, 4),
+        planner_thinking=_env_optional_thinking("LLM_PLANNER_THINKING"),
+        answer_thinking=_env_optional_thinking("LLM_ANSWER_THINKING"),
     )
 
 
@@ -168,6 +173,8 @@ def get_product_config_status() -> dict[str, Any]:
             "model": llm.model or None,
             "base_url_configured": bool(llm.base_url),
             "api_key_configured": bool(llm.api_key),
+            "planner_thinking": llm.planner_thinking or "omitted",
+            "answer_thinking": llm.answer_thinking or "omitted",
             "ready": llm.configured,
             "missing": list(llm.missing),
         },
@@ -302,6 +309,15 @@ def _env_float(key: str, default: float) -> float:
         return float(value)
     except ValueError:
         return default
+
+
+def _env_optional_thinking(key: str) -> ThinkingMode | None:
+    value = get_env_value(key, "").strip().lower()
+    if not value:
+        return None
+    if value in {"enabled", "disabled"}:
+        return cast(ThinkingMode, value)
+    raise ValueError(f"{key} must be enabled, disabled, or empty.")
 
 
 def _bounded_env_int(key: str, default: int, minimum: int, maximum: int) -> int:
