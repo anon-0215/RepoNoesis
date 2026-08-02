@@ -73,6 +73,16 @@ class SmokeDiagnosticsTests(unittest.TestCase):
         self.assertNotIn("forbidden-response-body", serialized)
         self.assertNotIn("forbidden-credential", serialized)
 
+    def test_final_answer_failure_reason_is_a_fixed_enum(self):
+        recorder = SmokeDiagnosticsRecorder()
+        recorder.record_final_answer_failure("citation_unknown")
+        self.assertEqual(
+            recorder.snapshot()["final_answer_failure_reason_code"],
+            "citation_unknown",
+        )
+        with self.assertRaises(ValueError):
+            recorder.record_final_answer_failure("dynamic-sensitive-reason")
+
 
 if __name__ == "__main__":
     unittest.main()

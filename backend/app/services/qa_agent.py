@@ -144,7 +144,9 @@ def answer_from_evidence(
         diagnostics_recorder.enter_stage("citation_validation")
     valid, validation_warnings = validator.validate_all(evidence)
     if diagnostics_recorder is not None:
-        diagnostics_recorder.mark_citation_validation_completed()
+        diagnostics_recorder.mark_citation_validation_completed(
+            passed=not validation_warnings and len(valid) == len(evidence)
+        )
     warnings = [*(warnings or []), *validation_warnings]
     if not valid:
         return _m1_response(
@@ -172,20 +174,44 @@ def answer_from_evidence(
         )
         if diagnostics_recorder is not None:
             diagnostics_recorder.record_final_answer_response()
-        if (
-            candidate_answer
-            and max_answer_tokens is not None
-            and _estimated_tokens(candidate_answer) > max_answer_tokens
+        if not candidate_answer:
+            if diagnostics_recorder is not None:
+                diagnostics_recorder.record_grounded_answer_candidate(received=False)
+                diagnostics_recorder.record_grounded_answer_accepted(False)
+                diagnostics_recorder.record_final_answer_failure("response_empty")
+        else:
+            reference_valid, failure_reason, citation_count = (
+                _validate_grounded_answer_references(candidate_answer, valid)
+            )
+            if diagnostics_recorder is not None:
+                diagnostics_recorder.record_grounded_answer_candidate(
+                    received=True,
+                    citation_count=citation_count,
+                )
+        if candidate_answer and max_answer_tokens is not None and (
+            _estimated_tokens(candidate_answer) > max_answer_tokens
         ):
             candidate_answer = None
+            if diagnostics_recorder is not None:
+                diagnostics_recorder.record_grounded_answer_accepted(False)
+                diagnostics_recorder.record_final_answer_failure(
+                    "answer_token_budget_exceeded"
+                )
             warnings.append(
                 "The generation model exceeded the final answer token budget; "
                 "used the deterministic grounded response."
             )
-        if candidate_answer and _has_only_valid_references(candidate_answer, valid):
+        if candidate_answer and reference_valid:
             answer = candidate_answer
             generated_with_llm = True
         else:
+            if (
+                candidate_answer
+                and diagnostics_recorder is not None
+                and failure_reason is not None
+            ):
+                diagnostics_recorder.record_grounded_answer_accepted(False)
+                diagnostics_recorder.record_final_answer_failure(failure_reason)
             warnings.append(
                 "The generation model returned missing or invalid evidence references; "
                 "used the deterministic grounded response."
@@ -196,14 +222,24 @@ def answer_from_evidence(
     if diagnostics_recorder is not None:
         diagnostics_recorder.enter_stage("post_generation_validation")
     revalidated, final_warnings = validator.validate_all(valid)
-    if diagnostics_recorder is not None:
-        diagnostics_recorder.mark_post_generation_validation_completed()
     warnings.extend(final_warnings)
-    if {item.evidence_id for item in revalidated} != {
+    post_generation_passed = not final_warnings and {
+        item.evidence_id for item in revalidated
+    } == {
         item.evidence_id for item in valid
-    }:
+    }
+    if diagnostics_recorder is not None:
+        diagnostics_recorder.mark_post_generation_validation_completed(
+            passed=post_generation_passed
+        )
+    if not post_generation_passed:
         answer = None
         generated_with_llm = False
+        if diagnostics_recorder is not None:
+            diagnostics_recorder.record_grounded_answer_accepted(False)
+            diagnostics_recorder.record_final_answer_failure(
+                "post_generation_validation_failed"
+            )
         warnings.append(
             "Source changed during answer generation; stale generated text was discarded."
         )
@@ -222,6 +258,8 @@ def answer_from_evidence(
             llm_available=bool(llm and llm.available),
             relation_context=relation_context,
         )
+    elif generated_with_llm and diagnostics_recorder is not None:
+        diagnostics_recorder.record_grounded_answer_accepted(True)
 
     grounding_status = (
         "grounded" if retrieval_mode == "hybrid" else "degraded"
@@ -431,18 +469,33 @@ def _estimated_tokens(value: str) -> int:
     return max(1, (len(value) + 3) // 4)
 
 
-def _has_only_valid_references(answer: str, evidence: list[Evidence]) -> bool:
+def _validate_grounded_answer_references(
+    answer: str,
+    evidence: list[Evidence],
+) -> tuple[bool, str | None, int]:
     valid_ids = {item.evidence_id for item in evidence}
     used_ids = set(re.findall(r"\[(E\d+)\]", answer))
-    if not used_ids or not used_ids.issubset(valid_ids):
-        return False
+    if not used_ids:
+        citation_like = bool(re.search(r"(?<![A-Za-z0-9_])E\d+", answer))
+        return False, "citation_format_invalid" if citation_like else "citation_missing", 0
+    if not used_ids.issubset(valid_ids):
+        return False, "citation_unknown", len(used_ids)
     locations = {
         f"{item.path}:{item.start_line}-{item.end_line}" for item in evidence
     }
     mentioned_locations = set(
         re.findall(r"(?<![\w/.-])([\w./-]+\.py:\d+-\d+)", answer)
     )
-    return bool(mentioned_locations) and mentioned_locations.issubset(locations)
+    if not mentioned_locations or not mentioned_locations.issubset(locations):
+        return False, "citation_validation_failed", len(used_ids)
+    return True, None, len(used_ids)
+
+
+def _has_only_valid_references(answer: str, evidence: list[Evidence]) -> bool:
+    accepted, _reason, _citation_count = _validate_grounded_answer_references(
+        answer, evidence
+    )
+    return accepted
 
 
 def _legacy_answer_question(

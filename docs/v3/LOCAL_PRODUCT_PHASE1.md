@@ -140,6 +140,19 @@ Stable Gate failures use `smoke_embedding_configuration_incomplete`,
 not relax any Gate C acceptance condition and do not authorize an automatic
 retry of a paid provider request.
 
+Final-answer diagnostics distinguish execution from success. The
+`citation_validation_completed`, `relation_validation_completed`, and
+`post_generation_validation_completed` fields mean only that the corresponding
+validator returned; their optional `*_passed` partners report the accumulated
+validation result. Candidate-level fields report whether a non-empty grounded
+candidate was received, how many syntactically valid Evidence IDs it cited, and
+whether it was ultimately accepted. The fixed
+`final_answer_failure_reason_code` enum distinguishes empty output, token-budget
+overflow, missing/malformed/unknown citations, citation binding failure,
+relation or post-generation validation failure, Provider failure, and deadline
+exhaustion. Result-level `citation_count` remains the count of citations in the
+returned answer and is deliberately separate from candidate citation counts.
+
 The bounded agent treats tool execution and final answer generation as separate
 capacities. Exhausting `max_tool_calls`, the planner-token budget, or the bounded
 planning steps stops further planning/tools, but does not consume the single

@@ -6,12 +6,17 @@ from pathlib import Path
 import tempfile
 import unittest
 import urllib.error
+from unittest.mock import patch
 
 from app.config import LLMSettings
 from app.database import Database
 from app.services.agent_contracts import AgentLimits
 from app.services.agent_core import run_bounded_agent
+from app.services.evidence import EvidenceBuilder
 from app.services.llm_client import LLMClient, ProviderError
+from app.services.qa_agent import answer_from_evidence
+from app.services.relation_graph import RelationValidator
+from app.services.retrieval_v2 import retrieve_code
 from app.services.smoke_diagnostics import SmokeDiagnosticsRecorder
 from tests.m1_helpers import disabled_embedding_service, make_project
 from tests.test_m2_agent import ScriptedPlanner, decision
@@ -20,12 +25,15 @@ from tests.test_m2_agent import ScriptedPlanner, decision
 class _FinalAnswerLlm:
     available = True
 
-    def __init__(self, response: str) -> None:
+    def __init__(self, response: str | None, callback=None) -> None:
         self.response = response
         self.calls = 0
+        self.callback = callback
 
     def chat(self, _messages, **_kwargs):
         self.calls += 1
+        if self.callback is not None:
+            self.callback()
         return self.response
 
 
@@ -34,7 +42,7 @@ class AgentFinalizationTests(unittest.TestCase):
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)
         self.database = Database(Path(self.directory.name) / "agent-finalization.sqlite")
-        _project_id, self.bundle = make_project(
+        self.project_id, self.bundle = make_project(
             self.database,
             [
                 (
@@ -85,6 +93,13 @@ class AgentFinalizationTests(unittest.TestCase):
         self.assertTrue(diagnostics["tool_budget_exhausted"])
         self.assertTrue(diagnostics["final_answer_attempted"])
         self.assertTrue(diagnostics["final_answer_response_received"])
+        self.assertTrue(diagnostics["citation_validation_passed"])
+        self.assertTrue(diagnostics["relation_validation_passed"])
+        self.assertTrue(diagnostics["post_generation_validation_passed"])
+        self.assertTrue(diagnostics["grounded_answer_candidate_received"])
+        self.assertTrue(diagnostics["grounded_answer_accepted"])
+        self.assertEqual(diagnostics["grounded_candidate_citation_count"], 1)
+        self.assertNotIn("final_answer_failure_reason_code", diagnostics)
         self.assertEqual(diagnostics["agent_status"], "completed")
 
     def test_tool_budget_exhausted_without_evidence_does_not_call_final_answer(self):
@@ -180,6 +195,180 @@ class AgentFinalizationTests(unittest.TestCase):
         self.assertEqual(len(result["citations"]), 1)
         self.assertNotIn("E999", result["answer"])
         self.assertEqual(llm.calls, 1)
+
+    def test_missing_candidate_citation_has_fixed_reason_and_keeps_fallback_count_separate(self):
+        planner = ScriptedPlanner(
+            [decision("continue", "search_code", {"query": "authenticate_user"})]
+        )
+        recorder = SmokeDiagnosticsRecorder()
+        result = self._run(
+            planner,
+            _FinalAnswerLlm("Answer without a source citation."),
+            limits=replace(AgentLimits(), max_tool_calls=1),
+            recorder=recorder,
+        )
+
+        diagnostics = recorder.snapshot()
+        self.assertEqual(result["agent_status"], "final_answer_failed")
+        self.assertEqual(result["answer_mode"], "deterministic")
+        self.assertEqual(diagnostics["final_answer_failure_reason_code"], "citation_missing")
+        self.assertTrue(diagnostics["grounded_answer_candidate_received"])
+        self.assertFalse(diagnostics["grounded_answer_accepted"])
+        self.assertEqual(diagnostics["grounded_candidate_citation_count"], 0)
+        self.assertEqual(diagnostics["citation_count"], 1)
+
+    def test_unknown_and_malformed_candidate_citations_are_distinct(self):
+        cases = (
+            (
+                "unknown",
+                "Unsupported [E999] src/auth.py:1-2.",
+                "citation_unknown",
+            ),
+            (
+                "malformed",
+                "Malformed citation E1 at src/auth.py:1-2.",
+                "citation_format_invalid",
+            ),
+            (
+                "binding",
+                "Wrong range [E1] src/auth.py:99-100.",
+                "citation_validation_failed",
+            ),
+        )
+        for label, response, expected_reason in cases:
+            with self.subTest(label=label):
+                recorder = SmokeDiagnosticsRecorder()
+                planner = ScriptedPlanner(
+                    [
+                        decision(
+                            "continue", "search_code", {"query": "authenticate_user"}
+                        )
+                    ]
+                )
+                result = self._run(
+                    planner,
+                    _FinalAnswerLlm(response),
+                    limits=replace(AgentLimits(), max_tool_calls=1),
+                    recorder=recorder,
+                )
+                diagnostics = recorder.snapshot()
+                self.assertEqual(result["agent_status"], "final_answer_failed")
+                self.assertEqual(
+                    diagnostics["final_answer_failure_reason_code"], expected_reason
+                )
+                self.assertFalse(diagnostics["grounded_answer_accepted"])
+
+    def test_empty_provider_result_records_response_empty_without_validation_fabrication(self):
+        recorder = SmokeDiagnosticsRecorder()
+        planner = ScriptedPlanner(
+            [decision("continue", "search_code", {"query": "authenticate_user"})]
+        )
+        result = self._run(
+            planner,
+            _FinalAnswerLlm(None),
+            limits=replace(AgentLimits(), max_tool_calls=1),
+            recorder=recorder,
+        )
+
+        diagnostics = recorder.snapshot()
+        self.assertEqual(result["agent_status"], "final_answer_failed")
+        self.assertEqual(diagnostics["final_answer_failure_reason_code"], "response_empty")
+        self.assertFalse(diagnostics["grounded_answer_candidate_received"])
+        self.assertFalse(diagnostics["grounded_answer_accepted"])
+        self.assertNotIn("grounded_candidate_citation_count", diagnostics)
+
+    def test_citation_validation_completion_and_failure_are_distinct(self):
+        outcome = retrieve_code(
+            self.database,
+            disabled_embedding_service(),
+            self.project_id,
+            "authenticate_user",
+            evidence_count=1,
+        )
+        evidence = EvidenceBuilder().build(
+            outcome.results,
+            self.bundle["project"],
+            retrieval_strategy_version=outcome.retrieval_strategy_version,
+        )
+        evidence[0].content_hash = "invalid-test-hash"
+        recorder = SmokeDiagnosticsRecorder()
+
+        result = answer_from_evidence(
+            "authenticate_user",
+            evidence,
+            _FinalAnswerLlm("must not be used"),
+            self.database,
+            retrieval_mode=outcome.retrieval_mode,
+            diagnostics_recorder=recorder,
+        )
+
+        diagnostics = recorder.snapshot()
+        self.assertEqual(result["evidence"], [])
+        self.assertTrue(diagnostics["citation_validation_completed"])
+        self.assertFalse(diagnostics["citation_validation_passed"])
+        self.assertNotIn("grounded_answer_candidate_received", diagnostics)
+
+    def test_relation_validation_failure_is_visible_without_rejecting_direct_evidence(self):
+        recorder = SmokeDiagnosticsRecorder()
+        planner = ScriptedPlanner(
+            [
+                decision("continue", "search_code", {"query": "authenticate_user"}),
+                decision("answer"),
+            ]
+        )
+        with patch.object(
+            RelationValidator,
+            "validate_chains",
+            return_value=([], ["safe-test-rejection"]),
+        ):
+            result = self._run(
+                planner,
+                _FinalAnswerLlm("Grounded answer [E1] src/auth.py:1-2."),
+                limits=AgentLimits(),
+                recorder=recorder,
+            )
+
+        diagnostics = recorder.snapshot()
+        self.assertEqual(result["answer_mode"], "llm_grounded")
+        self.assertTrue(diagnostics["relation_validation_completed"])
+        self.assertFalse(diagnostics["relation_validation_passed"])
+        self.assertTrue(diagnostics["grounded_answer_accepted"])
+        self.assertNotIn("final_answer_failure_reason_code", diagnostics)
+
+    def test_post_generation_validation_failure_is_distinct(self):
+        def change_persisted_source():
+            with self.database.connect() as connection:
+                connection.execute(
+                    "UPDATE repo_files SET content = ? WHERE project_id = ? AND path = ?",
+                    (
+                        "def changed(password):\n    return False\n",
+                        self.project_id,
+                        "src/auth.py",
+                    ),
+                )
+
+        recorder = SmokeDiagnosticsRecorder()
+        planner = ScriptedPlanner(
+            [decision("continue", "search_code", {"query": "authenticate_user"})]
+        )
+        result = self._run(
+            planner,
+            _FinalAnswerLlm(
+                "Grounded answer [E1] src/auth.py:1-2.",
+                callback=change_persisted_source,
+            ),
+            limits=replace(AgentLimits(), max_tool_calls=1),
+            recorder=recorder,
+        )
+
+        diagnostics = recorder.snapshot()
+        self.assertTrue(diagnostics["post_generation_validation_completed"])
+        self.assertFalse(diagnostics["post_generation_validation_passed"])
+        self.assertFalse(diagnostics["grounded_answer_accepted"])
+        self.assertEqual(
+            diagnostics["final_answer_failure_reason_code"],
+            "post_generation_validation_failed",
+        )
 
     def test_provider_failure_records_attempt_and_failure_status_then_propagates(self):
         recorder = SmokeDiagnosticsRecorder()

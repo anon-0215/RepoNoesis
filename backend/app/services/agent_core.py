@@ -530,6 +530,15 @@ def run_bounded_agent(
         and state.remaining_budget()["time_ms"] > 0
         else None
     )
+    if (
+        diagnostics_recorder is not None
+        and evidence
+        and llm
+        and llm.available
+        and state.completion_status not in {"insufficient_evidence", "cancelled"}
+        and state.remaining_budget()["time_ms"] <= 0
+    ):
+        diagnostics_recorder.record_final_answer_failure("deadline_exhausted")
     try:
         final = answer_from_evidence(
             question,
@@ -551,6 +560,11 @@ def run_bounded_agent(
         if diagnostics_recorder is not None:
             if isinstance((exc.diagnostics or {}).get("http_status"), int):
                 diagnostics_recorder.record_final_answer_response()
+            diagnostics_recorder.record_final_answer_failure(
+                "response_empty"
+                if exc.code == "provider_empty_content"
+                else "provider_failed"
+            )
             diagnostics_recorder.record_agent_result(
                 {
                     "agent_mode": "bounded",
@@ -570,6 +584,11 @@ def run_bounded_agent(
             "Relation data changed during answer generation; relation-dependent "
             "generated text was discarded."
         )
+        if diagnostics_recorder is not None:
+            diagnostics_recorder.record_grounded_answer_accepted(False)
+            diagnostics_recorder.record_final_answer_failure(
+                "relation_validation_failed"
+            )
         final = answer_from_evidence(
             question,
             post_evidence,
@@ -1070,24 +1089,29 @@ def _validated_relation_context(
         state.context.database
     ).validate_all(evidence)
     if diagnostics_recorder is not None:
-        diagnostics_recorder.mark_citation_validation_completed()
+        diagnostics_recorder.mark_citation_validation_completed(
+            passed=not evidence_warnings and len(valid_evidence) == len(evidence)
+        )
     valid_ids = {item.evidence_id for item in valid_evidence}
     if diagnostics_recorder is not None:
         diagnostics_recorder.enter_stage("relation_validation")
+    candidate_chains = state.context.chain_store.all(state.request_id)
     chains, relation_warnings = RelationValidator(
         state.context.database
     ).validate_chains(
         owner_id=state.request_id,
         project_id=state.context.project_id,
         repository_revision=state.context.repository_revision,
-        chains=state.context.chain_store.all(state.request_id),
+        chains=candidate_chains,
         valid_evidence_ids=valid_ids,
         evidence_by_chunk_id={
             item.code_chunk_id: item.evidence_id for item in valid_evidence
         },
     )
     if diagnostics_recorder is not None:
-        diagnostics_recorder.mark_relation_validation_completed()
+        diagnostics_recorder.mark_relation_validation_completed(
+            passed=not relation_warnings and len(chains) == len(candidate_chains)
+        )
     all_relation_ids = state.context.chain_store.supporting_ids(state.request_id)
     valid_relation_ids = {
         evidence_id

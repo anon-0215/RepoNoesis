@@ -36,10 +36,26 @@ FallbackReasonCode = Literal[
     "context_binding_failed",
     "planner_validation_failed",
 ]
+FinalAnswerFailureReasonCode = Literal[
+    "response_empty",
+    "answer_token_budget_exceeded",
+    "citation_missing",
+    "citation_format_invalid",
+    "citation_unknown",
+    "citation_validation_failed",
+    "relation_validation_failed",
+    "post_generation_validation_failed",
+    "provider_failed",
+    "deadline_exhausted",
+    "unknown_safe_failure",
+]
 
 SMOKE_STAGES = frozenset(SmokeStage.__args__)
 PROVIDER_PURPOSES = frozenset(ProviderPurpose.__args__)
 FALLBACK_REASON_CODES = frozenset(FallbackReasonCode.__args__)
+FINAL_ANSWER_FAILURE_REASON_CODES = frozenset(
+    FinalAnswerFailureReasonCode.__args__
+)
 SMOKE_ERROR_MESSAGES = {
     "smoke_embedding_configuration_incomplete": (
         "The smoke gate embedding configuration is incomplete."
@@ -219,14 +235,45 @@ class SmokeDiagnosticsRecorder:
     def record_final_answer_response(self) -> None:
         self._agent["final_answer_response_received"] = True
 
-    def mark_citation_validation_completed(self) -> None:
-        self._agent["citation_validation_completed"] = True
+    def mark_citation_validation_completed(self, *, passed: bool) -> None:
+        self._record_validation("citation_validation", passed)
 
-    def mark_relation_validation_completed(self) -> None:
-        self._agent["relation_validation_completed"] = True
+    def mark_relation_validation_completed(self, *, passed: bool) -> None:
+        self._record_validation("relation_validation", passed)
 
-    def mark_post_generation_validation_completed(self) -> None:
-        self._agent["post_generation_validation_completed"] = True
+    def mark_post_generation_validation_completed(self, *, passed: bool) -> None:
+        self._record_validation("post_generation_validation", passed)
+
+    def _record_validation(self, prefix: str, passed: bool) -> None:
+        completed_key = f"{prefix}_completed"
+        passed_key = f"{prefix}_passed"
+        self._agent[completed_key] = True
+        previous = self._agent.get(passed_key)
+        self._agent[passed_key] = bool(passed) and (
+            bool(previous) if isinstance(previous, bool) else True
+        )
+
+    def record_grounded_answer_candidate(
+        self, *, received: bool, citation_count: int | None = None
+    ) -> None:
+        self._agent["grounded_answer_candidate_received"] = bool(received)
+        if (
+            received
+            and isinstance(citation_count, int)
+            and not isinstance(citation_count, bool)
+            and 0 <= citation_count <= 1_000
+        ):
+            self._agent["grounded_candidate_citation_count"] = citation_count
+
+    def record_grounded_answer_accepted(self, accepted: bool) -> None:
+        self._agent["grounded_answer_accepted"] = bool(accepted)
+
+    def record_final_answer_failure(
+        self, reason: FinalAnswerFailureReasonCode
+    ) -> None:
+        if reason not in FINAL_ANSWER_FAILURE_REASON_CODES:
+            raise ValueError("unsupported final answer failure reason")
+        self._agent["final_answer_failure_reason_code"] = reason
 
     def record_agent_result(self, result: dict[str, Any]) -> None:
         for key, allowed in (
@@ -283,6 +330,7 @@ def _safe_smoke_diagnostics(value: Any) -> dict[str, Any]:
         "tool_calls_failed",
         "evidence_count",
         "citation_count",
+        "grounded_candidate_citation_count",
     }
     boolean_keys = {
         "planner_response_received",
@@ -293,6 +341,11 @@ def _safe_smoke_diagnostics(value: Any) -> dict[str, Any]:
         "relation_validation_completed",
         "post_generation_validation_completed",
         "tool_budget_exhausted",
+        "citation_validation_passed",
+        "relation_validation_passed",
+        "post_generation_validation_passed",
+        "grounded_answer_candidate_received",
+        "grounded_answer_accepted",
         "diagnostics_truncated",
     }
     for key in integer_keys:
@@ -308,6 +361,7 @@ def _safe_smoke_diagnostics(value: Any) -> dict[str, Any]:
         ("agent_mode", _AGENT_MODES),
         ("answer_mode", _ANSWER_MODES),
         ("agent_status", _AGENT_STATUSES),
+        ("final_answer_failure_reason_code", FINAL_ANSWER_FAILURE_REASON_CODES),
     ):
         item = value.get(key)
         if isinstance(item, str) and item in allowed:
