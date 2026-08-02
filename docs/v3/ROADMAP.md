@@ -110,3 +110,31 @@ infrastructure complete、live validation incomplete。详见 `M5_DECISIONS.md` 
 **兼容/回滚/完成**：UI 兼容旧响应；feature flag 可回旧五标签页；迁移有恢复说明。全部门槛、演示、限制和可复现报告通过后才称 V3 完整验收。
 
 M1 是第一个代码开发里程碑。本设计阶段提交后停止，不提前实现 M1，更不把 Agent、调用图或 Learning State 塞入 M1。
+
+## Local Product 路线（独立于 M5 评测路线）
+
+### Local Product Phase 1：真实本地端到端闭环
+
+**完成状态（2026-08-02）：FULL PASS。** 代码验收基线为
+`e07bfd16e16ecbb827ab002fb9f11274013b92e3`。Gate A、B、C 均通过；Gate C
+以真实本地 BGE-M3 CUDA、`openai_compatible`/`deepseek-v4-pro`、bounded Agent
+和通过验证的 grounded answer 退出 0。完整安全摘要、能力边界和代码/文档提交区分见
+[`LOCAL_PRODUCT_PHASE1.md`](LOCAL_PRODUCT_PHASE1.md)。
+
+该结果是受控 smoke 的真实集成验收，不是任意仓库、语言、规模、平台、Provider 或教学
+效果的生产级证明，也不表示 M5 live pilot 已完成。
+
+### Local Product Phase 2：持久化仓库工作区生命周期（建议）
+
+仓库在 Phase 1 封存前没有正式 Phase 2 定义。当前建议的唯一主线是：把一次性导入升级为
+可重新打开、revision-aware、可恢复、可增量刷新并保持学习连续性的本地仓库工作区。
+
+建议顺序：
+
+1. P2.1：项目库、稳定 workspace/snapshot 身份和重新打开；
+2. P2.2：revision 检测、幂等 update run、增量重建和原子激活；
+3. P2.3：跨 revision 学习重验证与最小持续学习 UI。
+
+完整范围、非目标、schema 建议、兼容性、安全边界、Gate 和风险见
+[`LOCAL_PRODUCT_PHASE2_PLAN.md`](LOCAL_PRODUCT_PHASE2_PLAN.md)。该文档是建议，尚未
+授权实施；Phase 2 不包含 M5/Phase 6 修改或 live benchmark。

@@ -1,10 +1,13 @@
 # GitLearnAgent
 
-> Local Product Phase 1 adds a persistent local/public-HTTPS repository import
-> path, real offline BGE-M3 indexing, a product `openai_compatible` provider,
-> safe configuration diagnostics, and a minimal local UI. Setup, security
-> boundaries, and Gate A/B/C commands are documented in
+> **Local Product Phase 1: FULL PASS (2026-08-02).** The accepted code baseline
+> is `e07bfd16e16ecbb827ab002fb9f11274013b92e3`; Gate A/B/C and the 514-test
+> offline backend regression passed. Setup, safe acceptance evidence, and
+> limitations are recorded in
 > [`docs/v3/LOCAL_PRODUCT_PHASE1.md`](docs/v3/LOCAL_PRODUCT_PHASE1.md).
+> The proposed, not-yet-implemented Local Product Phase 2 workspace-lifecycle
+> plan is in
+> [`docs/v3/LOCAL_PRODUCT_PHASE2_PLAN.md`](docs/v3/LOCAL_PRODUCT_PHASE2_PLAN.md).
 
 面向编程初学者的 GitHub 开源项目学习 Agent。
 
@@ -91,18 +94,16 @@ GitLearnAgent 的目标是把一个 GitHub 开源仓库转化为一套适合初�
 
 ```mermaid
 flowchart TD
-    A["用户输入 GitHub 仓库 URL"] --> B["后端解析 owner/repo"]
-    B --> C["GitHub API 获取仓库元信息和文件树"]
-    C --> D["按重要性筛选候选文件"]
-    D --> E["并发抓取 GitHub blob 文件内容"]
-    E --> F["静态分析：语言、框架、入口、依赖、符号"]
-    F --> G["文件重要性排序与模块划分"]
-    G --> H["生成项目地图、学习路线、任务和测验"]
-    G --> I["建立源码问答检索上下文"]
-    H --> J["SQLite 保存分析结果"]
-    I --> J
-    J --> K["FastAPI 提供接口"]
-    K --> L["React 前端展示结果"]
+    A["本地 Git 目录或公开 HTTPS Git URL"] --> B["安全导入并解析固定 revision"]
+    B --> C["静态分析与 Python 函数/类代码块"]
+    C --> D["词法/本地 BGE-M3 索引与静态关系"]
+    D --> E["EvidenceStore 与 bounded Agent"]
+    E --> F["Citation/Relation/生成后复验"]
+    C --> G["项目地图与学习路线"]
+    F --> H["SQLite 持久化项目、索引和学习状态"]
+    G --> H
+    H --> I["FastAPI 提供接口"]
+    I --> J["React 本地工作台"]
 ```
 
 ## 快速开始
@@ -325,7 +326,7 @@ http://127.0.0.1:8000
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | `GET` | `/api/health` | 健康检查，确认后端、LLM 配置和 GitHub token 状态。 |
-| `POST` | `/api/projects/analyze` | 提交 GitHub 仓库 URL，开始分析并返回 `project_id`。 |
+| `POST` | `/api/projects/analyze` | 提交本地 Git 目录或公开 HTTPS Git URL，完成产品导入/分析并返回 `project_id`；旧 `repo_url` 请求保持兼容。 |
 | `GET` | `/api/projects/{project_id}` | 获取项目概览、技术栈、核心文件和模块摘要。 |
 | `GET` | `/api/projects/{project_id}/map` | 获取目录树、模块关系和核心文件列表。 |
 | `GET` | `/api/projects/{project_id}/learning-path` | 获取学习路线、任务和测验。 |
@@ -345,7 +346,8 @@ POST /api/projects/analyze
 Content-Type: application/json
 
 {
-  "repo_url": "https://github.com/tiangolo/fastapi"
+  "source_type": "local",
+  "source": "D:\\Project\\my-python-repository"
 }
 ```
 
@@ -407,7 +409,11 @@ GitLearnAgent/
 
 ## 工作原理
 
-### 1. 仓库抓取
+### 1. 仓库导入
+
+Local Product 路径支持读取干净本地 Git 工作树的 tracked files，或把无凭据公开 HTTPS
+Git 仓库克隆到受控、被 Git 忽略的运行目录。两种来源都解析固定 commit revision，且不
+执行仓库代码、不安装仓库依赖。旧 `repo_url` GitHub API 路径继续作为兼容入口。
 
 后端会解析 GitHub URL，提取 `owner/repo`，然后通过 GitHub REST API 获取：
 
@@ -490,7 +496,9 @@ M4 另提供正式的结构化学习闭环。它使用 local single-user profile
 → 生成带引用路径的回答
 ```
 
-如果配置了 `LLM_API_KEY`，系统会用大模型增强表达；如果没有配置，则使用本地规则回答。
+Local Product 的生成式问答要求完整的后端 `openai_compatible` 配置；配置缺失时会明确
+拒绝真实产品生成，不能把本地 deterministic fallback 冒充为 Provider 回答。离线测试和
+兼容路径仍可显式使用确定性回答。
 
 ### 7. 报告生成
 
@@ -641,25 +649,28 @@ samples/demo_repositories.md
 
 ## 当前限制
 
-- 只支持公开 GitHub 仓库。
-- 首版重点支持 Python、JavaScript、TypeScript。
+- Local Product Phase 1 支持干净的本地 Git 工作树和无凭据公开 HTTPS Git 仓库；不支持
+  私有仓库认证、SSH、submodule 或任意远端地址。
+- 产品级代码块、关系扩展和真实 Gate 重点支持 Python；JavaScript/TypeScript 仍只是旧的
+  轻量结构分析，不具备同等 Evidence/关系保证。
 - JS/TS 分析目前是轻量规则，不是完整 TypeScript 编译器级分析。
 - Python 支持保守的静态 import/call/reference/definition 关系扩展，但不代表运行时调用图。
-- 问答检索目前是本地关键词和规则评分，不是完整向量数据库。
+- 已支持本地 BGE-M3 与词法/符号/关系检索，但当前真实验收 fixture 很小，未证明任意仓库
+  规模和长期性能。
 - 大模型增强只支持 OpenAI 兼容接口。
-- 暂不支持私有仓库 OAuth 授权。
+- 项目数据和 M4 学习状态可持久化，但前端尚无项目库/重新打开流程；新 revision 当前创建
+  新 project，不做端到端增量刷新或跨 project 学习历史合并。
+- 分析同步执行，进度较粗；没有持久化更新任务、阶段恢复或并发用户保证。
 - 暂不执行被分析仓库代码，避免安全风险。
 
 ## 后续计划
 
-- 支持更多语言，例如 Java、Go、Rust。
-- 引入 Tree-sitter 或 Language Server Protocol，提高结构分析能力。
-- 加入向量检索，提高源码问答召回率。
-- 增加后台任务队列和进度条，改善大仓库体验。
-- 支持上传 ZIP 仓库，减少 GitHub 网络依赖。
-- 在 M5 为现有结构化学习状态补充完整前端体验和真实/半真实评测。
-- 增加更系统的对比实验评测模块。
-- 生成适合大创答辩的可视化分析报告。
+- 优先评审并实施建议的 Local Product Phase 2 主线：项目库/重新打开、revision-aware
+  增量刷新、失败恢复和学习状态重验证。详见
+  [`docs/v3/LOCAL_PRODUCT_PHASE2_PLAN.md`](docs/v3/LOCAL_PRODUCT_PHASE2_PLAN.md)。
+- M5 继续作为独立的可复现实验和对照评测路线；其 live gate 未完成时不得宣称完整通过。
+- 完整学习工作台、更大仓库性能、多项目高级组织、更多语言、私有仓库认证和云多用户能力
+  均留作 Phase 2 之后的独立评审，不在当前建议中预先承诺。
 
 ## 项目价值
 

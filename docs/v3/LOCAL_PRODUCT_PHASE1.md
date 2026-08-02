@@ -174,6 +174,106 @@ answer finishes as `completed`; invalid generated references finish as
 `insufficient_evidence`. No budget value or Gate C condition is increased or
 relaxed by this behavior.
 
+## Final acceptance record
+
+**Final status: `Local Product Phase 1: FULL PASS`.**
+
+The code acceptance baseline is
+`e07bfd16e16ecbb827ab002fb9f11274013b92e3`. The final Gate C was executed
+locally on 2026-08-02 after that commit and exited with code 0. This section is
+the durable acceptance summary; it deliberately excludes credentials,
+environment-variable values, prompts, request or response bodies, answer text,
+reasoning content, Evidence text, and source text.
+
+| Gate | Final status | What the accepted run established |
+| --- | --- | --- |
+| A | PASS | A clean temporary local Git repository completed Python extraction, real offline local BGE-M3 indexing, relation indexing, bounded-agent deterministic fallback, and Evidence/citation validation. It did not claim a real generated-model result. |
+| B | PASS | The public unauthenticated HTTPS Git import path completed the real-embedding product smoke with the same repository safety restrictions. It did not claim a real generated-model result. |
+| C | PASS | The single final paid-provider run completed the real local-repository path with `openai_compatible`, `deepseek-v4-pro`, a bounded agent, an `llm_grounded` answer, and validated grounding. |
+
+The accepted Gate C chain was:
+
+```text
+local Git repository
+-> Python source extraction
+-> local BGE-M3 CUDA embedding
+-> hybrid retrieval
+-> relation expansion
+-> bounded agent
+-> DeepSeek grounded answer
+-> citation, relation, and post-generation validation
+-> Gate C pass
+```
+
+Safe Gate C result metadata:
+
+- repository input: local; resolved revision
+  `496f4e32ecb954b65a0391d34b48f6c0fd0da5fb`;
+- source inventory: 1 Python file and 1 code chunk;
+- embedding: `local_bge_m3`, real, offline, CUDA, 1024 dimensions, 1 newly
+  generated chunk;
+- relation index: complete, 2 nodes and 3 edges;
+- agent and answer: `agent_mode=bounded`, `answer_mode=llm_grounded`,
+  `grounding_status=grounded`, 1 Evidence item and 1 citation;
+- generation: `provider=openai_compatible`, `model=deepseek-v4-pro`, planner
+  thinking explicitly disabled and answer thinking omitted;
+- process result: `status=pass`, exit code 0.
+
+The offline backend regression for the accepted code baseline recorded:
+
+```text
+Ran 514 tests
+OK
+```
+
+There were no failures, errors, or skipped tests. The final documentation seal
+did not rerun that regression because it changes no production or test code.
+
+### What Phase 1 proves
+
+- The configured local product can import and persist a clean local Python Git
+  repository or an unauthenticated public HTTPS Git repository.
+- It can extract Python function/class chunks with source locations, build a
+  real offline BGE-M3 index, build static relations, and run the existing
+  bounded Evidence/Citation pipeline.
+- The product-neutral `openai_compatible` Chat Completions client can obtain a
+  real DeepSeek answer and expose it only after grounding validation succeeds.
+- Provider configuration failures, response-shape failures, agent stages, and
+  Gate C assertions have bounded, redacted diagnostics.
+- Project analysis, indexes, and M4 learning records are stored in SQLite and
+  survive backend restarts.
+- The minimal local UI can start an import and ask an evidence-grounded
+  repository question without putting the API key in browser state.
+
+### What Phase 1 does not prove
+
+- production readiness, unattended operation, concurrent users, authentication,
+  private repositories, or cloud deployment;
+- correctness or performance for arbitrary repositories, large repositories,
+  all Python language constructs, or languages other than the documented
+  conservative analysis paths;
+- a complete browser E2E over import, restart, project reopening, revision
+  refresh, learning plans, tasks, attempts, and review;
+- incremental analysis after a repository revision changes, partial rebuilds,
+  multi-project organization, or automatic learning-history continuity across
+  different project records;
+- general DeepSeek quality, other OpenAI-compatible providers, arbitrary model
+  configurations, token/cost behavior, or repeated paid-provider reliability;
+- M5 live-pilot completion, comparative retrieval superiority, educational
+  effectiveness, or mastery-prediction validity.
+
+The Gate C fixture was intentionally tiny. Its successful real-provider and
+real-embedding path is an integration acceptance, not a claim of comprehensive
+quality, scale, language, platform, or production validation.
+
+### Acceptance and documentation commits
+
+- Code acceptance baseline:
+  `e07bfd16e16ecbb827ab002fb9f11274013b92e3`.
+- Documentation seal: the later commit containing this section and the Local
+  Product Phase 2 plan. It records the accepted result but does not alter the
+  accepted code baseline.
+
 ## Current limitations
 
 - Local source must be the root of a clean Git worktree.
