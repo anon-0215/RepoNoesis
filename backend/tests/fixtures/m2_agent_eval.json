@@ -174,7 +174,7 @@
     "forbidden_tools": ["shell"],
     "expected_tool_sequence": ["search_code", "search_code", "search_code"],
     "expected_evidence": ["src/auth.py"],
-    "expected_final_status": "completed",
+    "expected_final_status": "tool_budget_exhausted",
     "maximum_steps": 3,
     "maximum_calls": 3,
     "annotation_note": "重复调用被拒绝并由 no-progress 终止。"

@@ -33,7 +33,7 @@ from app.services.hierarchy_normalization import (
     HIERARCHY_MODE_OFF,
     validate_hierarchy_mode,
 )
-from app.services.llm_client import LLMClient
+from app.services.llm_client import LLMClient, ProviderError
 from app.services.learning_service import LearningService
 from app.services.qa_agent import (
     INSUFFICIENT_ANSWER,
@@ -488,6 +488,14 @@ def run_bounded_agent(
         if observation.status == "cancelled":
             state.completion_status = "cancelled"
             break
+        if state.remaining_budget()["tool_calls"] <= 0:
+            state.completion_status = "tool_budget_exhausted"
+            state.warnings.append(
+                "Agent tool budget was exhausted; continuing to bounded finalization."
+            )
+            if diagnostics_recorder is not None:
+                diagnostics_recorder.record_tool_budget_exhausted()
+            break
         if state.no_progress_count >= limits.max_no_progress_steps:
             state.completion_status = (
                 "completed" if evidence_store.all(request_id) else "insufficient_evidence"
@@ -515,27 +523,42 @@ def run_bounded_agent(
     if cancellation.cancelled:
         state.completion_status = "cancelled"
     final_llm = (
-        None
-        if state.completion_status in {"budget_exhausted", "cancelled"}
-        or state.remaining_budget()["time_ms"] <= 0
-        else llm
+        llm
+        if llm
+        and llm.available
+        and state.completion_status not in {"insufficient_evidence", "cancelled"}
+        and state.remaining_budget()["time_ms"] > 0
+        else None
     )
-    final = answer_from_evidence(
-        question,
-        evidence,
-        final_llm,
-        database,
-        retrieval_mode=state.retrieval_mode,
-        warnings=state.warnings,
-        max_answer_tokens=limits.max_final_answer_tokens,
-        answer_timeout_seconds=max(
-            0.1,
-            state.remaining_budget()["time_ms"] / 1000,
-        ),
-        relation_context=_relation_answer_context(state, valid_chains),
-        learning_context=state.context.learning_context,
-        diagnostics_recorder=diagnostics_recorder,
-    )
+    try:
+        final = answer_from_evidence(
+            question,
+            evidence,
+            final_llm,
+            database,
+            retrieval_mode=state.retrieval_mode,
+            warnings=state.warnings,
+            max_answer_tokens=limits.max_final_answer_tokens,
+            answer_timeout_seconds=max(
+                0.1,
+                state.remaining_budget()["time_ms"] / 1000,
+            ),
+            relation_context=_relation_answer_context(state, valid_chains),
+            learning_context=state.context.learning_context,
+            diagnostics_recorder=diagnostics_recorder,
+        )
+    except ProviderError as exc:
+        if diagnostics_recorder is not None:
+            if isinstance((exc.diagnostics or {}).get("http_status"), int):
+                diagnostics_recorder.record_final_answer_response()
+            diagnostics_recorder.record_agent_result(
+                {
+                    "agent_mode": "bounded",
+                    "agent_status": "final_answer_failed",
+                    "evidence": evidence,
+                }
+            )
+        raise
     post_evidence, post_chains, post_relation_warnings = _validated_relation_context(
         state, evidence_store.all(request_id), diagnostics_recorder
     )
@@ -566,13 +589,25 @@ def run_bounded_agent(
         valid_chains = post_chains
     else:
         valid_chains = post_chains
-    if not final["evidence"] and state.completion_status == "completed":
-        state.completion_status = "insufficient_evidence"
-    if state.completion_status == "insufficient_evidence":
+    if state.completion_status == "cancelled":
+        pass
+    elif state.completion_status == "insufficient_evidence":
         final["answer"] = INSUFFICIENT_ANSWER
         final["citations"] = []
         final["evidence"] = []
         final["grounding_status"] = "insufficient_evidence"
+    elif (
+        not final["evidence"]
+        and not (
+            state.completion_status == "budget_exhausted"
+            and state.remaining_budget()["time_ms"] <= 0
+        )
+    ):
+        state.completion_status = "insufficient_evidence"
+    elif final.get("answer_mode") == "llm_grounded":
+        state.completion_status = "completed"
+    elif final_llm is not None:
+        state.completion_status = "final_answer_failed"
     response = _attach_agent_fields(
         final,
         mode="bounded",
@@ -731,7 +766,7 @@ def _pre_step_stop_status(state: AgentState) -> str | None:
     ):
         return "budget_exhausted"
     if remaining["tool_calls"] <= 0:
-        return "budget_exhausted"
+        return "tool_budget_exhausted"
     if remaining["planner_tokens"] <= 0:
         return "budget_exhausted"
     return None

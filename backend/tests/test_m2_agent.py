@@ -230,7 +230,7 @@ class M2AgentTests(unittest.TestCase):
             token_usage=10,
         )
         result = self._run(planner, limits=limits)
-        self.assertEqual(result["agent_status"], "budget_exhausted")
+        self.assertEqual(result["agent_status"], "tool_budget_exhausted")
         self.assertEqual(result["budget_usage"]["tool_calls_used"], 1)
         self.assertTrue(result["evidence"])
 

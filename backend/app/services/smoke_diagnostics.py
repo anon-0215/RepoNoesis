@@ -60,7 +60,15 @@ _FINISH_REASONS = frozenset(
 _AGENT_MODES = frozenset({"bounded", "deterministic_fallback"})
 _ANSWER_MODES = frozenset({"llm_grounded", "deterministic"})
 _AGENT_STATUSES = frozenset(
-    {"completed", "degraded", "insufficient_evidence", "budget_exhausted", "cancelled"}
+    {
+        "completed",
+        "degraded",
+        "insufficient_evidence",
+        "tool_budget_exhausted",
+        "final_answer_failed",
+        "budget_exhausted",
+        "cancelled",
+    }
 )
 _TOOL_STATUSES = frozenset({"succeeded", "failed", "rejected", "timed_out", "cancelled"})
 
@@ -201,6 +209,9 @@ class SmokeDiagnosticsRecorder:
                 item["succeeded" if succeeded else "failed"]
             ) + 1
 
+    def record_tool_budget_exhausted(self) -> None:
+        self._agent["tool_budget_exhausted"] = True
+
     def record_final_answer_attempt(self) -> None:
         self.enter_stage("final_answer")
         self._agent["final_answer_attempted"] = True
@@ -281,6 +292,7 @@ def _safe_smoke_diagnostics(value: Any) -> dict[str, Any]:
         "citation_validation_completed",
         "relation_validation_completed",
         "post_generation_validation_completed",
+        "tool_budget_exhausted",
         "diagnostics_truncated",
     }
     for key in integer_keys:

@@ -140,6 +140,17 @@ Stable Gate failures use `smoke_embedding_configuration_incomplete`,
 not relax any Gate C acceptance condition and do not authorize an automatic
 retry of a paid provider request.
 
+The bounded agent treats tool execution and final answer generation as separate
+capacities. Exhausting `max_tool_calls`, the planner-token budget, or the bounded
+planning steps stops further planning/tools, but does not consume the single
+grounded finalization opportunity. If validated Evidence exists and the total
+deadline has not expired, the agent may make at most one final-answer Provider
+call using the existing `max_final_answer_tokens` limit. A validated grounded
+answer finishes as `completed`; invalid generated references finish as
+`final_answer_failed`; exhausted tools without sufficient Evidence finish as
+`insufficient_evidence`. No budget value or Gate C condition is increased or
+relaxed by this behavior.
+
 ## Current limitations
 
 - Local source must be the root of a clean Git worktree.
