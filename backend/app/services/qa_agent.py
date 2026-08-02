@@ -16,6 +16,7 @@ from app.services.evidence import (
 from app.services.hybrid_retriever import DEFAULT_EVIDENCE_COUNT
 from app.services.hierarchy_normalization import HIERARCHY_MODE_OFF
 from app.services.llm_client import LLMClient
+from app.services.smoke_diagnostics import SmokeDiagnosticsRecorder
 from app.services.retrieval_v2 import RETRIEVAL_VERSION_V1, retrieve_code
 from app.services.relation_retrieval import (
     RELATION_MODE_EXPAND_V1,
@@ -55,6 +56,7 @@ def answer_question(
     retrieval_version: str = RETRIEVAL_VERSION_V1,
     hierarchy_mode: str = HIERARCHY_MODE_OFF,
     relation_mode: str = RELATION_MODE_OFF,
+    diagnostics_recorder: SmokeDiagnosticsRecorder | None = None,
 ) -> dict[str, Any]:
     """Answer from validated code-chunk Evidence.
 
@@ -113,6 +115,7 @@ def answer_question(
         database,
         retrieval_mode=outcome.retrieval_mode,
         warnings=[*outcome.warnings, *([relation_warning] if relation_warning else [])],
+        diagnostics_recorder=diagnostics_recorder,
     )
 
 
@@ -128,6 +131,7 @@ def answer_from_evidence(
     answer_timeout_seconds: float | None = None,
     relation_context: list[dict[str, Any]] | None = None,
     learning_context: dict[str, Any] | None = None,
+    diagnostics_recorder: SmokeDiagnosticsRecorder | None = None,
 ) -> dict[str, Any]:
     """Generate an M1-compatible answer after server-controlled validation.
 
@@ -136,7 +140,11 @@ def answer_from_evidence(
     immediately before the response is built.
     """
     validator = CitationValidator(database)
+    if diagnostics_recorder is not None:
+        diagnostics_recorder.enter_stage("citation_validation")
     valid, validation_warnings = validator.validate_all(evidence)
+    if diagnostics_recorder is not None:
+        diagnostics_recorder.mark_citation_validation_completed()
     warnings = [*(warnings or []), *validation_warnings]
     if not valid:
         return _m1_response(
@@ -150,6 +158,8 @@ def answer_from_evidence(
     answer: str | None = None
     generated_with_llm = False
     if llm and llm.available:
+        if diagnostics_recorder is not None:
+            diagnostics_recorder.record_final_answer_attempt()
         candidate_answer = _answer_with_grounded_llm(
             question,
             valid,
@@ -158,7 +168,10 @@ def answer_from_evidence(
             timeout_seconds=answer_timeout_seconds,
             relation_context=relation_context,
             learning_context=learning_context,
+            diagnostics_recorder=diagnostics_recorder,
         )
+        if diagnostics_recorder is not None:
+            diagnostics_recorder.record_final_answer_response()
         if (
             candidate_answer
             and max_answer_tokens is not None
@@ -180,7 +193,11 @@ def answer_from_evidence(
 
     # Re-read the persisted snapshot immediately before returning. If the
     # project changed while generation was running, stale Evidence is removed.
+    if diagnostics_recorder is not None:
+        diagnostics_recorder.enter_stage("post_generation_validation")
     revalidated, final_warnings = validator.validate_all(valid)
+    if diagnostics_recorder is not None:
+        diagnostics_recorder.mark_post_generation_validation_completed()
     warnings.extend(final_warnings)
     if {item.evidence_id for item in revalidated} != {
         item.evidence_id for item in valid
@@ -313,6 +330,7 @@ def _answer_with_grounded_llm(
     timeout_seconds: float | None = None,
     relation_context: list[dict[str, Any]] | None = None,
     learning_context: dict[str, Any] | None = None,
+    diagnostics_recorder: SmokeDiagnosticsRecorder | None = None,
 ) -> str | None:
     source_text = "\n\n".join(
         (
@@ -333,6 +351,8 @@ def _answer_with_grounded_llm(
     )
     if answer_thinking is not None:
         chat_arguments["thinking"] = answer_thinking
+    if diagnostics_recorder is not None:
+        chat_arguments["purpose"] = "final_answer"
     return llm.chat(
         [
             {

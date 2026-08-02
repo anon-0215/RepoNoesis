@@ -28,6 +28,7 @@ from app.services.repository_import import (
     import_local_repository,
     import_public_git_repository,
 )
+from app.services.smoke_diagnostics import SmokeDiagnosticsRecorder, SmokeGateError
 
 
 def main() -> int:
@@ -38,37 +39,58 @@ def main() -> int:
     gate.add_argument("--gate-c", action="store_true", help="real configured provider gate")
     args = parser.parse_args()
     load_environment()
+    gate_name = "C" if args.gate_c else ("B" if args.gate_b else "A")
+    diagnostics_recorder = SmokeDiagnosticsRecorder()
+    diagnostics_recorder.enter_stage(
+        "repository_import" if args.gate_b else "fixture_creation"
+    )
     try:
         if args.gate_b:
+            diagnostics_recorder.enter_stage("repository_import")
             imported = import_public_git_repository(args.gate_b, get_repository_settings())
-            report = _run_pipeline(imported.snapshot, require_provider=False)
+            report = _run_pipeline(
+                imported.snapshot,
+                require_provider=False,
+                gate=gate_name,
+                diagnostics_recorder=diagnostics_recorder,
+            )
             report["gate"] = "B"
             report["source_type"] = "git_url"
         else:
             with tempfile.TemporaryDirectory(prefix="reponoesis-smoke-") as directory:
+                diagnostics_recorder.enter_stage("fixture_creation")
                 fixture = _create_fixture(Path(directory))
+                diagnostics_recorder.enter_stage("repository_import")
                 imported = import_local_repository(str(fixture), get_repository_settings())
                 report = _run_pipeline(
                     imported.snapshot,
                     require_provider=bool(args.gate_c),
+                    gate=gate_name,
+                    diagnostics_recorder=diagnostics_recorder,
                 )
             report["gate"] = "C" if args.gate_c else "A"
             report["source_type"] = "local"
         print(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True))
         return 0
+    except SmokeGateError as exc:
+        print(json.dumps(exc.to_safe_dict(), ensure_ascii=False, indent=2, sort_keys=True))
+        return 1
     except (RepositoryImportError, ProviderError) as exc:
         payload = exc.to_safe_dict()
-        payload["gate"] = "C" if args.gate_c else ("B" if args.gate_b else "A")
+        payload["gate"] = gate_name
         print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
         return 2
     except Exception as exc:
+        error = SmokeGateError(
+            code="smoke_stage_failed",
+            gate=gate_name,
+            stage=diagnostics_recorder.stage,
+            exception_type=type(exc).__name__,
+            diagnostics=diagnostics_recorder.snapshot(),
+        )
         print(
             json.dumps(
-                {
-                    "code": "smoke_gate_failed",
-                    "message": f"Smoke gate failed with {type(exc).__name__}.",
-                    "gate": "C" if args.gate_c else ("B" if args.gate_b else "A"),
-                },
+                error.to_safe_dict(),
                 ensure_ascii=False,
                 indent=2,
                 sort_keys=True,
@@ -77,28 +99,59 @@ def main() -> int:
         return 1
 
 
-def _run_pipeline(snapshot: Any, *, require_provider: bool) -> dict[str, Any]:
-    llm = LLMClient(get_llm_settings()) if require_provider else None
+def _run_pipeline(
+    snapshot: Any,
+    *,
+    require_provider: bool,
+    gate: str = "C",
+    diagnostics_recorder: SmokeDiagnosticsRecorder | None = None,
+) -> dict[str, Any]:
+    diagnostics_recorder = diagnostics_recorder or SmokeDiagnosticsRecorder()
+    diagnostics_recorder.enter_stage("provider_preflight")
+    llm = (
+        LLMClient(
+            get_llm_settings(), diagnostics_recorder=diagnostics_recorder
+        )
+        if require_provider
+        else None
+    )
     if llm is not None:
         llm.require_available()
+    diagnostics_recorder.enter_stage("embedding_preflight")
     settings = get_embedding_settings()
     if not settings.enabled or not settings.offline or settings.provider != "local_bge_m3":
-        raise RuntimeError("embedding product configuration is incomplete")
+        raise SmokeGateError(
+            code="smoke_embedding_configuration_incomplete",
+            gate=gate,
+            stage="embedding_preflight",
+            exception_type="RuntimeError",
+            diagnostics=diagnostics_recorder.snapshot(),
+        )
     embedding = EmbeddingService(settings)
     with tempfile.TemporaryDirectory(prefix="reponoesis-smoke-db-") as database_dir:
+        diagnostics_recorder.enter_stage("repository_persistence")
         database = Database(Path(database_dir) / "smoke.sqlite")
         project_id = database.create_project(snapshot.to_dict())
+        diagnostics_recorder.enter_stage("source_analysis")
         analysis = analyze_snapshot(snapshot)
+        diagnostics_recorder.enter_stage("chunk_extraction")
         chunks = extract_python_code_chunks_from_files(
             snapshot.files, snapshot.repository_revision
         )
         if not chunks.chunks:
-            raise RuntimeError("no Python chunks were produced")
+            raise SmokeGateError(
+                code="smoke_no_python_chunks",
+                gate=gate,
+                stage="chunk_extraction",
+                exception_type="RuntimeError",
+                diagnostics=diagnostics_recorder.snapshot(),
+            )
         files = [file.to_dict() for file in snapshot.files]
         public = {file["path"]: file for file in analysis["files"]}
         for file in files:
             if file["path"] in public:
                 file.update(public[file["path"]])
+        diagnostics_recorder.enter_stage("repository_persistence")
         database.save_analysis(
             project_id,
             analysis,
@@ -110,8 +163,11 @@ def _run_pipeline(snapshot: Any, *, require_provider: bool) -> dict[str, Any]:
             ),
             [chunk.to_dict() for chunk in chunks.chunks],
         )
+        diagnostics_recorder.enter_stage("relation_index")
         relation = index_project_relations(database, project_id)
+        diagnostics_recorder.enter_stage("embedding_index")
         embedding_result = EmbeddingIndexer(database, embedding).index_project(project_id)
+        diagnostics_recorder.enter_stage("agent_setup")
         bundle = database.get_bundle(project_id)
         assert bundle is not None
         question = (
@@ -128,14 +184,30 @@ def _run_pipeline(snapshot: Any, *, require_provider: bool) -> dict[str, Any]:
             evidence_count=5,
             limits=get_agent_limits(),
             retrieval_version="v2",
+            diagnostics_recorder=diagnostics_recorder,
         )
+        diagnostics_recorder.record_agent_result(result)
+        diagnostics_recorder.enter_stage("gate_assertion")
         if not result.get("citations") or not result.get("evidence"):
-            raise RuntimeError("validated evidence citations were not produced")
+            raise SmokeGateError(
+                code="smoke_validated_evidence_missing",
+                gate=gate,
+                stage="gate_assertion",
+                exception_type="RuntimeError",
+                diagnostics=diagnostics_recorder.snapshot(),
+            )
         if require_provider and (
             result.get("answer_mode") != "llm_grounded"
             or result.get("agent_mode") != "bounded"
         ):
-            raise RuntimeError("provider answer did not pass the bounded grounding gate")
+            raise SmokeGateError(
+                code="smoke_provider_grounding_failed",
+                gate=gate,
+                stage="gate_assertion",
+                exception_type="RuntimeError",
+                diagnostics=diagnostics_recorder.snapshot(),
+            )
+        diagnostics_recorder.enter_stage("report_build")
         identity = embedding.get_effective_embedding_identity()
         return {
             "status": "pass",

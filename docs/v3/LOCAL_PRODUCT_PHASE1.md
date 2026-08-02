@@ -120,6 +120,26 @@ product provider, and passes only if the final result is both `agent_mode=bounde
 and `answer_mode=llm_grounded` with validated Evidence/citations. Deterministic
 fallbacks, mock providers, and M5 evaluation providers cannot satisfy it.
 
+### Safe Gate C diagnostics
+
+Gate C injects a request-local, size-bounded diagnostics recorder. It reports
+only fixed stage names, stable error codes, exception type names, counters,
+booleans, enum values, safe HTTP/usage numbers, and response field/type
+metadata. The recorder is disabled for normal API requests unless explicitly
+injected, and its fields never participate in agent decisions.
+
+Smoke diagnostics never contain prompts, messages, request or response bodies,
+generated content, reasoning content, source or Evidence text, tool arguments or
+results, headers, authorization data, credentials, or derived properties such as
+their lengths, excerpts, summaries, or hashes. Provider and repository import
+errors retain their existing safe error payloads.
+
+Stable Gate failures use `smoke_embedding_configuration_incomplete`,
+`smoke_no_python_chunks`, `smoke_validated_evidence_missing`,
+`smoke_provider_grounding_failed`, or `smoke_stage_failed`. These diagnostics do
+not relax any Gate C acceptance condition and do not authorize an automatic
+retry of a paid provider request.
+
 ## Current limitations
 
 - Local source must be the root of a clean Git worktree.

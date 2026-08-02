@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from typing import Any, Callable
 
 from app.config import LLMSettings, ThinkingMode, get_llm_settings
+from app.services.smoke_diagnostics import ProviderPurpose, SmokeDiagnosticsRecorder
 
 
 @dataclass(frozen=True)
@@ -54,6 +55,7 @@ class LLMClient:
         *,
         opener: Callable[..., Any] | None = None,
         sleep: Callable[[float], None] | None = None,
+        diagnostics_recorder: SmokeDiagnosticsRecorder | None = None,
     ) -> None:
         self.settings = settings or get_llm_settings()
         self.base_url = self.settings.base_url
@@ -61,6 +63,7 @@ class LLMClient:
         self.model = self.settings.model
         self._opener = opener or urllib.request.urlopen
         self._sleep = sleep or time.sleep
+        self._diagnostics_recorder = diagnostics_recorder
 
     @property
     def available(self) -> bool:
@@ -88,6 +91,7 @@ class LLMClient:
         max_tokens: int | None = None,
         timeout_seconds: float | None = None,
         thinking: ThinkingMode | None = None,
+        purpose: ProviderPurpose | None = None,
     ) -> str | None:
         self.require_available()
         if thinking not in {None, "enabled", "disabled"}:
@@ -109,6 +113,11 @@ class LLMClient:
             },
             method="POST",
         )
+        provider_call_id = (
+            self._diagnostics_recorder.start_provider_call(purpose)
+            if self._diagnostics_recorder is not None and purpose is not None
+            else None
+        )
         timeout = max(
             0.1,
             min(
@@ -124,14 +133,25 @@ class LLMClient:
                 # not the timeout. Keep this keyword-only so request.data remains JSON.
                 with self._opener(request, timeout=timeout) as response:
                     http_status = _response_status(response)
+                    self._record_provider_metadata(
+                        provider_call_id,
+                        {"response_received": True, "http_status": http_status},
+                    )
                     data: Any = json.loads(response.read().decode("utf-8"))
                 return _parse_chat_content(
                     data,
                     http_status=http_status,
                     provider=self.provider_name,
                     model=self.model,
+                    diagnostics_callback=lambda metadata: self._record_provider_metadata(
+                        provider_call_id, metadata
+                    ),
                 )
             except urllib.error.HTTPError as exc:
+                self._record_provider_metadata(
+                    provider_call_id,
+                    {"response_received": True, "http_status": exc.code},
+                )
                 error = _http_error(exc.code)
             except (TimeoutError, urllib.error.URLError):
                 error = ProviderError(
@@ -141,6 +161,10 @@ class LLMClient:
                     status_code=503,
                 )
             except (UnicodeDecodeError, json.JSONDecodeError, TypeError) as exc:
+                self._record_provider_metadata(
+                    provider_call_id,
+                    {"response_json_valid": False},
+                )
                 raise _invalid_response_error(
                     {
                         "provider": self.provider_name,
@@ -153,6 +177,12 @@ class LLMClient:
                 raise error
             self._sleep(min(0.25 * (2**attempt), 1.0))
         raise ProviderError("provider_unavailable", "The generation provider is unavailable.")
+
+    def _record_provider_metadata(
+        self, call_id: int | None, metadata: dict[str, Any]
+    ) -> None:
+        if self._diagnostics_recorder is not None:
+            self._diagnostics_recorder.record_provider_response(call_id, metadata)
 
 
 def _chat_completions_url(base_url: str) -> str:
@@ -168,100 +198,111 @@ def _parse_chat_content(
     http_status: int | None = None,
     provider: str | None = None,
     model: str | None = None,
+    diagnostics_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> str:
     diagnostics: dict[str, Any] = {
         "provider": provider,
         "model": model,
         "http_status": http_status,
+        "response_json_valid": True,
         "top_level_type": _json_type(data),
     }
-    if not isinstance(data, dict):
-        raise _invalid_response_error(diagnostics)
+    try:
+        if not isinstance(data, dict):
+            raise _invalid_response_error(diagnostics)
 
-    choices_present = "choices" in data
-    choices = data.get("choices")
-    diagnostics.update(
-        {
-            "choices_present": choices_present,
-            "choices_type": _json_type(choices),
-            "choices_count": len(choices) if isinstance(choices, list) else None,
-        }
-    )
-    diagnostics["usage"] = _safe_usage(data.get("usage"))
-    if not isinstance(choices, list) or not choices:
-        raise _invalid_response_error(diagnostics)
-
-    first = choices[0]
-    diagnostics["choice_0_type"] = _json_type(first)
-    if not isinstance(first, dict):
-        raise _invalid_response_error(diagnostics)
-
-    finish_reason_present = "finish_reason" in first
-    finish_reason = first.get("finish_reason")
-    diagnostics.update(
-        {
-            "finish_reason_present": finish_reason_present,
-            "finish_reason_type": _json_type(finish_reason),
-        }
-    )
-    if isinstance(finish_reason, str) or finish_reason is None:
-        diagnostics["finish_reason"] = (
-            finish_reason
-            if finish_reason
-            in {"stop", "length", "tool_calls", "content_filter", "function_call"}
-            else "other"
-            if finish_reason is not None
-            else None
+        choices_present = "choices" in data
+        choices = data.get("choices")
+        diagnostics.update(
+            {
+                "choices_present": choices_present,
+                "choices_type": _json_type(choices),
+                "choices_count": len(choices) if isinstance(choices, list) else None,
+            }
         )
-    else:
-        raise _invalid_response_error(diagnostics)
+        diagnostics["usage"] = _safe_usage(data.get("usage"))
+        if not isinstance(choices, list) or not choices:
+            raise _invalid_response_error(diagnostics)
 
-    message_present = "message" in first
-    message = first.get("message")
-    diagnostics.update(
-        {
-            "message_present": message_present,
-            "message_type": _json_type(message),
-        }
-    )
-    if not isinstance(message, dict):
-        raise _invalid_response_error(diagnostics)
+        first = choices[0]
+        diagnostics["choice_0_type"] = _json_type(first)
+        if not isinstance(first, dict):
+            raise _invalid_response_error(diagnostics)
 
-    content_present = "content" in message
-    content = message.get("content")
-    content_valid_type = isinstance(content, str) or content is None
-    content_empty = content is None or (isinstance(content, str) and not content.strip())
-    reasoning_present = "reasoning_content" in message
-    reasoning = message.get("reasoning_content")
-    reasoning_valid_type = isinstance(reasoning, str) or reasoning is None
-    diagnostics.update(
-        {
-            "content_present": content_present,
-            "content_type": _json_type(content),
-            "content_empty": content_empty,
-            "reasoning_content_present": reasoning_present,
-            "reasoning_content_type": _json_type(reasoning),
-        }
-    )
-    if not content_valid_type or (reasoning_present and not reasoning_valid_type):
+        finish_reason_present = "finish_reason" in first
+        finish_reason = first.get("finish_reason")
+        diagnostics.update(
+            {
+                "finish_reason_present": finish_reason_present,
+                "finish_reason_type": _json_type(finish_reason),
+            }
+        )
+        if isinstance(finish_reason, str) or finish_reason is None:
+            diagnostics["finish_reason"] = (
+                finish_reason
+                if finish_reason
+                in {"stop", "length", "tool_calls", "content_filter", "function_call"}
+                else "other"
+                if finish_reason is not None
+                else None
+            )
+        else:
+            raise _invalid_response_error(diagnostics)
+
+        message_present = "message" in first
+        message = first.get("message")
+        diagnostics.update(
+            {
+                "message_present": message_present,
+                "message_type": _json_type(message),
+            }
+        )
+        if not isinstance(message, dict):
+            raise _invalid_response_error(diagnostics)
+
+        content_present = "content" in message
+        content = message.get("content")
+        content_valid_type = isinstance(content, str) or content is None
+        content_empty = content is None or (
+            isinstance(content, str) and not content.strip()
+        )
+        reasoning_present = "reasoning_content" in message
+        reasoning = message.get("reasoning_content")
+        reasoning_valid_type = isinstance(reasoning, str) or reasoning is None
+        diagnostics.update(
+            {
+                "content_present": content_present,
+                "content_type": _json_type(content),
+                "content_empty": content_empty,
+                "reasoning_content_present": reasoning_present,
+                "reasoning_content_type": _json_type(reasoning),
+            }
+        )
+        if not content_valid_type or (reasoning_present and not reasoning_valid_type):
+            raise _invalid_response_error(diagnostics)
+        if isinstance(content, str) and content.strip():
+            if diagnostics_callback is not None:
+                diagnostics_callback(_compact_diagnostics(diagnostics))
+            return content.strip()
+        if finish_reason == "length":
+            raise ProviderError(
+                "provider_output_truncated",
+                "The generation provider reached the configured output limit before returning final content.",
+                retryable=False,
+                diagnostics=_compact_diagnostics(diagnostics),
+            )
+        if finish_reason == "stop":
+            raise ProviderError(
+                "provider_empty_content",
+                "The generation provider completed without final answer content.",
+                retryable=False,
+                diagnostics=_compact_diagnostics(diagnostics),
+            )
         raise _invalid_response_error(diagnostics)
-    if isinstance(content, str) and content.strip():
-        return content.strip()
-    if finish_reason == "length":
-        raise ProviderError(
-            "provider_output_truncated",
-            "The generation provider reached the configured output limit before returning final content.",
-            retryable=False,
-            diagnostics=_compact_diagnostics(diagnostics),
-        )
-    if finish_reason == "stop":
-        raise ProviderError(
-            "provider_empty_content",
-            "The generation provider completed without final answer content.",
-            retryable=False,
-            diagnostics=_compact_diagnostics(diagnostics),
-        )
-    raise _invalid_response_error(diagnostics)
+    except ProviderError:
+        if diagnostics_callback is not None:
+            diagnostics_callback(_compact_diagnostics(diagnostics))
+        raise
 
 
 def _invalid_response_error(diagnostics: dict[str, Any]) -> ProviderError:

@@ -54,6 +54,7 @@ from app.services.retrieval_v2 import (
     RETRIEVAL_VERSION_V1,
     validate_retrieval_version,
 )
+from app.services.smoke_diagnostics import SmokeDiagnosticsRecorder
 
 logger = logging.getLogger(__name__)
 
@@ -116,10 +117,17 @@ class AgentState:
 
 
 class LLMPlanner:
-    def __init__(self, llm: LLMClient, registry: ToolRegistry, limits: AgentLimits) -> None:
+    def __init__(
+        self,
+        llm: LLMClient,
+        registry: ToolRegistry,
+        limits: AgentLimits,
+        diagnostics_recorder: SmokeDiagnosticsRecorder | None = None,
+    ) -> None:
         self.llm = llm
         self.registry = registry
         self.limits = limits
+        self.diagnostics_recorder = diagnostics_recorder
 
     def decide(
         self,
@@ -150,6 +158,8 @@ class LLMPlanner:
         )
         if planner_thinking is not None:
             chat_arguments["thinking"] = planner_thinking
+        if self.diagnostics_recorder is not None:
+            chat_arguments["purpose"] = "planner"
         response = self.llm.chat(
             [
                 {
@@ -221,6 +231,7 @@ def run_bounded_agent(
     retrieval_version: str = RETRIEVAL_VERSION_V1,
     hierarchy_mode: str = HIERARCHY_MODE_OFF,
     relation_mode: str = RELATION_MODE_OFF,
+    diagnostics_recorder: SmokeDiagnosticsRecorder | None = None,
 ) -> dict[str, Any]:
     retrieval_version = validate_retrieval_version(retrieval_version)
     hierarchy_mode = validate_hierarchy_mode(
@@ -237,6 +248,11 @@ def run_bounded_agent(
     request_id = str(uuid.uuid4())
     evidence_store = EvidenceStore()
     registry = registry or build_m2_tool_registry(limits)
+    if diagnostics_recorder is not None:
+        diagnostics_recorder.enter_stage("agent_setup")
+        diagnostics_recorder.begin_agent(
+            [item["name"] for item in registry.list_tools()]
+        )
     try:
         context = build_tool_context(
             request_id=request_id,
@@ -266,6 +282,7 @@ def run_bounded_agent(
             retrieval_version=retrieval_version,
             hierarchy_mode=hierarchy_mode,
             relation_mode=relation_mode,
+            diagnostics_recorder=diagnostics_recorder,
         )
         result["warnings"] = [
             *result["warnings"],
@@ -282,10 +299,16 @@ def run_bounded_agent(
             planner_usage_mode="estimated",
             limits=limits,
         )
-        return _attach_learning_fields(response, learning_context)
+        response = _attach_learning_fields(response, learning_context)
+        if diagnostics_recorder is not None:
+            diagnostics_recorder.record_fallback("context_binding_failed")
+            diagnostics_recorder.record_agent_result(response)
+        return response
 
     if planner is None:
         if not llm or not llm.available:
+            if diagnostics_recorder is not None:
+                diagnostics_recorder.record_fallback("llm_unavailable")
             return _run_deterministic_fallback(
                 question=question,
                 llm=llm,
@@ -301,8 +324,9 @@ def run_bounded_agent(
                 language=language,
                 symbol=symbol,
                 evidence_count=evidence_count,
+                diagnostics_recorder=diagnostics_recorder,
             )
-        planner = LLMPlanner(llm, registry, limits)
+        planner = LLMPlanner(llm, registry, limits, diagnostics_recorder)
 
     state = AgentState(
         request_id=request_id,
@@ -324,12 +348,16 @@ def run_bounded_agent(
         if stop_status:
             state.completion_status = stop_status
             break
-        decision, decision_error = _get_valid_decision(planner, state)
+        decision, decision_error = _get_valid_decision(
+            planner, state, diagnostics_recorder
+        )
         if decision is None:
             if "budget exhausted" in decision_error:
                 state.completion_status = "budget_exhausted"
                 state.warnings.append(decision_error)
                 break
+            if diagnostics_recorder is not None:
+                diagnostics_recorder.record_fallback("planner_validation_failed")
             return _run_deterministic_fallback(
                 question=question,
                 llm=llm,
@@ -349,6 +377,7 @@ def run_bounded_agent(
                     "Planner decision failed validation; used deterministic "
                     f"fallback: {decision_error}."
                 ),
+                diagnostics_recorder=diagnostics_recorder,
             )
 
         if state.context.cancellation.cancelled:
@@ -406,6 +435,8 @@ def run_bounded_agent(
         )
         state.tool_call_count += 1
         state.tool_counts[action] = state.tool_counts.get(action, 0) + 1
+        if diagnostics_recorder is not None:
+            diagnostics_recorder.record_tool_attempt(action)
         fingerprint = _fingerprint(
             context, action, call.tool_version, arguments
         )
@@ -423,6 +454,8 @@ def run_bounded_agent(
             observation = registry.execute(context, call)
             call.parameters = _sanitize_parameters(arguments)
             state.fingerprints[fingerprint] = observation.status
+        if diagnostics_recorder is not None:
+            diagnostics_recorder.record_tool_result(action, observation.status)
         logger.info(
             "agent_tool_call",
             extra={
@@ -468,7 +501,7 @@ def run_bounded_agent(
         state.completion_status = "budget_exhausted"
     evidence = evidence_store.all(request_id)
     evidence, valid_chains, relation_warnings = _validated_relation_context(
-        state, evidence
+        state, evidence, diagnostics_recorder
     )
     state.warnings.extend(relation_warnings)
     evidence, evidence_truncated = _bounded_evidence_context(
@@ -501,9 +534,10 @@ def run_bounded_agent(
         ),
         relation_context=_relation_answer_context(state, valid_chains),
         learning_context=state.context.learning_context,
+        diagnostics_recorder=diagnostics_recorder,
     )
     post_evidence, post_chains, post_relation_warnings = _validated_relation_context(
-        state, evidence_store.all(request_id)
+        state, evidence_store.all(request_id), diagnostics_recorder
     )
     state.warnings.extend(post_relation_warnings)
     if {item.chain_id for item in post_chains} != {
@@ -527,6 +561,7 @@ def run_bounded_agent(
             ),
             relation_context=_relation_answer_context(state, post_chains),
             learning_context=state.context.learning_context,
+            diagnostics_recorder=diagnostics_recorder,
         )
         valid_chains = post_chains
     else:
@@ -551,6 +586,8 @@ def run_bounded_agent(
     )
     response = _attach_relation_fields(response, state, valid_chains)
     response = _attach_learning_fields(response, state.context.learning_context)
+    if diagnostics_recorder is not None:
+        diagnostics_recorder.record_agent_result(response)
     logger.info(
         "agent_run_completed",
         extra={
@@ -570,16 +607,21 @@ def run_bounded_agent(
 def _get_valid_decision(
     planner: Planner,
     state: AgentState,
+    diagnostics_recorder: SmokeDiagnosticsRecorder | None = None,
 ) -> tuple[PlannerDecision | None, str]:
     last_error = "planner unavailable"
     repair_hint: str | None = None
     for _attempt in range(2):
         if state.planner_token_usage >= state.limits.max_total_planner_output_tokens:
             return None, "planner token budget exhausted"
+        if diagnostics_recorder is not None:
+            diagnostics_recorder.record_planner_request(repair=repair_hint is not None)
         raw, token_usage = planner.decide(
             _planner_state(state),
             repair_hint=repair_hint,
         )
+        if diagnostics_recorder is not None:
+            diagnostics_recorder.record_planner_response(raw is not None)
         token_usage = max(0, int(token_usage))
         state.planner_token_usage += token_usage
         if token_usage > state.limits.max_planner_output_tokens_per_step:
@@ -600,8 +642,12 @@ def _get_valid_decision(
                 decision.action is not None or decision.arguments
             ):
                 raise ValueError("terminal decisions cannot include a tool action")
+            if diagnostics_recorder is not None:
+                diagnostics_recorder.record_planner_validation(True)
             return decision, ""
         except (ValidationError, ValueError, json.JSONDecodeError) as exc:
+            if diagnostics_recorder is not None:
+                diagnostics_recorder.record_planner_validation(False)
             last_error = type(exc).__name__
             repair_hint = last_error
     return None, last_error
@@ -981,11 +1027,18 @@ def _attach_agent_fields(
 def _validated_relation_context(
     state: AgentState,
     evidence: list[Any],
+    diagnostics_recorder: SmokeDiagnosticsRecorder | None = None,
 ) -> tuple[list[Any], list[EvidenceChain], list[str]]:
+    if diagnostics_recorder is not None:
+        diagnostics_recorder.enter_stage("citation_validation")
     valid_evidence, evidence_warnings = CitationValidator(
         state.context.database
     ).validate_all(evidence)
+    if diagnostics_recorder is not None:
+        diagnostics_recorder.mark_citation_validation_completed()
     valid_ids = {item.evidence_id for item in valid_evidence}
+    if diagnostics_recorder is not None:
+        diagnostics_recorder.enter_stage("relation_validation")
     chains, relation_warnings = RelationValidator(
         state.context.database
     ).validate_chains(
@@ -998,6 +1051,8 @@ def _validated_relation_context(
             item.code_chunk_id: item.evidence_id for item in valid_evidence
         },
     )
+    if diagnostics_recorder is not None:
+        diagnostics_recorder.mark_relation_validation_completed()
     all_relation_ids = state.context.chain_store.supporting_ids(state.request_id)
     valid_relation_ids = {
         evidence_id
@@ -1164,6 +1219,7 @@ def _run_deterministic_fallback(
     symbol: str | None,
     evidence_count: int,
     warning: str | None = None,
+    diagnostics_recorder: SmokeDiagnosticsRecorder | None = None,
 ) -> dict[str, Any]:
     steps = list(existing_steps)
     tool_calls = existing_tool_calls
@@ -1202,7 +1258,11 @@ def _run_deterministic_fallback(
                 "max_bytes": limits.max_observation_bytes,
             },
         )
+        if diagnostics_recorder is not None:
+            diagnostics_recorder.record_tool_attempt("search_code")
         observation = registry.execute(context, call)
+        if diagnostics_recorder is not None:
+            diagnostics_recorder.record_tool_result("search_code", observation.status)
         tool_calls += 1
         logger.info(
             "agent_tool_call",
@@ -1271,7 +1331,7 @@ def _run_deterministic_fallback(
             planner_token_usage=planner_tokens,
         )
         evidence, valid_chains, relation_warnings = _validated_relation_context(
-            relation_state, evidence
+            relation_state, evidence, diagnostics_recorder
         )
         warnings.extend(relation_warnings)
     final_llm = (
@@ -1300,11 +1360,13 @@ def _run_deterministic_fallback(
             if relation_state is not None
             else None
         ),
+        diagnostics_recorder=diagnostics_recorder,
     )
     if relation_state is not None:
         post_evidence, post_chains, relation_warnings = _validated_relation_context(
             relation_state,
             context.evidence_store.all(context.request_id),
+            diagnostics_recorder,
         )
         warnings.extend(relation_warnings)
         if {item.chain_id for item in post_chains} != {
@@ -1326,6 +1388,7 @@ def _run_deterministic_fallback(
                     relation_state, post_chains
                 ),
                 learning_context=context.learning_context,
+                diagnostics_recorder=diagnostics_recorder,
             )
         valid_chains = post_chains
     if context.cancellation.cancelled:
@@ -1351,6 +1414,8 @@ def _run_deterministic_fallback(
     if relation_state is not None:
         response = _attach_relation_fields(response, relation_state, valid_chains)
     response = _attach_learning_fields(response, context.learning_context)
+    if diagnostics_recorder is not None:
+        diagnostics_recorder.record_agent_result(response)
     logger.info(
         "agent_run_completed",
         extra={

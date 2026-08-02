@@ -7,6 +7,7 @@ import urllib.error
 
 from app.config import LLMSettings
 from app.services.llm_client import LLMClient, ProviderError
+from app.services.smoke_diagnostics import SmokeDiagnosticsRecorder
 
 
 class _Response:
@@ -202,6 +203,71 @@ class OpenAICompatibleProviderTests(unittest.TestCase):
         self.assertNotIn("reasoning_effort", captured)
         self.assertNotIn("response_format", captured)
         self.assertNotIn("stream", captured)
+
+    def test_successful_response_records_only_safe_provider_metadata(self):
+        recorder = SmokeDiagnosticsRecorder()
+        payload = {
+            "choices": [
+                {
+                    "finish_reason": "stop",
+                    "message": {
+                        "content": "sensitive-content-body",
+                        "reasoning_content": "sensitive-reasoning-body",
+                    },
+                }
+            ],
+            "usage": {"prompt_tokens": 4, "completion_tokens": 5, "total_tokens": 9},
+        }
+        client = LLMClient(
+            _settings(),
+            opener=lambda *_args, **_kwargs: _Response(payload),
+            sleep=lambda _value: None,
+            diagnostics_recorder=recorder,
+        )
+        self.assertEqual(
+            client.chat([{"role": "user", "content": "secret prompt"}], purpose="planner"),
+            "sensitive-content-body",
+        )
+
+        diagnostics = recorder.snapshot()["provider_calls"][0]
+        self.assertEqual(diagnostics["purpose"], "planner")
+        self.assertTrue(diagnostics["request_started"])
+        self.assertTrue(diagnostics["response_received"])
+        self.assertEqual(diagnostics["http_status"], 200)
+        self.assertTrue(diagnostics["response_json_valid"])
+        self.assertTrue(diagnostics["choices_present"])
+        self.assertEqual(diagnostics["choices_count"], 1)
+        self.assertEqual(diagnostics["finish_reason"], "stop")
+        self.assertEqual(diagnostics["usage"]["total_tokens"], 9)
+        self.assertTrue(diagnostics["content_present"])
+        self.assertFalse(diagnostics["content_empty"])
+        self.assertEqual(diagnostics["content_type"], "string")
+        self.assertTrue(diagnostics["reasoning_content_present"])
+        self.assertEqual(diagnostics["reasoning_content_type"], "string")
+        serialized = json.dumps(diagnostics)
+        self.assertNotIn("sensitive-content-body", serialized)
+        self.assertNotIn("sensitive-reasoning-body", serialized)
+        self.assertNotIn("secret prompt", serialized)
+
+    def test_failure_before_response_does_not_invent_status_or_usage(self):
+        recorder = SmokeDiagnosticsRecorder()
+
+        def opener(_request, *, timeout):
+            raise urllib.error.URLError("offline-test-failure")
+
+        client = LLMClient(
+            _settings(max_retries=0),
+            opener=opener,
+            sleep=lambda _value: None,
+            diagnostics_recorder=recorder,
+        )
+        with self.assertRaises(ProviderError):
+            client.chat([{"role": "user", "content": "hello"}], purpose="planner")
+        diagnostics = recorder.snapshot()["provider_calls"][0]
+        self.assertTrue(diagnostics["request_started"])
+        self.assertFalse(diagnostics["response_received"])
+        self.assertNotIn("http_status", diagnostics)
+        self.assertNotIn("usage", diagnostics)
 
     def test_retryable_status_has_bounded_retries(self):
         calls = []
