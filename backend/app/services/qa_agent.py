@@ -184,6 +184,9 @@ def answer_from_evidence(
                 _validate_grounded_answer_references(candidate_answer, valid)
             )
             if diagnostics_recorder is not None:
+                diagnostics_recorder.mark_grounded_reference_validation_completed(
+                    passed=reference_valid
+                )
                 diagnostics_recorder.record_grounded_answer_candidate(
                     received=True,
                     citation_count=citation_count,
@@ -473,21 +476,42 @@ def _validate_grounded_answer_references(
     answer: str,
     evidence: list[Evidence],
 ) -> tuple[bool, str | None, int]:
-    valid_ids = {item.evidence_id for item in evidence}
+    evidence_by_id = {item.evidence_id: item for item in evidence}
+    valid_ids = set(evidence_by_id)
     used_ids = set(re.findall(r"\[(E\d+)\]", answer))
     if not used_ids:
         citation_like = bool(re.search(r"(?<![A-Za-z0-9_])E\d+", answer))
         return False, "citation_format_invalid" if citation_like else "citation_missing", 0
     if not used_ids.issubset(valid_ids):
         return False, "citation_unknown", len(used_ids)
-    locations = {
+    valid_locations = {
         f"{item.path}:{item.start_line}-{item.end_line}" for item in evidence
     }
     mentioned_locations = set(
         re.findall(r"(?<![\w/.-])([\w./-]+\.py:\d+-\d+)", answer)
     )
-    if not mentioned_locations or not mentioned_locations.issubset(locations):
-        return False, "citation_validation_failed", len(used_ids)
+    if not mentioned_locations:
+        return False, "citation_location_missing", len(used_ids)
+
+    valid_paths = {item.path for item in evidence}
+    mentioned_paths = {
+        location.rsplit(":", 1)[0] for location in mentioned_locations
+    }
+    if not mentioned_paths.issubset(valid_paths):
+        return False, "citation_path_mismatch", len(used_ids)
+    if not mentioned_locations.issubset(valid_locations):
+        return False, "citation_line_range_mismatch", len(used_ids)
+
+    expected_locations = {
+        (
+            f"{evidence_by_id[evidence_id].path}:"
+            f"{evidence_by_id[evidence_id].start_line}-"
+            f"{evidence_by_id[evidence_id].end_line}"
+        )
+        for evidence_id in used_ids
+    }
+    if mentioned_locations != expected_locations:
+        return False, "citation_evidence_binding_failed", len(used_ids)
     return True, None, len(used_ids)
 
 

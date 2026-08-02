@@ -75,13 +75,32 @@ class SmokeDiagnosticsTests(unittest.TestCase):
 
     def test_final_answer_failure_reason_is_a_fixed_enum(self):
         recorder = SmokeDiagnosticsRecorder()
-        recorder.record_final_answer_failure("citation_unknown")
-        self.assertEqual(
-            recorder.snapshot()["final_answer_failure_reason_code"],
-            "citation_unknown",
-        )
+        for reason in (
+            "citation_location_missing",
+            "citation_path_mismatch",
+            "citation_line_range_mismatch",
+            "citation_evidence_binding_failed",
+        ):
+            recorder.record_final_answer_failure(reason)
+            self.assertEqual(
+                recorder.snapshot()["final_answer_failure_reason_code"],
+                reason,
+            )
         with self.assertRaises(ValueError):
             recorder.record_final_answer_failure("dynamic-sensitive-reason")
+
+    def test_candidate_reference_validation_is_optional_and_accumulates_failures(self):
+        recorder = SmokeDiagnosticsRecorder()
+        self.assertNotIn(
+            "grounded_reference_validation_completed", recorder.snapshot()
+        )
+        recorder.mark_grounded_reference_validation_completed(passed=True)
+        recorder.mark_grounded_reference_validation_completed(passed=False)
+        recorder.mark_grounded_reference_validation_completed(passed=True)
+
+        diagnostics = recorder.snapshot()
+        self.assertTrue(diagnostics["grounded_reference_validation_completed"])
+        self.assertFalse(diagnostics["grounded_reference_validation_passed"])
 
 
 if __name__ == "__main__":

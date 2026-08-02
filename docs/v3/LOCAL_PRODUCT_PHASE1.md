@@ -148,10 +148,20 @@ validation result. Candidate-level fields report whether a non-empty grounded
 candidate was received, how many syntactically valid Evidence IDs it cited, and
 whether it was ultimately accepted. The fixed
 `final_answer_failure_reason_code` enum distinguishes empty output, token-budget
-overflow, missing/malformed/unknown citations, citation binding failure,
+overflow, missing/malformed/unknown citations, missing locations, path or line
+range mismatches, Evidence-to-location binding failure,
 relation or post-generation validation failure, Provider failure, and deadline
 exhaustion. Result-level `citation_count` remains the count of citations in the
 returned answer and is deliberately separate from candidate citation counts.
+`citation_validation_*` reports persisted Evidence snapshot validation through
+`CitationValidator`; `grounded_reference_validation_*` separately reports the
+candidate string's Evidence-ID and exact-location contract. Candidate locations
+must use the exact repository-relative POSIX `path.py:start-end` supplied for
+each cited Evidence ID. No path normalization or alternate absolute/Windows
+display form is accepted.
+The older `citation_validation_failed` value remains allowlisted for previously
+recorded diagnostics, but new candidate checks emit the more specific location,
+path, line-range, or binding code.
 
 The bounded agent treats tool execution and final answer generation as separate
 capacities. Exhausting `max_tool_calls`, the planner-token budget, or the bounded

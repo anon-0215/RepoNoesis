@@ -43,6 +43,10 @@ FinalAnswerFailureReasonCode = Literal[
     "citation_format_invalid",
     "citation_unknown",
     "citation_validation_failed",
+    "citation_location_missing",
+    "citation_path_mismatch",
+    "citation_line_range_mismatch",
+    "citation_evidence_binding_failed",
     "relation_validation_failed",
     "post_generation_validation_failed",
     "provider_failed",
@@ -244,6 +248,9 @@ class SmokeDiagnosticsRecorder:
     def mark_post_generation_validation_completed(self, *, passed: bool) -> None:
         self._record_validation("post_generation_validation", passed)
 
+    def mark_grounded_reference_validation_completed(self, *, passed: bool) -> None:
+        self._record_validation("grounded_reference_validation", passed)
+
     def _record_validation(self, prefix: str, passed: bool) -> None:
         completed_key = f"{prefix}_completed"
         passed_key = f"{prefix}_passed"
@@ -346,6 +353,8 @@ def _safe_smoke_diagnostics(value: Any) -> dict[str, Any]:
         "post_generation_validation_passed",
         "grounded_answer_candidate_received",
         "grounded_answer_accepted",
+        "grounded_reference_validation_completed",
+        "grounded_reference_validation_passed",
         "diagnostics_truncated",
     }
     for key in integer_keys:

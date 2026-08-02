@@ -98,6 +98,8 @@ class AgentFinalizationTests(unittest.TestCase):
         self.assertTrue(diagnostics["post_generation_validation_passed"])
         self.assertTrue(diagnostics["grounded_answer_candidate_received"])
         self.assertTrue(diagnostics["grounded_answer_accepted"])
+        self.assertTrue(diagnostics["grounded_reference_validation_completed"])
+        self.assertTrue(diagnostics["grounded_reference_validation_passed"])
         self.assertEqual(diagnostics["grounded_candidate_citation_count"], 1)
         self.assertNotIn("final_answer_failure_reason_code", diagnostics)
         self.assertEqual(diagnostics["agent_status"], "completed")
@@ -232,7 +234,7 @@ class AgentFinalizationTests(unittest.TestCase):
             (
                 "binding",
                 "Wrong range [E1] src/auth.py:99-100.",
-                "citation_validation_failed",
+                "citation_line_range_mismatch",
             ),
         )
         for label, response, expected_reason in cases:
@@ -257,6 +259,14 @@ class AgentFinalizationTests(unittest.TestCase):
                     diagnostics["final_answer_failure_reason_code"], expected_reason
                 )
                 self.assertFalse(diagnostics["grounded_answer_accepted"])
+                self.assertTrue(diagnostics["citation_validation_completed"])
+                self.assertTrue(diagnostics["citation_validation_passed"])
+                self.assertTrue(
+                    diagnostics["grounded_reference_validation_completed"]
+                )
+                self.assertFalse(
+                    diagnostics["grounded_reference_validation_passed"]
+                )
 
     def test_empty_provider_result_records_response_empty_without_validation_fabrication(self):
         recorder = SmokeDiagnosticsRecorder()
@@ -276,6 +286,8 @@ class AgentFinalizationTests(unittest.TestCase):
         self.assertFalse(diagnostics["grounded_answer_candidate_received"])
         self.assertFalse(diagnostics["grounded_answer_accepted"])
         self.assertNotIn("grounded_candidate_citation_count", diagnostics)
+        self.assertNotIn("grounded_reference_validation_completed", diagnostics)
+        self.assertNotIn("grounded_reference_validation_passed", diagnostics)
 
     def test_citation_validation_completion_and_failure_are_distinct(self):
         outcome = retrieve_code(
