@@ -18,6 +18,7 @@ from app.services.embedding_service import (
     build_embedding_config_hash,
 )
 from app.services.learning_agent import build_learning_path
+from app.services.learning_continuity import LearningContinuityService
 from app.services.relation_analysis import index_project_relations
 from app.services.repository_import import (
     ImportedRepository,
@@ -59,6 +60,7 @@ class WorkspaceUpdateService:
         self.embedding_service = embedding_service
         self.importer = importer
         self.fail_at_phase: str | None = None
+        self.continuity_fail_before_publish = False
 
     def check_revision(self, workspace_id: str) -> dict[str, Any]:
         workspace = self._workspace(workspace_id)
@@ -252,6 +254,11 @@ class WorkspaceUpdateService:
                 source_identity=imported.source_identity,
                 stats=stats,
             )
+            continuity = LearningContinuityService(self.database)
+            continuity.fail_before_publish = self.continuity_fail_before_publish
+            transition = continuity.get_current(workspace_id)
+            if transition.get("transition_id"):
+                continuity.execute(workspace_id, str(transition["transition_id"]))
             return self.get_run(workspace_id, run_id)
         except RepositoryImportError as exc:
             self.database.fail_update_run(

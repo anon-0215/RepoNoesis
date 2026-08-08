@@ -1,6 +1,6 @@
 # 源鉴 RepoNoesis Local Product Phase 2 设计与实施记录
 
-> 状态：P2.1 与 V3·LP2.2 已完成离线实现；P2.3 仍未实施，必须另行评审。
+> 状态：P2.1、V3·LP2.2 与 V3·LP2.3 已完成离线实现；真实本地产品 Gate 仍须单独授权。
 >
 > 基线：Local Product Phase 1 代码验收提交
 > `e07bfd16e16ecbb827ab002fb9f11274013b92e3`，数据库 schema v8。
@@ -36,8 +36,8 @@ Phase 1 后的当前产品路径已经改变为：相同 source + revision 的 c
 | 仅重建变化部分 | 文件 manifest 按内容 diff；chunk 按 chunker 身份复用，Embedding 按完整有效身份复用，relation 在新 snapshot 内安全全量重建。 | 已实现安全基线；局部 relation 闭包仍未采用。 |
 | 多项目管理 | P2.1 已提供最小分页项目库和选择；搜索、归档、删除和高级组织仍未实现。 | 最小范围已实现。 |
 | 学习状态跨会话 | M4 goal/plan/task/attempt/event/state 在同一 project 下持久化并可跨后端进程恢复。 | 已实现。 |
-| 学习状态跨 revision | 新 revision 当前是新 project；不同 project 不自动合并 learner history。 | 核心功能/数据语义缺口。 |
-| M1—M4 前端 | UI 已暴露 workspace reopen 与 P2.2 显式更新状态；完整 M4 goal/plan/task/attempt/review UI 仍未实现。 | 生命周期已实现；教学工作台仍是缺口。 |
+| 学习状态跨 revision | LP2.3 使用持久化 transition、确定性 mapping、系统派生 event 与 goal/plan lineage；只继承严格等价状态。 | 已实现保守离线基线。 |
+| M1—M4 前端 | UI 已暴露 reopen、P2.2 更新和 LP2.3 continuity 状态/摘要/retry；完整 M4 教学工作台仍未实现。 | 最小连续性闭环已实现；完整教学工作台仍是缺口。 |
 | 真实 Provider/Embedding | Gate A/B/C 在 CLI smoke 中验证；Gate C 是一个很小的本地 Python fixture。没有记录真实浏览器 E2E、长期运行或多仓库矩阵。 | 验收广度/质量缺口。 |
 | 语言 | 产品级 chunk、关系和 Gate 重点是 Python；旧分析器有轻量 JS/TS 结构识别，但不是同等产品级证据链。 | 兼容性边界。 |
 | 规模 | 初始分析仍同步；P2.2 run/阶段持久化且中断后安全失败可重试，但未证明大仓库性能或阶段内续跑。 | 规模/可靠性边界。 |
@@ -47,14 +47,14 @@ Phase 1 后的当前产品路径已经改变为：相同 source + revision 的 c
 
 1. P2.1 已把稳定 workspace 与 revision-bound project 分离；V3·LP2.2 允许同一 workspace
    保存多个不可变 snapshot，并只激活一个。
-2. `project_id` 继续有意承担 snapshot 身份，M1—M4 Evidence/learning 外键不变。不同
-   revision 的学习连续性仍是 P2.3 缺口，本轮没有自动合并或伪造 mastery。
+2. `project_id` 继续有意承担 snapshot 身份，M1—M4 Evidence/learning 外键不变。LP2.3
+   通过 additive transition/mapping/lineage 连接 revision，不批量复制历史表，也不伪造 mastery。
 3. V3·LP2.2 已持久化 run、阶段、失败恢复和原子激活；本轮没有取消 API，进程/请求中断
    统一安全失败并要求用户显式 retry。
 4. 文件、chunk 和 Embedding 已组织成内容/完整配置身份驱动的增量链；relation 当前选择
    可证明正确的 snapshot 内全量重建，而非尚未证明的局部闭包更新。
-5. P2.1/P2.2 前端已形成项目选择、重启恢复、显式检查/确认、进度、失败和成功激活闭环；
-   完整教学工作台、多项目高级组织与大仓库性能仍是后续独立范围。
+5. P2.1/P2.2/LP2.3 前端已形成项目选择、重启恢复、显式检查/确认、代码激活、学习连续性
+   摘要与失败 retry 闭环；完整教学工作台、多项目高级组织与大仓库性能仍是后续独立范围。
 
 ## 2. 候选方向比较
 
@@ -347,12 +347,23 @@ chunk/embedding、正确 relation 重建、原子 activation、进度/错误/重
 
 ### P2.3：学习连续性与最小持续学习 UI
 
+**实施状态（2026-08-08）：已完成离线实现。** schema v10 additive 升级为 v11；P2.2
+激活事务同时创建绑定 A/B project、revision、activation version、稳定 learner 和 mapping
+config 的 pending transition。确定性 mapping 区分 unchanged exact、unique rename、modified、
+deleted、ambiguous、unmapped 与 incompatible；只有严格等价目标保守继承状态，modified 强制
+`needs_review`，其余不继承。旧 attempt/evaluation/Evidence/event/state 不复制或覆盖；新状态
+由无 attempt/evaluation 的 `continuity_state_derived/revision_continuity` 系统事件及 mapping
+provenance 解释。完整契约见
+[`LOCAL_PRODUCT_P2_3_CONTRACT.md`](LOCAL_PRODUCT_P2_3_CONTRACT.md)。
+最终离线记录为后端 `Ran 557 tests / OK`、前端 Vitest `9 passed`、TypeScript 与 Vite
+production build 通过；未运行网络、真实模型/Provider 或任何 Gate。
+
 **输入：** P2.2 的 previous/new snapshot lineage，以及既有 M4 goal、plan、task、attempt、
 event 和 state。
 
-**输出：** 跨 revision revalidation/carry-forward 服务；current/changed/renamed/missing/
-ambiguous 结果；needs-review 计划；前端最小 goal、当前 plan、任务、attempt、复习和 warning
-界面。
+**输出：** 持久化 transition、跨 revision revalidation/carry-forward 服务；exact/renamed/
+modified/deleted/ambiguous/unmapped/incompatible 结果；派生 goal/plan lineage、needs-review
+计划；前端 continuity 状态、影响计数、retry 和 warning 界面。
 
 **验收：**
 

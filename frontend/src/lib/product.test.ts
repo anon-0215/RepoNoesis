@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest';
 import {
   buildAnalyzePayload,
   citationLabel,
+  learningContinuityState,
   nextWorkspaceSearch,
   normalizeWorkspaceId,
   providerSummary,
@@ -112,5 +113,22 @@ describe('local product presentation', () => {
     expect(workspaceUpdateState(check, { ...run, status: 'failed' })).toBe('failed');
     expect(workspaceUpdateState(check, { ...run, status: 'succeeded', result: 'unchanged' })).toBe('unchanged');
     expect(workspaceUpdateState(check, { ...run, status: 'succeeded', result: 'activated' })).toBe('ready');
+  });
+
+  it('keeps persisted learning continuity states distinct', () => {
+    const continuity = {
+      transition_id: 'transition', workspace_id: 'workspace', activation_version: 2,
+      status: 'pending' as const, stats: {
+        total: 0, unchanged_exact: 0, renamed_exact: 0, modified: 0, deleted: 0,
+        ambiguous: 0, unmapped: 0, incompatible: 0, retained: 0, needs_review: 0,
+        history_only: 0, not_inherited: 0
+      }, error_code: '', error_message: '', retryable: false, retry_count: 0,
+      created_at: '', started_at: null, finished_at: null, updated_at: ''
+    };
+    expect(learningContinuityState(null)).toBe('not-required');
+    expect(learningContinuityState(continuity)).toBe('pending');
+    expect(learningContinuityState({ ...continuity, status: 'running' })).toBe('running');
+    expect(learningContinuityState({ ...continuity, status: 'succeeded' })).toBe('succeeded');
+    expect(learningContinuityState({ ...continuity, status: 'failed' })).toBe('failed');
   });
 });

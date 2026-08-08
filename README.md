@@ -8,8 +8,9 @@
 > Local Product Phase 2 P2.1 provides the persistent project library and
 > restart-safe workspace reopening. V3·LP2.2 now adds explicit revision checks,
 > persistent idempotent update runs, content-based incremental rebuilds and
-> atomic snapshot activation. P2.3 learning revalidation remains unimplemented;
-> the plan and exact identity/update contracts are in
+> atomic snapshot activation. V3·LP2.3 now adds persistent cross-revision
+> learning continuity, deterministic target mapping, conservative mastery
+> carry-forward, `needs_review`, and explicit retry. The plan and exact contracts are in
 > [`docs/v3/LOCAL_PRODUCT_PHASE2_PLAN.md`](docs/v3/LOCAL_PRODUCT_PHASE2_PLAN.md).
 
 面向编程初学者的 GitHub 开源项目学习 Agent。
@@ -336,6 +337,10 @@ http://127.0.0.1:8000
 | `POST` | `/api/workspaces/{workspace_id}/refresh` | 用户确认后创建或复用幂等 update run；客户端不能指定内部 snapshot ID。 |
 | `GET` | `/api/workspaces/{workspace_id}/runs/{run_id}` | 读取持久化阶段、计数和安全失败信息。 |
 | `POST` | `/api/workspaces/{workspace_id}/runs/{run_id}/retry` | 显式重试可安全恢复的失败 run。 |
+| `GET` | `/api/workspaces/{workspace_id}/learning-continuity` | 读取当前 activation 的学习连续性状态与安全计数。 |
+| `GET` | `/api/workspaces/{workspace_id}/learning-continuity/{transition_id}` | 读取持久化 transition 详情，不触发模型或分析。 |
+| `GET` | `/api/workspaces/{workspace_id}/learning-continuity/{transition_id}/targets` | 读取不含源码/Evidence 正文的 target 影响摘要。 |
+| `POST` | `/api/workspaces/{workspace_id}/learning-continuity/{transition_id}/retry` | 显式重试失败的 continuity transition。 |
 | `GET` | `/api/projects/{project_id}` | 获取项目概览、技术栈、核心文件和模块摘要。 |
 | `GET` | `/api/projects/{project_id}/map` | 获取目录树、模块关系和核心文件列表。 |
 | `GET` | `/api/projects/{project_id}/learning-path` | 获取学习路线、任务和测验。 |
@@ -435,8 +440,12 @@ P2.2 使用文件内容哈希而非 mtime 区分新增、修改、删除、重�
 一致时可复制未变化 chunk；Embedding 只有在最终输入、内容、模型/revision、维度、文本格式、
 prefix/max length 和 normalize 等完整身份一致且向量校验通过时才复用。relation 在新
 `project_id + revision` 内全量重建，避免跨 snapshot 污染。refresh 不复制、修改或重验证旧
-Evidence、attempt、evaluation、immutable event 或 mastery；这些仍绑定原 project，P2.3
-跨 revision 学习重验证尚未实现。
+Evidence、attempt、evaluation、immutable event 或 mastery。LP2.3 在激活事务中创建持久化
+continuity transition，并只用确定性 identity/hash/AST 结构规则映射学习 target：严格
+unchanged/unique rename 可派生状态，modified 强制 `needs_review`，deleted/ambiguous/
+unmapped/incompatible 不继承。旧历史仍绑定原 project；新 revision 的 continuity event
+明确标为系统派生且没有 attempt/evaluation。完整契约见
+[`docs/v3/LOCAL_PRODUCT_P2_3_CONTRACT.md`](docs/v3/LOCAL_PRODUCT_P2_3_CONTRACT.md)。
 
 后端会解析 GitHub URL，提取 `owner/repo`，然后通过 GitHub REST API 获取：
 
@@ -558,8 +567,8 @@ cd frontend
 npm run build
 ```
 
-V3·LP2.2 在 2026-08-08 的最终离线回归记录为：后端 `Ran 543 tests / OK`；前端
-Vitest `8 passed`；TypeScript `tsc --noEmit` 与 Vite production build 通过。该记录只使用
+V3·LP2.3 在 2026-08-08 的最终离线回归记录为：后端 `Ran 557 tests / OK`；前端
+Vitest `9 passed`；TypeScript 与 Vite production build 通过。该记录只使用
 临时 fixture、fake repository/fake Embedding 与静态检查，没有运行真实网络、BGE-M3、
 Provider、Gate A/B/C、P2 live Gate 或 M5 live pilot。
 
@@ -687,16 +696,17 @@ samples/demo_repositories.md
   规模和长期性能。
 - 大模型增强只支持 OpenAI 兼容接口。
 - 项目数据和 M4 学习状态可持久化，前端可通过稳定 workspace ID 重新打开；新 revision
-  使用新的不可变 project snapshot，并在完整验证后原子激活。P2.2 不合并或重验证跨 project
-  学习历史。
+  使用新的不可变 project snapshot，并在完整验证后原子激活。LP2.3 只为严格等价 target
+  派生状态，修改、歧义和不兼容目标不会继续宣称 mastered。
 - 初始分析仍同步执行；P2.2 update run 持久化阶段和安全失败状态，但没有自动轮询仓库、
   文件监听、多用户调度或任意规模性能保证。
 - 暂不执行被分析仓库代码，避免安全风险。
 
 ## 后续计划
 
-- Local Product Phase 2 P2.1 项目库/重新打开与 V3·LP2.2 revision-aware 增量刷新、
-  失败恢复和原子激活已完成离线实现；下一步只能另行评审 P2.3 学习状态重验证。详见
+- Local Product Phase 2 P2.1 项目库/重新打开、V3·LP2.2 revision-aware 增量刷新和
+  V3·LP2.3 跨版本学习连续性已完成离线实现；下一步只能单独授权真实本地产品验收或
+  OPS 仓库命名治理。详见
   [`docs/v3/LOCAL_PRODUCT_PHASE2_PLAN.md`](docs/v3/LOCAL_PRODUCT_PHASE2_PLAN.md)。
 - M5 继续作为独立的可复现实验和对照评测路线；其 live gate 未完成时不得宣称完整通过。
 - 完整学习工作台、更大仓库性能、多项目高级组织、更多语言、私有仓库认证和云多用户能力

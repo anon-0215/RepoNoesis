@@ -202,6 +202,20 @@ button:disabled {
   border-color: #d66b6b;
 }
 
+.workspace-update-card.continuity-failed {
+  border-color: #d97706;
+  background: #fffbeb;
+}
+
+.workspace-update-card.continuity-succeeded {
+  border-color: #0f766e;
+  background: #f0fdfa;
+}
+
+.continuity-summary strong {
+  color: #b45309;
+}
+
 .workspace-update-actions {
   display: flex;
   flex-wrap: wrap;

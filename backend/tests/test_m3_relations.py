@@ -37,8 +37,8 @@ class M3SchemaAndRelationTests(unittest.TestCase):
                     "SELECT name FROM sqlite_master WHERE type='index'"
                 )
             }
-        self.assertEqual(SCHEMA_VERSION, 10)
-        self.assertEqual(version, 10)
+        self.assertEqual(SCHEMA_VERSION, 11)
+        self.assertEqual(version, 11)
         self.assertTrue(
             {"relation_nodes", "code_relations", "relation_index_runs"}.issubset(
                 tables

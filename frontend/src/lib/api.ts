@@ -2,6 +2,7 @@ import type {
   ChatAnswer,
   ConfigStatus,
   LearningStep,
+  LearningContinuity,
   ProjectMap,
   ProjectResponse,
   WorkspaceDetail,
@@ -88,6 +89,20 @@ export async function retryWorkspaceUpdateRun(
 ): Promise<WorkspaceUpdateRun> {
   return request(
     `/api/workspaces/${encodeURIComponent(workspaceId)}/runs/${encodeURIComponent(runId)}/retry`,
+    { method: 'POST' }
+  );
+}
+
+export async function getLearningContinuity(workspaceId: string): Promise<LearningContinuity> {
+  return request(`/api/workspaces/${encodeURIComponent(workspaceId)}/learning-continuity`);
+}
+
+export async function retryLearningContinuity(
+  workspaceId: string,
+  transitionId: string
+): Promise<LearningContinuity> {
+  return request(
+    `/api/workspaces/${encodeURIComponent(workspaceId)}/learning-continuity/${encodeURIComponent(transitionId)}/retry`,
     { method: 'POST' }
   );
 }

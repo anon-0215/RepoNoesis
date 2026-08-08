@@ -140,6 +140,81 @@ class WorkspaceUpdateApiTests(unittest.TestCase):
         self.assertNotIn("base_project_id", properties)
         self.assertNotIn("source_location", properties)
 
+    def test_learning_continuity_api_is_server_bound_safe_and_retryable(self) -> None:
+        self.current = self._imported("b" * 40, "def value():\n    return 2\n")
+        run = self.service.start_refresh(self.workspace_id)
+        completed = self.service.execute_run(self.workspace_id, run["run_id"])
+        self.assertEqual(completed["status"], "succeeded")
+
+        current = self.main.get_workspace_learning_continuity(self.workspace_id)
+        self.assertEqual(current["status"], "succeeded")
+        self.assertNotIn("source_project_id", current)
+        self.assertNotIn("target_project_id", current)
+        self.assertNotIn("learner_id", current)
+        detail = self.main.get_learning_continuity_transition(
+            self.workspace_id, current["transition_id"]
+        )
+        self.assertEqual(detail["transition_id"], current["transition_id"])
+        impacts = self.main.get_learning_continuity_impacts(
+            self.workspace_id, current["transition_id"]
+        )
+        self.assertEqual(impacts["items"], [])
+
+        with self.assertRaises(HTTPException) as invalid:
+            self.main.get_learning_continuity_transition(self.workspace_id, "missing")
+        self.assertEqual(invalid.exception.status_code, 422)
+        self.assertEqual(
+            invalid.exception.detail["code"], "invalid_continuity_transition_id"
+        )
+        with self.assertRaises(HTTPException) as missing:
+            self.main.get_learning_continuity_transition(
+                self.workspace_id, "00000000-0000-4000-8000-000000000000"
+            )
+        self.assertEqual(missing.exception.status_code, 404)
+        self.assertEqual(
+            missing.exception.detail["code"], "continuity_transition_not_found"
+        )
+        with self.assertRaises(HTTPException) as conflict:
+            self.main.retry_learning_continuity_transition(
+                self.workspace_id, current["transition_id"], BackgroundTasks()
+            )
+        self.assertEqual(conflict.exception.status_code, 409)
+        self.assertEqual(conflict.exception.detail["code"], "continuity_not_retryable")
+
+        with self.database.connect() as conn:
+            conn.execute(
+                """
+                UPDATE learning_continuity_transitions
+                SET status='failed', retryable=1, error_code='continuity_interrupted'
+                WHERE id=?
+                """,
+                (current["transition_id"],),
+            )
+        background = BackgroundTasks()
+        retried = self.main.retry_learning_continuity_transition(
+            self.workspace_id, current["transition_id"], background
+        )
+        self.assertEqual(retried["status"], "pending")
+        asyncio.run(background())
+        self.assertEqual(
+            self.main.get_workspace_learning_continuity(self.workspace_id)["status"],
+            "succeeded",
+        )
+
+    def test_openapi_continuity_routes_accept_no_internal_identity_body(self) -> None:
+        schema = self.main.app.openapi()
+        current_path = "/api/workspaces/{workspace_id}/learning-continuity"
+        detail_path = current_path + "/{transition_id}"
+        targets_path = detail_path + "/targets"
+        retry_path = detail_path + "/retry"
+        for path in (current_path, detail_path, targets_path, retry_path):
+            self.assertIn(path, schema["paths"])
+        self.assertNotIn("requestBody", schema["paths"][retry_path]["post"])
+        properties = schema["components"]["schemas"]["LearningContinuityResponse"]["properties"]
+        self.assertNotIn("source_project_id", properties)
+        self.assertNotIn("target_project_id", properties)
+        self.assertNotIn("learner_id", properties)
+
 
 if __name__ == "__main__":
     unittest.main()

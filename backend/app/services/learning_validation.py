@@ -50,6 +50,9 @@ def project_learning_events(
             event["event_type"] == "attempt_evaluated"
             and event["provenance"] == "verified_assessment"
         ):
+            availability = "current"
+            last_revision = target["observed_revision"]
+            last_hash = target["observed_content_hash"]
             correction = corrections.get(str(event["event_id"]))
             verdict = (
                 correction.get("corrected_verdict")
@@ -84,6 +87,32 @@ def project_learning_events(
             if availability in {"changed", "missing", "ambiguous", "stale"}:
                 mastery = "needs_review"
                 review_reason = f"revision_{availability}"
+        elif (
+            event["event_type"] == "continuity_state_derived"
+            and event["provenance"] == "revision_continuity"
+        ):
+            mapping_status = str(outcome.get("mapping_status", "unmapped"))
+            availability = str(outcome.get("availability", "stale"))
+            last_revision = event["repository_revision"]
+            last_hash = str(outcome.get("content_hash", ""))
+            if mapping_status in {"unchanged_exact", "renamed_exact"}:
+                source_mastery = str(outcome.get("source_mastery_status", "unseen"))
+                mastery = source_mastery if source_mastery in {
+                    "unseen", "introduced", "practicing", "demonstrated", "mastered",
+                    "needs_review",
+                } else "needs_review"
+                passed_tasks = {
+                    f"continuity-pass-{index}"
+                    for index in range(int(outcome.get("source_verified_pass_count", 0)))
+                }
+                qualifying_tasks = {
+                    f"continuity-qualifying-{index}"
+                    for index in range(int(outcome.get("source_qualifying_pass_count", 0)))
+                }
+                review_reason = ""
+            else:
+                mastery = "needs_review"
+                review_reason = f"revision_{mapping_status}"
     return {
         "mastery_status": mastery,
         "availability": availability,

@@ -15,8 +15,10 @@ from app.learning_schema import LEARNING_SCHEMA_STATEMENTS
 
 
 DEFAULT_DB_PATH = Path(__file__).resolve().parents[1] / "data" / "gitlearn.sqlite"
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
 CODE_CHUNKER_VERSION = "python_ast_chunks_v1@1"
+LEARNING_CONTINUITY_CONFIG_IDENTITY = "learning-continuity-v1@1"
+LOCAL_CONTINUITY_LEARNER_ID = "learner-local-single-user-v1"
 UPDATE_RUN_PHASES = (
     "revision_resolution",
     "manifest_diff",
@@ -458,6 +460,7 @@ class Database:
             """
         )
         self._migrate_workspace_update_schema(conn)
+        self._migrate_learning_continuity_schema(conn)
         conn.execute(
             """
             CREATE INDEX IF NOT EXISTS idx_workspace_revisions_project
@@ -591,6 +594,113 @@ class Database:
             """
             CREATE INDEX IF NOT EXISTS idx_repository_update_runs_status
             ON repository_update_runs(status, updated_at, id)
+            """
+        )
+
+    def _migrate_learning_continuity_schema(self, conn: sqlite3.Connection) -> None:
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO learner_profiles (
+                learner_id, profile_type, status, schema_version
+            ) VALUES (?, 'local_single_user', 'active', 1)
+            """,
+            (LOCAL_CONTINUITY_LEARNER_ID,),
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS learning_continuity_transitions (
+                id TEXT PRIMARY KEY,
+                workspace_id TEXT NOT NULL,
+                source_project_id TEXT NOT NULL,
+                target_project_id TEXT NOT NULL,
+                source_revision TEXT NOT NULL,
+                target_revision TEXT NOT NULL,
+                activation_version INTEGER NOT NULL CHECK(activation_version >= 2),
+                learner_id TEXT NOT NULL,
+                mapping_config_identity TEXT NOT NULL,
+                status TEXT NOT NULL CHECK(status IN ('pending', 'running', 'succeeded', 'failed')),
+                stats_json TEXT NOT NULL DEFAULT '{}',
+                error_code TEXT NOT NULL DEFAULT '',
+                error_message TEXT NOT NULL DEFAULT '',
+                retryable INTEGER NOT NULL DEFAULT 0,
+                retry_count INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                started_at TEXT,
+                finished_at TEXT,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(workspace_id, source_project_id, target_project_id, learner_id, mapping_config_identity),
+                UNIQUE(workspace_id, activation_version, learner_id),
+                FOREIGN KEY(workspace_id) REFERENCES repository_workspaces(id) ON DELETE CASCADE,
+                FOREIGN KEY(source_project_id) REFERENCES projects(id) ON DELETE RESTRICT,
+                FOREIGN KEY(target_project_id) REFERENCES projects(id) ON DELETE RESTRICT,
+                FOREIGN KEY(learner_id) REFERENCES learner_profiles(learner_id) ON DELETE RESTRICT
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS learning_continuity_mappings (
+                transition_id TEXT NOT NULL,
+                source_target_id TEXT NOT NULL,
+                target_target_id TEXT,
+                mapping_status TEXT NOT NULL CHECK(mapping_status IN (
+                    'unchanged_exact', 'renamed_exact', 'modified', 'deleted',
+                    'ambiguous', 'unmapped', 'incompatible'
+                )),
+                mapping_rule TEXT NOT NULL,
+                source_mastery_status TEXT NOT NULL DEFAULT 'unseen',
+                derived_mastery_status TEXT NOT NULL DEFAULT '',
+                source_content_hash TEXT NOT NULL DEFAULT '',
+                target_content_hash TEXT NOT NULL DEFAULT '',
+                source_path TEXT NOT NULL DEFAULT '',
+                target_path TEXT NOT NULL DEFAULT '',
+                source_qualified_name TEXT NOT NULL DEFAULT '',
+                target_qualified_name TEXT NOT NULL DEFAULT '',
+                review_reason TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY(transition_id, source_target_id),
+                FOREIGN KEY(transition_id) REFERENCES learning_continuity_transitions(id) ON DELETE CASCADE,
+                FOREIGN KEY(source_target_id) REFERENCES learning_targets(target_id) ON DELETE RESTRICT,
+                FOREIGN KEY(target_target_id) REFERENCES learning_targets(target_id) ON DELETE RESTRICT
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_learning_continuity_target_once
+            ON learning_continuity_mappings(transition_id, target_target_id)
+            WHERE target_target_id IS NOT NULL
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_learning_continuity_transition_status
+            ON learning_continuity_transitions(workspace_id, status, activation_version DESC)
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_learning_continuity_mapping_status
+            ON learning_continuity_mappings(transition_id, mapping_status, source_target_id)
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS learning_continuity_goal_lineage (
+                transition_id TEXT NOT NULL,
+                source_goal_id TEXT NOT NULL,
+                target_goal_id TEXT NOT NULL,
+                source_plan_id TEXT,
+                target_plan_id TEXT,
+                lineage_status TEXT NOT NULL CHECK(lineage_status IN ('carried', 'needs_review', 'history_only')),
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY(transition_id, source_goal_id),
+                FOREIGN KEY(transition_id) REFERENCES learning_continuity_transitions(id) ON DELETE CASCADE,
+                FOREIGN KEY(source_goal_id) REFERENCES learning_goals(goal_id) ON DELETE RESTRICT,
+                FOREIGN KEY(target_goal_id) REFERENCES learning_goals(goal_id) ON DELETE RESTRICT,
+                FOREIGN KEY(source_plan_id) REFERENCES learning_plans(plan_id) ON DELETE RESTRICT,
+                FOREIGN KEY(target_plan_id) REFERENCES learning_plans(plan_id) ON DELETE RESTRICT
+            )
             """
         )
 
@@ -2151,11 +2261,15 @@ class Database:
         with self.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             workspace = conn.execute(
-                "SELECT active_project_id FROM repository_workspaces WHERE id=?",
+                "SELECT active_project_id, activation_version FROM repository_workspaces WHERE id=?",
                 (workspace_id,),
             ).fetchone()
             project = conn.execute(
-                "SELECT status FROM projects WHERE id=?", (project_id,)
+                "SELECT status, repository_revision FROM projects WHERE id=?", (project_id,)
+            ).fetchone()
+            source_project = conn.execute(
+                "SELECT repository_revision FROM projects WHERE id=?",
+                (expected_active_project_id,),
             ).fetchone()
             revision = conn.execute(
                 """
@@ -2169,6 +2283,7 @@ class Database:
                 or workspace["active_project_id"] != expected_active_project_id
                 or project is None
                 or project["status"] != "done"
+                or source_project is None
                 or revision is None
                 or revision["activation_status"] != "staging"
             ):
@@ -2198,6 +2313,38 @@ class Database:
                 WHERE id=? AND active_project_id=?
                 """,
                 (project_id, workspace_id, expected_active_project_id),
+            )
+            activation_version = int(workspace["activation_version"]) + 1
+            transition_id = str(uuid.uuid5(
+                uuid.NAMESPACE_URL,
+                "\0".join((
+                    "reponoesis:learning-continuity",
+                    workspace_id,
+                    expected_active_project_id,
+                    project_id,
+                    LOCAL_CONTINUITY_LEARNER_ID,
+                    LEARNING_CONTINUITY_CONFIG_IDENTITY,
+                )),
+            ))
+            conn.execute(
+                """
+                INSERT INTO learning_continuity_transitions (
+                    id, workspace_id, source_project_id, target_project_id,
+                    source_revision, target_revision, activation_version,
+                    learner_id, mapping_config_identity, status
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')
+                """,
+                (
+                    transition_id,
+                    workspace_id,
+                    expected_active_project_id,
+                    project_id,
+                    source_project["repository_revision"],
+                    project["repository_revision"],
+                    activation_version,
+                    LOCAL_CONTINUITY_LEARNER_ID,
+                    LEARNING_CONTINUITY_CONFIG_IDENTITY,
+                ),
             )
             conn.execute(
                 "UPDATE projects SET source_identity=? WHERE id=?",

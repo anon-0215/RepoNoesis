@@ -20,6 +20,7 @@ import {
   checkWorkspaceRevision,
   getConfigStatus,
   getLearningPath,
+  getLearningContinuity,
   getProject,
   getProjectMap,
   getReport,
@@ -27,10 +28,12 @@ import {
   getWorkspaceUpdateRun,
   listWorkspaces,
   retryWorkspaceUpdateRun,
+  retryLearningContinuity,
   startWorkspaceRefresh
 } from './lib/api';
 import {
   citationLabel,
+  learningContinuityState,
   nextWorkspaceSearch,
   providerSummary,
   RECENT_WORKSPACE_KEY,
@@ -43,6 +46,7 @@ import {
 import type {
   ChatAnswer,
   ConfigStatus,
+  LearningContinuity,
   LearningStep,
   ProjectMap,
   ProjectResponse,
@@ -73,6 +77,7 @@ export default function App() {
   const [currentRevision, setCurrentRevision] = useState('');
   const [revisionCheck, setRevisionCheck] = useState<WorkspaceRevisionCheck | null>(null);
   const [updateRun, setUpdateRun] = useState<WorkspaceUpdateRun | null>(null);
+  const [continuity, setContinuity] = useState<LearningContinuity | null>(null);
   const [project, setProject] = useState<ProjectResponse | null>(null);
   const [projectMap, setProjectMap] = useState<ProjectMap | null>(null);
   const [learningSteps, setLearningSteps] = useState<LearningStep[]>([]);
@@ -85,6 +90,7 @@ export default function App() {
 
   const hasProject = Boolean(project && projectId);
   const updateState = workspaceUpdateState(revisionCheck, updateRun);
+  const continuityState = learningContinuityState(continuity);
 
   useEffect(() => {
     getConfigStatus().then(setConfigStatus).catch((error) => {
@@ -98,6 +104,12 @@ export default function App() {
     const timer = window.setTimeout(() => void pollUpdateRun(workspaceId, updateRun.run_id), 1000);
     return () => window.clearTimeout(timer);
   }, [workspaceId, updateRun]);
+
+  useEffect(() => {
+    if (!workspaceId || !continuity?.transition_id || !['pending', 'running'].includes(continuity.status)) return;
+    const timer = window.setTimeout(() => void pollContinuity(workspaceId), 1000);
+    return () => window.clearTimeout(timer);
+  }, [workspaceId, continuity]);
 
   async function initializeWorkspace() {
     await loadWorkspaceLibrary();
@@ -156,6 +168,7 @@ export default function App() {
       setCurrentRevision(workspace.active_snapshot.repository_revision);
       setRevisionCheck(null);
       setUpdateRun(workspace.latest_update_run);
+      setContinuity(workspace.learning_continuity);
       setAnswers([]);
       window.localStorage.setItem(RECENT_WORKSPACE_KEY, workspace.workspace_id);
       replaceWorkspaceUrl(workspace.workspace_id);
@@ -172,6 +185,7 @@ export default function App() {
       setCurrentRevision('');
       setRevisionCheck(null);
       setUpdateRun(null);
+      setContinuity(null);
       setProject(null);
       setMessage(
         `${error instanceof Error ? error.message : '项目重新打开失败'} 请从项目库选择其他项目或重新分析。`
@@ -218,6 +232,32 @@ export default function App() {
     }
   }
 
+  async function handleRetryContinuity() {
+    if (!workspaceId || !continuity?.transition_id || !continuity.retryable) return;
+    if (!window.confirm('确认重试学习连续性映射？代码 snapshot 不会回滚，也不会伪造学习作答。')) return;
+    try {
+      const result = await retryLearningContinuity(workspaceId, continuity.transition_id);
+      setContinuity(result);
+      setMessage('学习连续性重试已启动；普通源码问答仍可使用当前 revision。');
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : '学习连续性重试失败');
+    }
+  }
+
+  async function pollContinuity(nextWorkspaceId: string) {
+    try {
+      const result = await getLearningContinuity(nextWorkspaceId);
+      setContinuity(result);
+      if (result.status === 'failed') {
+        setMessage(`${result.error_message || '学习连续性失败'} 当前代码 snapshot 和普通问答仍可用；旧 mastery 未被沿用。`);
+      } else if (result.status === 'succeeded') {
+        setMessage('学习连续性已安全发布；修改目标已进入需要复习。');
+      }
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : '无法恢复学习连续性状态');
+    }
+  }
+
   async function pollUpdateRun(nextWorkspaceId: string, runId: string) {
     try {
       const run = await getWorkspaceUpdateRun(nextWorkspaceId, runId);
@@ -231,6 +271,7 @@ export default function App() {
         setCurrentRevision(workspace.active_snapshot.repository_revision);
         setRevisionCheck(null);
         setUpdateRun(workspace.latest_update_run);
+        setContinuity(workspace.learning_continuity);
         await loadWorkspaceLibrary();
         setMessage('新 revision 已完整验证并原子激活。');
       } else if (run.status === 'succeeded') {
@@ -289,7 +330,7 @@ export default function App() {
       return <MapView projectMap={projectMap} />;
     }
     if (activeTab === 'learning') {
-      return <LearningView steps={learningSteps} />;
+      return <LearningView steps={learningSteps} continuity={continuity} />;
     }
     if (activeTab === 'ask') {
       return (
@@ -303,7 +344,7 @@ export default function App() {
       );
     }
     return <ReportView markdown={report} />;
-  }, [activeTab, answers, hasProject, learningSteps, loading, project, projectMap, question, report]);
+  }, [activeTab, answers, continuity, hasProject, learningSteps, loading, project, projectMap, question, report]);
 
   return (
     <div className="app-shell">
@@ -372,6 +413,32 @@ export default function App() {
                   <button type="button" onClick={() => void handleRetryRefresh()}>安全重试</button>
                 )}
               </div>
+            </section>
+          )}
+
+          {workspaceId && continuityState !== 'not-required' && continuity && (
+            <section className={`workspace-update-card continuity-${continuityState}`} aria-label="学习连续性">
+              <strong>跨版本学习连续性</strong>
+              <span>状态：{continuityState}</span>
+              {(continuityState === 'pending' || continuityState === 'running') && (
+                <span>学习状态正在保守映射；普通问答可继续使用新 revision。</span>
+              )}
+              {continuityState === 'succeeded' && (
+                <>
+                  <span>安全保留：{continuity.stats.retained}</span>
+                  <span>需要复习：{continuity.stats.needs_review}</span>
+                  <span>仅留历史：{continuity.stats.history_only}</span>
+                  <span>未自动继承：{continuity.stats.not_inherited}</span>
+                </>
+              )}
+              {continuityState === 'failed' && (
+                <span>{continuity.error_code || 'continuity_failed'}；旧 mastery 未用于当前 revision。</span>
+              )}
+              {continuityState === 'failed' && continuity.retryable && (
+                <div className="workspace-update-actions">
+                  <button type="button" onClick={() => void handleRetryContinuity()}>重试学习连续性</button>
+                </div>
+              )}
             </section>
           )}
 
@@ -554,9 +621,27 @@ function Tree({ node }: { node: TreeNode }) {
   );
 }
 
-function LearningView({ steps }: { steps: LearningStep[] }) {
+function LearningView({ steps, continuity }: { steps: LearningStep[]; continuity: LearningContinuity | null }) {
   return (
     <div className="learning-list">
+      {continuity && continuity.status !== 'not_required' && (
+        <section className="panel continuity-summary">
+          <h2>跨版本学习连续性</h2>
+          {continuity.status === 'succeeded' ? (
+            <p>
+              已安全保留 {continuity.stats.retained} 个严格等价目标；
+              {continuity.stats.needs_review} 个目标需要复习；
+              {continuity.stats.history_only} 个已删除目标仅保留历史；
+              {continuity.stats.not_inherited} 个歧义或不兼容目标未继承。
+            </p>
+          ) : continuity.status === 'failed' ? (
+            <p>连续性处理失败。当前代码和源码问答仍可用，但学习入口不会静默沿用旧 mastery。</p>
+          ) : (
+            <p>连续性尚未完成。请等待或在失败后显式重试；系统不会自动伪造学习完成。</p>
+          )}
+          {continuity.stats.needs_review > 0 && <strong>请优先复习受 revision 修改影响的目标。</strong>}
+        </section>
+      )}
       {steps.map((step) => (
         <article className="learning-step" key={step.order}>
           <div className="step-index">{step.order}</div>

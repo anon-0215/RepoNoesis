@@ -25,6 +25,10 @@ from app.services.embedding_service import EmbeddingService
 from app.services.github_client import fetch_repository
 from app.services.hierarchy_normalization import validate_hierarchy_mode
 from app.services.learning_agent import build_learning_path
+from app.services.learning_continuity import (
+    LearningContinuityError,
+    LearningContinuityService,
+)
 from app.services.learning_contracts import (
     CreateGoalRequest,
     CreatePlanRequest,
@@ -57,6 +61,7 @@ load_environment()
 @asynccontextmanager
 async def app_lifespan(_app: FastAPI):
     WorkspaceUpdateService(db, repository_settings, embedding_service).recover_interrupted_runs()
+    LearningContinuityService(db).recover_interrupted()
     yield
 
 app = FastAPI(title="源鉴 RepoNoesis API", version="0.1.0", lifespan=app_lifespan)
@@ -263,6 +268,50 @@ class WorkspaceRevisionCheckResponse(BaseModel):
 class WorkspaceDetailResponse(WorkspaceSummaryResponse):
     active_snapshot: WorkspaceSnapshotResponse
     latest_update_run: WorkspaceUpdateRunResponse | None = None
+    learning_continuity: "LearningContinuityResponse | None" = None
+
+
+class LearningContinuityResponse(BaseModel):
+    transition_id: str | None
+    workspace_id: str
+    status: Literal["not_required", "pending", "running", "succeeded", "failed"]
+    activation_version: int
+    mapping_config_identity: str | None = None
+    source_revision: str | None = None
+    target_revision: str | None = None
+    stats: dict[str, int]
+    error_code: str = ""
+    error_message: str = ""
+    retryable: bool
+    retry_count: int = 0
+    created_at: str | None = None
+    started_at: str | None = None
+    finished_at: str | None = None
+    updated_at: str | None = None
+
+
+class LearningContinuityImpactResponse(BaseModel):
+    source_target_id: str
+    target_target_id: str | None
+    mapping_status: Literal[
+        "unchanged_exact", "renamed_exact", "modified", "deleted",
+        "ambiguous", "unmapped", "incompatible",
+    ]
+    mapping_rule: str
+    source_mastery_status: str
+    derived_mastery_status: str
+    source_path: str
+    target_path: str
+    source_qualified_name: str
+    target_qualified_name: str
+    review_reason: str
+
+
+class LearningContinuityImpactsResponse(BaseModel):
+    transition_id: str
+    workspace_id: str
+    status: Literal["pending", "running", "succeeded", "failed"]
+    items: list[LearningContinuityImpactResponse]
 
 
 @app.get("/api/health")
@@ -311,6 +360,9 @@ def get_workspace(workspace_id: str) -> dict[str, Any]:
         result = WorkspaceService(db).get_workspace(workspace_id)
         latest = db.get_latest_update_run(workspace_id)
         result["latest_update_run"] = _public_update_run(latest) if latest else None
+        result["learning_continuity"] = _public_continuity(
+            LearningContinuityService(db).get_current(workspace_id)
+        )
         return result
     except WorkspaceNotFound as exc:
         raise HTTPException(
@@ -444,6 +496,80 @@ def _public_update_run(run: dict[str, Any]) -> dict[str, Any]:
         "finished_at": run["finished_at"],
         "updated_at": run["updated_at"],
     }
+
+
+@app.get(
+    "/api/workspaces/{workspace_id}/learning-continuity",
+    response_model=LearningContinuityResponse,
+)
+def get_workspace_learning_continuity(workspace_id: str) -> dict[str, Any]:
+    try:
+        return _public_continuity(LearningContinuityService(db).get_current(workspace_id))
+    except LearningContinuityError as exc:
+        raise _continuity_http_error(exc) from exc
+
+
+@app.get(
+    "/api/workspaces/{workspace_id}/learning-continuity/{transition_id}",
+    response_model=LearningContinuityResponse,
+)
+def get_learning_continuity_transition(
+    workspace_id: str, transition_id: str
+) -> dict[str, Any]:
+    try:
+        return _public_continuity(
+            LearningContinuityService(db).get_transition(workspace_id, transition_id)
+        )
+    except LearningContinuityError as exc:
+        raise _continuity_http_error(exc) from exc
+
+
+@app.get(
+    "/api/workspaces/{workspace_id}/learning-continuity/{transition_id}/targets",
+    response_model=LearningContinuityImpactsResponse,
+)
+def get_learning_continuity_impacts(
+    workspace_id: str, transition_id: str
+) -> dict[str, Any]:
+    try:
+        return LearningContinuityService(db).get_impacts(workspace_id, transition_id)
+    except LearningContinuityError as exc:
+        raise _continuity_http_error(exc) from exc
+
+
+@app.post(
+    "/api/workspaces/{workspace_id}/learning-continuity/{transition_id}/retry",
+    response_model=LearningContinuityResponse,
+)
+def retry_learning_continuity_transition(
+    workspace_id: str,
+    transition_id: str,
+    background_tasks: BackgroundTasks,
+) -> dict[str, Any]:
+    try:
+        service = LearningContinuityService(db)
+        transition = service.retry(workspace_id, transition_id)
+        background_tasks.add_task(service.execute, workspace_id, transition_id)
+        return _public_continuity(transition)
+    except LearningContinuityError as exc:
+        raise _continuity_http_error(exc) from exc
+
+
+def _public_continuity(value: dict[str, Any]) -> dict[str, Any]:
+    allowed = {
+        "transition_id", "workspace_id", "status", "activation_version",
+        "mapping_config_identity", "source_revision", "target_revision", "stats",
+        "error_code", "error_message", "retryable", "retry_count", "created_at",
+        "started_at", "finished_at", "updated_at",
+    }
+    return {key: value[key] for key in allowed if key in value}
+
+
+def _continuity_http_error(exc: LearningContinuityError) -> HTTPException:
+    return HTTPException(
+        status_code=exc.status_code,
+        detail={"code": exc.code, "message": exc.message, "retryable": exc.retryable},
+    )
 
 
 def _workspace_id_or_409(project_id: str) -> str:

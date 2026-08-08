@@ -135,6 +135,7 @@ export interface WorkspaceDetail extends WorkspaceSummary {
     updated_at: string;
   };
   latest_update_run: WorkspaceUpdateRun | null;
+  learning_continuity: LearningContinuity | null;
 }
 
 export interface WorkspaceRevisionCheck {
@@ -161,5 +162,39 @@ export interface WorkspaceUpdateRun {
   started_at: string | null;
   finished_at: string | null;
   updated_at: string;
+}
+
+export interface LearningContinuityStats {
+  total: number;
+  unchanged_exact: number;
+  renamed_exact: number;
+  modified: number;
+  deleted: number;
+  ambiguous: number;
+  unmapped: number;
+  incompatible: number;
+  retained: number;
+  needs_review: number;
+  history_only: number;
+  not_inherited: number;
+}
+
+export interface LearningContinuity {
+  transition_id: string | null;
+  workspace_id: string;
+  status: 'not_required' | 'pending' | 'running' | 'succeeded' | 'failed';
+  activation_version: number;
+  mapping_config_identity?: string;
+  source_revision?: string;
+  target_revision?: string;
+  stats: LearningContinuityStats;
+  error_code: string;
+  error_message: string;
+  retryable: boolean;
+  retry_count: number;
+  created_at: string | null;
+  started_at: string | null;
+  finished_at: string | null;
+  updated_at: string | null;
 }
 

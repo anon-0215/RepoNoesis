@@ -124,7 +124,7 @@ M1 是第一个代码开发里程碑。本设计阶段提交后停止，不提�
 该结果是受控 smoke 的真实集成验收，不是任意仓库、语言、规模、平台、Provider 或教学
 效果的生产级证明，也不表示 M5 live pilot 已完成。
 
-### Local Product Phase 2：持久化仓库工作区生命周期（P2.1/P2.2 已完成）
+### Local Product Phase 2：持久化仓库工作区生命周期（P2.1/P2.2/LP2.3 已完成离线实现）
 
 仓库在 Phase 1 封存前没有正式 Phase 2 定义。当前建议的唯一主线是：把一次性导入升级为
 可重新打开、revision-aware、可恢复、可增量刷新并保持学习连续性的本地仓库工作区。
@@ -134,7 +134,11 @@ M1 是第一个代码开发里程碑。本设计阶段提交后停止，不提�
 执行分析、Embedding、relation 或 Provider，也不写学习事件。V3·LP2.2 进一步实现 schema
 v9→v10 additive migration、显式 revision check、持久化幂等 update run、内容哈希增量
 chunk/Embedding、snapshot 内 relation 重建、失败/中断恢复与原子 active snapshot 激活。
-P2.3 跨 revision 学习重验证仍未实现。
+V3·LP2.3 进一步实现 schema v10→v11 additive migration、与 activation 原子绑定的持久化
+continuity transition、确定性 target mapping、严格等价状态继承、modified `needs_review`、
+历史不可变与最小状态/摘要/retry UI。它不复制 attempt/evaluation/Evidence，也不调用 LLM
+替用户重新证明 mastery。契约见
+[`LOCAL_PRODUCT_P2_3_CONTRACT.md`](LOCAL_PRODUCT_P2_3_CONTRACT.md)。
 
 实施顺序：
 
@@ -143,5 +147,6 @@ P2.3 跨 revision 学习重验证仍未实现。
 3. P2.3：跨 revision 学习重验证与最小持续学习 UI。
 
 完整范围、非目标、冻结身份契约、兼容性、安全边界、Gate 和风险见
-[`LOCAL_PRODUCT_PHASE2_PLAN.md`](LOCAL_PRODUCT_PHASE2_PLAN.md)。P2.2/P2.3 仍需单独
-授权；Phase 2 不包含 M5/Phase 6 修改或 live benchmark。
+[`LOCAL_PRODUCT_PHASE2_PLAN.md`](LOCAL_PRODUCT_PHASE2_PLAN.md)。P2.1—LP2.3 已形成离线
+生命周期闭环；真实本地产品 Gate、仓库命名治理与后续阶段仍需单独授权。Phase 2 不包含
+M5/Phase 6 修改或 live benchmark。

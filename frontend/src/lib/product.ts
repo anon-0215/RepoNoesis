@@ -1,10 +1,11 @@
-import type { Citation, ConfigStatus, WorkspaceRevisionCheck, WorkspaceUpdateRun } from '../types';
+import type { Citation, ConfigStatus, LearningContinuity, WorkspaceRevisionCheck, WorkspaceUpdateRun } from '../types';
 
 export type SourceType = 'local' | 'git_url';
 
 export const RECENT_WORKSPACE_KEY = 'reponoesis.recentWorkspaceId';
 export type WorkspaceLibraryStatus = 'loading' | 'error' | 'empty' | 'ready';
 export type WorkspaceUpdateUiState = 'ready' | 'unchanged' | 'update-available' | 'updating' | 'failed';
+export type LearningContinuityUiState = 'not-required' | 'pending' | 'running' | 'succeeded' | 'failed';
 
 const WORKSPACE_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
@@ -71,4 +72,11 @@ export function workspaceUpdateState(
   if (check?.state === 'update_available') return 'update-available';
   if (check?.state === 'unchanged') return 'unchanged';
   return 'ready';
+}
+
+export function learningContinuityState(
+  continuity: LearningContinuity | null
+): LearningContinuityUiState {
+  if (!continuity || continuity.status === 'not_required') return 'not-required';
+  return continuity.status;
 }

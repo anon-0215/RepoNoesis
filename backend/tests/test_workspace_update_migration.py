@@ -74,7 +74,7 @@ class WorkspaceUpdateMigrationTests(unittest.TestCase):
         finally:
             conn.close()
 
-    def test_v9_migrates_transactionally_and_idempotently_to_v10(self) -> None:
+    def test_v9_migrates_transactionally_and_idempotently_to_current_schema(self) -> None:
         database = Database(self.path)
         project_id = database.create_project(
             {
@@ -93,10 +93,10 @@ class WorkspaceUpdateMigrationTests(unittest.TestCase):
         first = Database(self.path)
         second = Database(self.path)
         with second.connect() as conn:
-            self.assertEqual(SCHEMA_VERSION, 10)
+            self.assertEqual(SCHEMA_VERSION, 11)
             self.assertEqual(
                 conn.execute("SELECT version FROM schema_versions WHERE key='database'").fetchone()[0],
-                10,
+                11,
             )
             revision = conn.execute(
                 "SELECT activation_status, parent_project_id, manifest_hash, chunker_version "
