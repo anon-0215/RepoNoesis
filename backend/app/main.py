@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Literal
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -39,6 +39,14 @@ from app.services.repository_import import RepositoryImportError, import_reposit
 from app.services.report import generate_report
 from app.services.relation_analysis import index_project_relations
 from app.services.relation_retrieval import validate_relation_mode
+from app.services.workspace_service import (
+    DEFAULT_WORKSPACE_LIMIT,
+    MAX_WORKSPACE_LIMIT,
+    WorkspaceCorrupt,
+    WorkspaceNotFound,
+    WorkspaceService,
+    WorkspaceUnavailable,
+)
 
 
 load_environment()
@@ -191,6 +199,37 @@ class LearningListResponse(BaseModel):
     items: list[dict[str, Any]]
 
 
+class WorkspaceSummaryResponse(BaseModel):
+    workspace_id: str
+    display_name: str
+    source_type: str
+    project_status: str
+    repository_revision: str
+    openable: bool
+    created_at: str
+    updated_at: str
+
+
+class WorkspaceListResponse(BaseModel):
+    items: list[WorkspaceSummaryResponse]
+    total: int
+    limit: int
+    offset: int
+
+
+class WorkspaceSnapshotResponse(BaseModel):
+    project_id: str
+    repository_revision: str
+    status: str
+    primary_language: str
+    frameworks: list[str]
+    updated_at: str
+
+
+class WorkspaceDetailResponse(WorkspaceSummaryResponse):
+    active_snapshot: WorkspaceSnapshotResponse
+
+
 @app.get("/api/health")
 def health() -> dict[str, Any]:
     embedding_identity = embedding_service.get_model_identity()
@@ -212,6 +251,70 @@ def health() -> dict[str, Any]:
 @app.get("/api/config/status")
 def configuration_status() -> dict[str, Any]:
     return get_product_config_status()
+
+
+@app.get("/api/workspaces", response_model=WorkspaceListResponse)
+def list_workspaces(
+    limit: int = Query(default=DEFAULT_WORKSPACE_LIMIT, ge=1, le=MAX_WORKSPACE_LIMIT),
+    offset: int = Query(default=0, ge=0),
+) -> dict[str, Any]:
+    if not 1 <= limit <= MAX_WORKSPACE_LIMIT or offset < 0:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "invalid_pagination",
+                "message": f"limit must be between 1 and {MAX_WORKSPACE_LIMIT}, and offset must be non-negative.",
+                "retryable": False,
+            },
+        )
+    return WorkspaceService(db).list_workspaces(limit=limit, offset=offset)
+
+
+@app.get("/api/workspaces/{workspace_id}", response_model=WorkspaceDetailResponse)
+def get_workspace(workspace_id: str) -> dict[str, Any]:
+    try:
+        return WorkspaceService(db).get_workspace(workspace_id)
+    except WorkspaceNotFound as exc:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "code": "workspace_not_found",
+                "message": "The requested workspace does not exist.",
+                "retryable": False,
+            },
+        ) from exc
+    except WorkspaceCorrupt as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "workspace_corrupt",
+                "message": "The workspace snapshot association is incomplete or inconsistent.",
+                "retryable": False,
+            },
+        ) from exc
+    except WorkspaceUnavailable as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "workspace_not_openable",
+                "message": "The workspace has no completed snapshot that can be reopened.",
+                "retryable": False,
+            },
+        ) from exc
+
+
+def _workspace_id_or_409(project_id: str) -> str:
+    workspace = db.get_workspace_for_project(project_id)
+    if workspace is None:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "workspace_corrupt",
+                "message": "The project is not linked to a valid workspace.",
+                "retryable": False,
+            },
+        )
+    return str(workspace["id"])
 
 
 @app.post("/api/projects/analyze")
@@ -239,6 +342,7 @@ def analyze_project(request: AnalyzeRequest) -> dict[str, Any]:
         if existing and existing["status"] in {"done", "analyzing"}:
             return {
                 "project_id": existing["id"],
+                "workspace_id": _workspace_id_or_409(existing["id"]),
                 "status": existing["status"],
                 "import_action": "reused",
             }
@@ -335,6 +439,7 @@ def analyze_project(request: AnalyzeRequest) -> dict[str, Any]:
 
     response: dict[str, Any] = {
         "project_id": project_id,
+        "workspace_id": _workspace_id_or_409(project_id),
         "status": "done",
         "import_action": "analyzed" if product_import else "legacy_analyzed",
     }

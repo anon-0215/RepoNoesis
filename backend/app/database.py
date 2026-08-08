@@ -15,7 +15,7 @@ from app.learning_schema import LEARNING_SCHEMA_STATEMENTS
 
 
 DEFAULT_DB_PATH = Path(__file__).resolve().parents[1] / "data" / "gitlearn.sqlite"
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 
 
 SCHEMA = """
@@ -394,6 +394,111 @@ class Database:
             ON learning_events (learner_id, project_id, target_id, event_order)
             """
         )
+        self._migrate_workspace_schema(conn)
+
+    def _migrate_workspace_schema(self, conn: sqlite3.Connection) -> None:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS repository_workspaces (
+                id TEXT PRIMARY KEY,
+                display_name TEXT NOT NULL CHECK(length(display_name) BETWEEN 1 AND 300),
+                source_type TEXT NOT NULL,
+                source_location TEXT NOT NULL DEFAULT '',
+                active_project_id TEXT NOT NULL UNIQUE,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(active_project_id) REFERENCES projects(id) ON DELETE RESTRICT,
+                FOREIGN KEY(id, active_project_id)
+                    REFERENCES workspace_revisions(workspace_id, project_id)
+                    DEFERRABLE INITIALLY DEFERRED
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS workspace_revisions (
+                workspace_id TEXT NOT NULL,
+                project_id TEXT NOT NULL UNIQUE,
+                repository_revision TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY(workspace_id, project_id),
+                FOREIGN KEY(workspace_id) REFERENCES repository_workspaces(id)
+                    ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED,
+                FOREIGN KEY(project_id) REFERENCES projects(id)
+                    ON DELETE RESTRICT DEFERRABLE INITIALLY DEFERRED
+            )
+            """
+        )
+        self._backfill_legacy_workspaces(conn)
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_repository_workspaces_order
+            ON repository_workspaces (updated_at DESC, created_at DESC, id ASC)
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_workspace_revisions_project
+            ON workspace_revisions (project_id)
+            """
+        )
+        conn.execute(
+            """
+            CREATE TRIGGER IF NOT EXISTS trg_projects_delete_workspace
+            BEFORE DELETE ON projects
+            BEGIN
+                DELETE FROM repository_workspaces WHERE active_project_id = OLD.id;
+            END
+            """
+        )
+
+    def _backfill_legacy_workspaces(self, conn: sqlite3.Connection) -> None:
+        rows = conn.execute(
+            """
+            SELECT p.id, p.repo, p.source_type, p.source_location,
+                   p.repository_revision, p.created_at, p.updated_at
+            FROM projects AS p
+            LEFT JOIN workspace_revisions AS wr ON wr.project_id = p.id
+            WHERE wr.project_id IS NULL
+            ORDER BY p.created_at, p.id
+            """
+        ).fetchall()
+        for row in rows:
+            workspace_id = self._workspace_id_for_project(row["id"])
+            conn.execute(
+                """
+                INSERT INTO repository_workspaces (
+                    id, display_name, source_type, source_location,
+                    active_project_id, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    workspace_id,
+                    row["repo"] or "Unnamed repository",
+                    row["source_type"] or "legacy_github",
+                    row["source_location"] or "",
+                    row["id"],
+                    row["created_at"],
+                    row["updated_at"],
+                ),
+            )
+            conn.execute(
+                """
+                INSERT INTO workspace_revisions (
+                    workspace_id, project_id, repository_revision, created_at
+                ) VALUES (?, ?, ?, ?)
+                """,
+                (
+                    workspace_id,
+                    row["id"],
+                    row["repository_revision"] or "",
+                    row["created_at"],
+                ),
+            )
+
+    @staticmethod
+    def _workspace_id_for_project(project_id: str) -> str:
+        return str(uuid.uuid5(uuid.NAMESPACE_URL, f"reponoesis:workspace:{project_id}"))
 
     def create_project(self, snapshot: dict[str, Any]) -> str:
         project_id = str(uuid.uuid4())
@@ -417,6 +522,34 @@ class Database:
                     snapshot.get("source_type", "legacy_github"),
                     snapshot.get("source_location", ""),
                     snapshot.get("source_identity", ""),
+                ),
+            )
+            workspace_id = self._workspace_id_for_project(project_id)
+            conn.execute(
+                """
+                INSERT INTO repository_workspaces (
+                    id, display_name, source_type, source_location,
+                    active_project_id
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    workspace_id,
+                    snapshot.get("repo") or "Unnamed repository",
+                    snapshot.get("source_type", "legacy_github"),
+                    snapshot.get("source_location", ""),
+                    project_id,
+                ),
+            )
+            conn.execute(
+                """
+                INSERT INTO workspace_revisions (
+                    workspace_id, project_id, repository_revision
+                ) VALUES (?, ?, ?)
+                """,
+                (
+                    workspace_id,
+                    project_id,
+                    snapshot.get("repository_revision", ""),
                 ),
             )
         return project_id
@@ -1385,6 +1518,15 @@ class Database:
 
     def delete_project(self, project_id: str) -> None:
         with self.connect() as conn:
+            workspace_row = conn.execute(
+                "SELECT workspace_id FROM workspace_revisions WHERE project_id = ?",
+                (project_id,),
+            ).fetchone()
+            if workspace_row is not None:
+                conn.execute(
+                    "DELETE FROM repository_workspaces WHERE id = ?",
+                    (workspace_row["workspace_id"],),
+                )
             conn.execute("DELETE FROM code_chunks WHERE project_id = ?", (project_id,))
             conn.execute("DELETE FROM chat_answers WHERE project_id = ?", (project_id,))
             conn.execute("DELETE FROM learning_steps WHERE project_id = ?", (project_id,))
@@ -1410,6 +1552,82 @@ class Database:
                 (source_identity,),
             ).fetchone()
         return self._project_from_row(row) if row else None
+
+    def get_workspace_for_project(self, project_id: str) -> dict[str, Any] | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT w.*
+                FROM repository_workspaces AS w
+                JOIN workspace_revisions AS wr
+                  ON wr.workspace_id = w.id AND wr.project_id = w.active_project_id
+                WHERE wr.project_id = ?
+                """,
+                (project_id,),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def list_workspace_records(self, limit: int, offset: int) -> dict[str, Any]:
+        with self.connect() as conn:
+            total = conn.execute(
+                "SELECT COUNT(*) FROM repository_workspaces"
+            ).fetchone()[0]
+            rows = conn.execute(
+                """
+                SELECT
+                    w.id AS workspace_id,
+                    w.display_name,
+                    w.source_type,
+                    w.active_project_id,
+                    w.created_at,
+                    w.updated_at,
+                    p.repository_revision,
+                    p.status AS project_status,
+                    p.primary_language,
+                    p.frameworks_json,
+                    p.updated_at AS project_updated_at,
+                    wr.workspace_id AS revision_workspace_id,
+                    wr.project_id AS revision_project_id,
+                    wr.repository_revision AS linked_revision
+                FROM repository_workspaces AS w
+                LEFT JOIN projects AS p ON p.id = w.active_project_id
+                LEFT JOIN workspace_revisions AS wr
+                  ON wr.workspace_id = w.id AND wr.project_id = w.active_project_id
+                ORDER BY p.updated_at DESC, w.updated_at DESC, w.created_at DESC, w.id ASC
+                LIMIT ? OFFSET ?
+                """,
+                (limit, offset),
+            ).fetchall()
+        return {"items": [dict(row) for row in rows], "total": int(total)}
+
+    def get_workspace_record(self, workspace_id: str) -> dict[str, Any] | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT
+                    w.id AS workspace_id,
+                    w.display_name,
+                    w.source_type,
+                    w.active_project_id,
+                    w.created_at,
+                    w.updated_at,
+                    p.repository_revision,
+                    p.status AS project_status,
+                    p.primary_language,
+                    p.frameworks_json,
+                    p.updated_at AS project_updated_at,
+                    wr.workspace_id AS revision_workspace_id,
+                    wr.project_id AS revision_project_id,
+                    wr.repository_revision AS linked_revision
+                FROM repository_workspaces AS w
+                LEFT JOIN projects AS p ON p.id = w.active_project_id
+                LEFT JOIN workspace_revisions AS wr
+                  ON wr.workspace_id = w.id AND wr.project_id = w.active_project_id
+                WHERE w.id = ?
+                """,
+                (workspace_id,),
+            ).fetchone()
+        return dict(row) if row is not None else None
 
     def get_bundle(self, project_id: str) -> dict[str, Any] | None:
         project = self.get_project(project_id)

@@ -4,6 +4,7 @@ import {
   Clipboard,
   Download,
   FileCode2,
+  FolderOpen,
   GitBranch,
   LayoutDashboard,
   Map,
@@ -20,10 +21,29 @@ import {
   getLearningPath,
   getProject,
   getProjectMap,
-  getReport
+  getReport,
+  getWorkspace,
+  listWorkspaces
 } from './lib/api';
-import { citationLabel, providerSummary, type SourceType } from './lib/product';
-import type { ChatAnswer, ConfigStatus, LearningStep, ProjectMap, ProjectResponse, TreeNode } from './types';
+import {
+  citationLabel,
+  nextWorkspaceSearch,
+  providerSummary,
+  RECENT_WORKSPACE_KEY,
+  selectWorkspaceToRestore,
+  workspaceLibraryStatus,
+  type WorkspaceLibraryStatus,
+  type SourceType
+} from './lib/product';
+import type {
+  ChatAnswer,
+  ConfigStatus,
+  LearningStep,
+  ProjectMap,
+  ProjectResponse,
+  TreeNode,
+  WorkspaceSummary
+} from './types';
 
 type Tab = 'dashboard' | 'map' | 'learning' | 'ask' | 'report';
 
@@ -39,6 +59,9 @@ export default function App() {
   const [sourceType, setSourceType] = useState<SourceType>('local');
   const [source, setSource] = useState('');
   const [configStatus, setConfigStatus] = useState<ConfigStatus | null>(null);
+  const [workspaceId, setWorkspaceId] = useState('');
+  const [workspaces, setWorkspaces] = useState<WorkspaceSummary[]>([]);
+  const [libraryStatus, setLibraryStatus] = useState<WorkspaceLibraryStatus>('loading');
   const [projectId, setProjectId] = useState('');
   const [project, setProject] = useState<ProjectResponse | null>(null);
   const [projectMap, setProjectMap] = useState<ProjectMap | null>(null);
@@ -56,7 +79,41 @@ export default function App() {
     getConfigStatus().then(setConfigStatus).catch((error) => {
       setMessage(error instanceof Error ? error.message : '无法读取配置状态');
     });
+    void initializeWorkspace();
   }, []);
+
+  async function initializeWorkspace() {
+    await loadWorkspaceLibrary();
+    const restore = selectWorkspaceToRestore(
+      window.location.search,
+      window.localStorage.getItem(RECENT_WORKSPACE_KEY)
+    );
+    if (restore.source === 'invalid_url') {
+      replaceWorkspaceUrl(null);
+      setMessage('链接中的 workspace ID 无效，请从项目库重新选择。');
+      return;
+    }
+    if (restore.workspaceId) {
+      await openWorkspace(restore.workspaceId, restore.source);
+    }
+  }
+
+  async function loadWorkspaceLibrary() {
+    setLibraryStatus(workspaceLibraryStatus('loading'));
+    try {
+      const result = await listWorkspaces();
+      setWorkspaces(result.items);
+      setLibraryStatus(workspaceLibraryStatus('success', result.items.length));
+    } catch (error) {
+      setLibraryStatus(workspaceLibraryStatus('error'));
+      setMessage(error instanceof Error ? error.message : '无法读取项目库');
+    }
+  }
+
+  function replaceWorkspaceUrl(nextWorkspaceId: string | null) {
+    const search = nextWorkspaceSearch(window.location.search, nextWorkspaceId);
+    window.history.replaceState(null, '', `${window.location.pathname}${search}${window.location.hash}`);
+  }
 
   async function loadAll(nextProjectId: string) {
     const [projectData, mapData, learningData, reportData] = await Promise.all([
@@ -71,6 +128,37 @@ export default function App() {
     setReport(reportData.markdown);
   }
 
+  async function openWorkspace(nextWorkspaceId: string, source: 'url' | 'recent' | 'selection' = 'selection') {
+    setLoading(true);
+    setMessage('正在从项目库重新打开持久化项目…');
+    try {
+      const workspace = await getWorkspace(nextWorkspaceId);
+      await loadAll(workspace.active_snapshot.project_id);
+      setWorkspaceId(workspace.workspace_id);
+      setProjectId(workspace.active_snapshot.project_id);
+      setAnswers([]);
+      window.localStorage.setItem(RECENT_WORKSPACE_KEY, workspace.workspace_id);
+      replaceWorkspaceUrl(workspace.workspace_id);
+      setActiveTab('dashboard');
+      setMessage('已重新打开持久化项目；未重新分析或调用模型。');
+      return true;
+    } catch (error) {
+      if (window.localStorage.getItem(RECENT_WORKSPACE_KEY) === nextWorkspaceId) {
+        window.localStorage.removeItem(RECENT_WORKSPACE_KEY);
+      }
+      if (source === 'url' || source === 'recent') replaceWorkspaceUrl(null);
+      setWorkspaceId('');
+      setProjectId('');
+      setProject(null);
+      setMessage(
+        `${error instanceof Error ? error.message : '项目重新打开失败'} 请从项目库选择其他项目或重新分析。`
+      );
+      return false;
+    } finally {
+      setLoading(false);
+    }
+  }
+
   async function handleAnalyze(event: FormEvent) {
     event.preventDefault();
     setLoading(true);
@@ -78,10 +166,11 @@ export default function App() {
     setAnswers([]);
     try {
       const result = await analyzeProject(sourceType, source);
-      setProjectId(result.project_id);
-      await loadAll(result.project_id);
-      setActiveTab('dashboard');
-      setMessage(result.import_action === 'reused' ? '已载入持久化项目和索引。' : '分析和本地索引完成。');
+      await loadWorkspaceLibrary();
+      const opened = await openWorkspace(result.workspace_id);
+      if (opened) {
+        setMessage(result.import_action === 'reused' ? '已载入持久化项目和索引。' : '分析和本地索引完成。');
+      }
     } catch (error) {
       setMessage(error instanceof Error ? error.message : '分析失败');
     } finally {
@@ -148,6 +237,38 @@ export default function App() {
 
       <main className="workspace">
         <aside className="sidebar">
+          <section className="workspace-library" aria-label="项目库">
+            <div className="workspace-library-title">
+              <strong>项目库</strong>
+              <button type="button" onClick={() => void loadWorkspaceLibrary()} disabled={libraryStatus === 'loading'}>
+                <RefreshCw aria-hidden="true" />
+                <span>刷新列表</span>
+              </button>
+            </div>
+            {libraryStatus === 'loading' && <p>正在读取已有项目…</p>}
+            {libraryStatus === 'error' && <p className="library-error">项目库读取失败，可重试或使用下方新建分析。</p>}
+            {libraryStatus === 'empty' && <p>还没有已分析项目，请使用下方入口建立第一个项目。</p>}
+            {libraryStatus === 'ready' && (
+              <div className="workspace-list">
+                {workspaces.map((item) => (
+                  <button
+                    type="button"
+                    key={item.workspace_id}
+                    className={workspaceId === item.workspace_id ? 'active' : ''}
+                    disabled={!item.openable || loading}
+                    onClick={() => void openWorkspace(item.workspace_id)}
+                  >
+                    <FolderOpen aria-hidden="true" />
+                    <span>
+                      <strong>{item.display_name}</strong>
+                      <small>{item.openable ? `${item.project_status} · ${item.repository_revision.slice(0, 8) || 'no revision'}` : '关联不可用'}</small>
+                    </span>
+                  </button>
+                ))}
+              </div>
+            )}
+          </section>
+
           <form className="analyze-form" onSubmit={handleAnalyze}>
             <label htmlFor="repo-source">仓库来源</label>
             <div className="source-toggle" role="group" aria-label="仓库来源">

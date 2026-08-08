@@ -49,7 +49,7 @@ class M4IntegrityTests(unittest.TestCase):
         self.assertEqual(len(reopened.get_code_chunks(self.project_id)), 2)
         self.assertEqual(len(reopened.get_relations(self.project_id, "revision-m3")), relation_count)
         with reopened.connect() as conn:
-            self.assertEqual(conn.execute("SELECT version FROM schema_versions WHERE key='database'").fetchone()[0], 8)
+            self.assertEqual(conn.execute("SELECT version FROM schema_versions WHERE key='database'").fetchone()[0], SCHEMA_VERSION)
             self.assertIn("learning_events", {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")})
 
     def test_migration_failure_keeps_previous_schema_version(self):

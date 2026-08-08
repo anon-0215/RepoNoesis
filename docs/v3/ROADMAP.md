@@ -124,17 +124,21 @@ M1 是第一个代码开发里程碑。本设计阶段提交后停止，不提�
 该结果是受控 smoke 的真实集成验收，不是任意仓库、语言、规模、平台、Provider 或教学
 效果的生产级证明，也不表示 M5 live pilot 已完成。
 
-### Local Product Phase 2：持久化仓库工作区生命周期（建议）
+### Local Product Phase 2：持久化仓库工作区生命周期（P2.1 已完成）
 
 仓库在 Phase 1 封存前没有正式 Phase 2 定义。当前建议的唯一主线是：把一次性导入升级为
 可重新打开、revision-aware、可恢复、可增量刷新并保持学习连续性的本地仓库工作区。
 
-建议顺序：
+当前状态：P2.1 已实现 schema v8→v9 additive migration、每个历史 project 独立 workspace、
+分页项目库、只读 workspace 详情/重新打开，以及前端 URL/最近 workspace 恢复。重新打开不
+执行分析、Embedding、relation 或 Provider，也不写学习事件。P2.2/P2.3 尚未实现。
+
+实施顺序：
 
 1. P2.1：项目库、稳定 workspace/snapshot 身份和重新打开；
 2. P2.2：revision 检测、幂等 update run、增量重建和原子激活；
 3. P2.3：跨 revision 学习重验证与最小持续学习 UI。
 
-完整范围、非目标、schema 建议、兼容性、安全边界、Gate 和风险见
-[`LOCAL_PRODUCT_PHASE2_PLAN.md`](LOCAL_PRODUCT_PHASE2_PLAN.md)。该文档是建议，尚未
-授权实施；Phase 2 不包含 M5/Phase 6 修改或 live benchmark。
+完整范围、非目标、冻结身份契约、兼容性、安全边界、Gate 和风险见
+[`LOCAL_PRODUCT_PHASE2_PLAN.md`](LOCAL_PRODUCT_PHASE2_PLAN.md)。P2.2/P2.3 仍需单独
+授权；Phase 2 不包含 M5/Phase 6 修改或 live benchmark。

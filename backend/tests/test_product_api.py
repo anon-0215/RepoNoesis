@@ -126,12 +126,15 @@ class ProductApiTests(unittest.TestCase):
         self.assertEqual(first["status"], "done")
         self.assertEqual(first["import_action"], "analyzed")
         self.assertEqual(second["project_id"], first["project_id"])
+        self.assertEqual(second["workspace_id"], first["workspace_id"])
         self.assertEqual(second["import_action"], "reused")
         reopened = Database(self.database.path)
         bundle = reopened.get_bundle(first["project_id"])
         self.assertIsNotNone(bundle)
         self.assertEqual(bundle["project"]["source_type"], "local")
         self.assertGreater(len(bundle["code_chunks"]), 0)
+        workspace = reopened.get_workspace_for_project(first["project_id"])
+        self.assertEqual(workspace["id"], first["workspace_id"])
 
 
 class _FakeEmbeddingBackend:

@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 
 from app.config import EmbeddingSettings
-from app.database import Database
+from app.database import Database, SCHEMA_VERSION
 from app.services.embedding_service import (
     CODE_CHUNK_TEXT_FORMAT_VERSION,
     EmbeddingModelIdentity,
@@ -269,7 +269,7 @@ class DatabaseEmbeddingTests(unittest.TestCase):
             self.assertIn("embedding_config_hash", columns)
             self.assertIn("wrapper_model_identity", columns)
             self.assertIn("resolved_revision", columns)
-            self.assertEqual(version, 8)
+            self.assertEqual(version, SCHEMA_VERSION)
             self.assertEqual(legacy["identity_schema_version"], "legacy")
             self.assertEqual(legacy["identity_eligible"], 0)
 

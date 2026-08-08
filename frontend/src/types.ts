@@ -107,3 +107,32 @@ export interface ConfigStatus {
   };
 }
 
+export interface WorkspaceSummary {
+  workspace_id: string;
+  display_name: string;
+  source_type: string;
+  project_status: string;
+  repository_revision: string;
+  openable: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface WorkspaceListResponse {
+  items: WorkspaceSummary[];
+  total: number;
+  limit: number;
+  offset: number;
+}
+
+export interface WorkspaceDetail extends WorkspaceSummary {
+  active_snapshot: {
+    project_id: string;
+    repository_revision: string;
+    status: string;
+    primary_language: string;
+    frameworks: string[];
+    updated_at: string;
+  };
+}
+

@@ -37,8 +37,8 @@ class M3SchemaAndRelationTests(unittest.TestCase):
                     "SELECT name FROM sqlite_master WHERE type='index'"
                 )
             }
-        self.assertEqual(SCHEMA_VERSION, 8)
-        self.assertEqual(version, 8)
+        self.assertEqual(SCHEMA_VERSION, 9)
+        self.assertEqual(version, 9)
         self.assertTrue(
             {"relation_nodes", "code_relations", "relation_index_runs"}.issubset(
                 tables
@@ -70,7 +70,7 @@ class M3SchemaAndRelationTests(unittest.TestCase):
                 conn.execute(
                     "SELECT version FROM schema_versions WHERE key='database'"
                 ).fetchone()["version"],
-                8,
+                SCHEMA_VERSION,
             )
 
     def test_migration_failure_does_not_report_a_false_v5_version(self):

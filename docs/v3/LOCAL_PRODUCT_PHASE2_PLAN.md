@@ -1,6 +1,6 @@
 # RepoNoesis Local Product Phase 2 设计方案（建议）
 
-> 状态：建议，尚未实施，尚未成为既有架构决策。
+> 状态：P2.1 身份契约已冻结并进入实施；P2.2/P2.3 仍为建议，尚未实施。
 >
 > 基线：Local Product Phase 1 代码验收提交
 > `e07bfd16e16ecbb827ab002fb9f11274013b92e3`，数据库 schema v8。
@@ -150,6 +150,31 @@ revision；系统只重做有必要的工作，失败时保留原可用 snapshot
 迁移只新增表/列/索引，不删除 v8 数据。降级到旧代码时，旧 API 仍能读取原 `projects`
 snapshot；新表可以被忽略。不得通过破坏性 down migration 回滚用户数据。
 
+#### 5.1.1 P2.1 冻结身份契约
+
+P2.1 采用以下正式兼容契约；后续 P2.2 只能在该契约上增量扩展，不能回写或合并历史：
+
+1. `repository_workspaces` 表示用户长期持有并重新打开的仓库学习工作区。它使用服务端
+   生成、持久化的 `workspace_id`，不使用内存对象、列表位置、本地绝对路径、仓库 URL、
+   显示名或 revision 作为身份。应用和后端重启不会改变该 ID。
+2. 现有 `projects` 不改名、不重新编号，继续作为一次已分析 revision 的兼容 snapshot
+   载体。所有既有项目路由、Evidence、relation、goal、plan、task、attempt、evaluation、
+   immutable event 和 learner state 外键继续绑定原 `project_id`。
+3. `workspace_revisions` 是 P2.1 对 revision/snapshot 关系的最小持久化表示：它只记录
+   workspace 与现有 project snapshot 的精确归属及 revision。P2.1 的 workspace 只有一个
+   当前可打开 project；不创建虚构历史，不解析新 revision，也不实现 refresh、staging 或
+   activation 状态机。
+4. 每个 schema v8 历史 project 独立迁移为一个 workspace，并建立一条指向该 project 的
+   revision 记录。即使 URL、路径、显示名或 revision 相同也绝不自动合并。迁移不更新、
+   删除或重新编号任何历史 project 或学习/证据数据，且以 project 的唯一归属约束保证重复
+   执行不会创建第二个 workspace。
+5. workspace 详情只有在 `active_project_id`、`workspace_revisions` 和 `projects` 三者精确
+   一致时才可重新打开；缺失、交叉归属或 revision 不一致均返回固定的损坏关联错误，禁止
+   静默选择其他 project。
+6. “重新打开”只解析上述持久化关联，再调用原 project 只读接口恢复 UI。它不导入仓库、
+   不分析、不生成 chunk/Embedding、不重建 relation、不调用 Provider，也不写学习状态或
+   learning event。浏览器最近项目只保存稳定 `workspace_id`。
+
 ### 5.2 更新编排
 
 建议固定阶段：
@@ -265,6 +290,14 @@ reasoning content、Header、凭据及其长度/片段/哈希。诊断必须有�
 ## 7. 子阶段、输入、输出、验收与回滚
 
 ### P2.1：项目库与可重新打开工作区
+
+**实施状态（2026-08-08）：已完成。** 实际数据库版本从 v8 升至 v9，新增
+`repository_workspaces` 与 `workspace_revisions`，每个历史 project 独立迁移且不自动合并。
+新增 `GET /api/workspaces` 与 `GET /api/workspaces/{workspace_id}`；前端使用 URL 中的稳定
+workspace ID 和仅含该 ID 的本地最近记录恢复。reopen 只解析 SQLite 关联并读取原 project
+接口，不执行 analyze、Embedding、relation、Provider 或 learning event 写入。P2.2/P2.3、
+refresh、revision 变化检测、增量更新与 snapshot activation 均未实现。本轮只执行 fake/
+offline 自动化验证，没有运行 Gate A/B/C 或任何真实网络、Embedding、Provider Gate。
 
 **输入：** schema v8 数据库中的现有 projects，以及 Phase 1 的 local/public import。
 

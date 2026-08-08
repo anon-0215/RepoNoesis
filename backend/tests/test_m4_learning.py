@@ -41,7 +41,7 @@ class M4LearningServiceTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.directory.cleanup()
 
-    def test_fresh_schema_is_v8_with_learning_tables_indexes_and_immutable_events(self):
+    def test_fresh_schema_has_learning_tables_indexes_and_immutable_events(self):
         with self.db.connect() as conn:
             version = conn.execute(
                 "SELECT version FROM schema_versions WHERE key='database'"
@@ -49,11 +49,18 @@ class M4LearningServiceTests(unittest.TestCase):
             tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
             indexes = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='index'")}
             triggers = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='trigger'")}
-        self.assertEqual(SCHEMA_VERSION, 8)
-        self.assertEqual(version, 8)
+        self.assertEqual(SCHEMA_VERSION, 9)
+        self.assertEqual(version, 9)
         self.assertTrue({"learning_goals", "learning_plans", "learning_tasks", "learning_events", "learner_target_states"}.issubset(tables))
         self.assertIn("idx_learning_states_review", indexes)
-        self.assertEqual(triggers, {"trg_learning_events_no_update", "trg_learning_events_no_delete"})
+        self.assertEqual(
+            triggers,
+            {
+                "trg_learning_events_no_update",
+                "trg_learning_events_no_delete",
+                "trg_projects_delete_workspace",
+            },
+        )
 
     def test_local_learner_and_goal_are_stable_across_service_instances(self):
         request = CreateGoalRequest(

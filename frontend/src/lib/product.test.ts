@@ -1,6 +1,14 @@
 import { describe, expect, it } from 'vitest';
 
-import { buildAnalyzePayload, citationLabel, providerSummary } from './product';
+import {
+  buildAnalyzePayload,
+  citationLabel,
+  nextWorkspaceSearch,
+  normalizeWorkspaceId,
+  providerSummary,
+  selectWorkspaceToRestore,
+  workspaceLibraryStatus
+} from './product';
 
 describe('local product presentation', () => {
   it('switches between the two explicit source payloads', () => {
@@ -48,5 +56,38 @@ describe('local product presentation', () => {
         end_line: 11
       })
     ).toBe('src/app.py:10-11 · app.answer');
+  });
+
+  it('restores a stable workspace id from the URL before local recent state', () => {
+    const urlId = '11111111-1111-4111-8111-111111111111';
+    const recentId = '22222222-2222-4222-8222-222222222222';
+    expect(selectWorkspaceToRestore(`?workspace=${urlId}`, recentId)).toEqual({
+      workspaceId: urlId,
+      source: 'url'
+    });
+    expect(selectWorkspaceToRestore('', recentId)).toEqual({
+      workspaceId: recentId,
+      source: 'recent'
+    });
+  });
+
+  it('rejects malformed URL and stale local values without treating them as ids', () => {
+    expect(normalizeWorkspaceId('not-a-workspace')).toBeNull();
+    expect(selectWorkspaceToRestore('?workspace=not-a-workspace', 'also-bad')).toEqual({
+      workspaceId: null,
+      source: 'invalid_url'
+    });
+  });
+
+  it('writes only the stable workspace id into the URL query', () => {
+    const id = '33333333-3333-4333-8333-333333333333';
+    expect(nextWorkspaceSearch('?tab=map&project=secret', id)).toBe(`?tab=map&workspace=${id}`);
+  });
+
+  it('keeps project-library loading, error, empty and ready states distinct', () => {
+    expect(workspaceLibraryStatus('loading')).toBe('loading');
+    expect(workspaceLibraryStatus('error')).toBe('error');
+    expect(workspaceLibraryStatus('success', 0)).toBe('empty');
+    expect(workspaceLibraryStatus('success', 2)).toBe('ready');
   });
 });

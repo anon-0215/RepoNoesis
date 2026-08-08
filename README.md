@@ -5,8 +5,9 @@
 > offline backend regression passed. Setup, safe acceptance evidence, and
 > limitations are recorded in
 > [`docs/v3/LOCAL_PRODUCT_PHASE1.md`](docs/v3/LOCAL_PRODUCT_PHASE1.md).
-> The proposed, not-yet-implemented Local Product Phase 2 workspace-lifecycle
-> plan is in
+> Local Product Phase 2 P2.1 now provides the persistent project library and
+> restart-safe workspace reopening. P2.2/P2.3 remain unimplemented; the plan
+> and exact identity contract are in
 > [`docs/v3/LOCAL_PRODUCT_PHASE2_PLAN.md`](docs/v3/LOCAL_PRODUCT_PHASE2_PLAN.md).
 
 面向编程初学者的 GitHub 开源项目学习 Agent。
@@ -327,6 +328,8 @@ http://127.0.0.1:8000
 | --- | --- | --- |
 | `GET` | `/api/health` | 健康检查，确认后端、LLM 配置和 GitHub token 状态。 |
 | `POST` | `/api/projects/analyze` | 提交本地 Git 目录或公开 HTTPS Git URL，完成产品导入/分析并返回 `project_id`；旧 `repo_url` 请求保持兼容。 |
+| `GET` | `/api/workspaces?limit=20&offset=0` | 分页读取不含源码、Evidence、Embedding 或本地路径的项目库摘要。 |
+| `GET` | `/api/workspaces/{workspace_id}` | 解析当前可重新打开的持久化 project snapshot；只读且不触发分析、索引或 Provider。 |
 | `GET` | `/api/projects/{project_id}` | 获取项目概览、技术栈、核心文件和模块摘要。 |
 | `GET` | `/api/projects/{project_id}/map` | 获取目录树、模块关系和核心文件列表。 |
 | `GET` | `/api/projects/{project_id}/learning-path` | 获取学习路线、任务和测验。 |
@@ -414,6 +417,11 @@ GitLearnAgent/
 Local Product 路径支持读取干净本地 Git 工作树的 tracked files，或把无凭据公开 HTTPS
 Git 仓库克隆到受控、被 Git 忽略的运行目录。两种来源都解析固定 commit revision，且不
 执行仓库代码、不安装仓库依赖。旧 `repo_url` GitHub API 路径继续作为兼容入口。
+
+schema v9 为每个既有 project snapshot 建立独立、稳定的 workspace。前端项目库可以在后端
+重启后按 URL 中的 `workspace` ID 或浏览器最近 workspace ID 重新打开原 project；该流程只
+读取 SQLite 和既有 project API，不重新分析、生成 chunk/Embedding、重建 relation、调用
+Provider 或写入学习事件。P2.1 不实现 revision refresh 或增量更新。
 
 后端会解析 GitHub URL，提取 `owner/repo`，然后通过 GitHub REST API 获取：
 
@@ -658,15 +666,15 @@ samples/demo_repositories.md
 - 已支持本地 BGE-M3 与词法/符号/关系检索，但当前真实验收 fixture 很小，未证明任意仓库
   规模和长期性能。
 - 大模型增强只支持 OpenAI 兼容接口。
-- 项目数据和 M4 学习状态可持久化，但前端尚无项目库/重新打开流程；新 revision 当前创建
-  新 project，不做端到端增量刷新或跨 project 学习历史合并。
+- 项目数据和 M4 学习状态可持久化，前端可通过稳定 workspace ID 重新打开；新 revision
+  当前仍创建新 project，不做端到端增量刷新或跨 project 学习历史合并。
 - 分析同步执行，进度较粗；没有持久化更新任务、阶段恢复或并发用户保证。
 - 暂不执行被分析仓库代码，避免安全风险。
 
 ## 后续计划
 
-- 优先评审并实施建议的 Local Product Phase 2 主线：项目库/重新打开、revision-aware
-  增量刷新、失败恢复和学习状态重验证。详见
+- Local Product Phase 2 P2.1 项目库/重新打开已完成；下一步只能另行评审 P2.2 的
+  revision-aware 增量刷新、失败恢复与原子激活，P2.3 学习状态重验证仍在其后。详见
   [`docs/v3/LOCAL_PRODUCT_PHASE2_PLAN.md`](docs/v3/LOCAL_PRODUCT_PHASE2_PLAN.md)。
 - M5 继续作为独立的可复现实验和对照评测路线；其 live gate 未完成时不得宣称完整通过。
 - 完整学习工作台、更大仓库性能、多项目高级组织、更多语言、私有仓库认证和云多用户能力

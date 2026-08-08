@@ -1,4 +1,12 @@
-import type { ChatAnswer, ConfigStatus, LearningStep, ProjectMap, ProjectResponse } from '../types';
+import type {
+  ChatAnswer,
+  ConfigStatus,
+  LearningStep,
+  ProjectMap,
+  ProjectResponse,
+  WorkspaceDetail,
+  WorkspaceListResponse
+} from '../types';
 import { buildAnalyzePayload, type SourceType } from './product';
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL ?? 'http://127.0.0.1:8000';
@@ -36,11 +44,19 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
 export async function analyzeProject(
   sourceType: SourceType,
   source: string
-): Promise<{ project_id: string; status: string; import_action: string }> {
+): Promise<{ project_id: string; workspace_id: string; status: string; import_action: string }> {
   return request('/api/projects/analyze', {
     method: 'POST',
     body: JSON.stringify(buildAnalyzePayload(sourceType, source))
   });
+}
+
+export async function listWorkspaces(limit = 20, offset = 0): Promise<WorkspaceListResponse> {
+  return request(`/api/workspaces?limit=${limit}&offset=${offset}`);
+}
+
+export async function getWorkspace(workspaceId: string): Promise<WorkspaceDetail> {
+  return request(`/api/workspaces/${encodeURIComponent(workspaceId)}`);
 }
 
 export async function getConfigStatus(): Promise<ConfigStatus> {

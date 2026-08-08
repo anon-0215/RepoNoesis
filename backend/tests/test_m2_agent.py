@@ -400,7 +400,7 @@ class M2AgentTests(unittest.TestCase):
         mocked_agent.assert_called_once()
         self.assertEqual(validated.agent_schema_version, 1)
         self.assertEqual(result["agent_mode"], "deterministic_fallback")
-        self.assertEqual(SCHEMA_VERSION, 8)
+        self.assertEqual(SCHEMA_VERSION, 9)
 
 
 if __name__ == "__main__":
