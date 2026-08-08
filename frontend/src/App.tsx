@@ -725,7 +725,7 @@ function ReportView({ markdown }: { markdown: string }) {
     const url = URL.createObjectURL(blob);
     const anchor = document.createElement('a');
     anchor.href = url;
-    anchor.download = 'gitlearnagent-report.md';
+    anchor.download = 'reponoesis-report.md';
     anchor.click();
     URL.revokeObjectURL(url);
   }

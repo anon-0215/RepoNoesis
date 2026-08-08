@@ -1,5 +1,8 @@
 # 源鉴 RepoNoesis
 
+> 《源鉴（RepoNoesis）——面向真实代码仓库的证据驱动型持续学习智能体》
+> “让每一次代码解释，都源于真实源码。”
+
 > **Local Product Phase 1: FULL PASS (2026-08-02).** The accepted code baseline
 > is `e07bfd16e16ecbb827ab002fb9f11274013b92e3`; Gate A/B/C and the 514-test
 > offline backend regression passed. Setup, safe acceptance evidence, and
@@ -12,6 +15,8 @@
 > learning continuity, deterministic target mapping, conservative mastery
 > carry-forward, `needs_review`, and explicit retry. The plan and exact contracts are in
 > [`docs/v3/LOCAL_PRODUCT_PHASE2_PLAN.md`](docs/v3/LOCAL_PRODUCT_PHASE2_PLAN.md).
+> Repository and product naming governance is recorded in
+> [`docs/v3/OPS_NAME1.md`](docs/v3/OPS_NAME1.md).
 
 面向编程初学者的 GitHub 开源项目学习 Agent。
 
@@ -48,7 +53,7 @@
 - 直接问通用 AI 时，回答可能缺少源码依据。
 - 大模型一次性总结仓库时容易遗漏入口文件、配置文件和真实模块边界。
 
-GitLearnAgent 的目标是把一个 GitHub 开源仓库转化为一套适合初学者的学习材料：
+源鉴 RepoNoesis 的目标是把一个 GitHub 开源仓库转化为一套适合初学者的学习材料：
 
 - 先建立项目全局印象。
 - 再理解依赖和启动方式。
@@ -115,8 +120,8 @@ flowchart TD
 ### 1. 克隆项目
 
 ```powershell
-git clone https://github.com/anon-0215/GitLearnAgent.git
-cd GitLearnAgent
+git clone https://github.com/anon-0215/RepoNoesis.git
+cd RepoNoesis
 ```
 
 ### 2. 创建环境
@@ -281,7 +286,7 @@ http://127.0.0.1:8000/api/health
   "ok": true,
   "llm_available": false,
   "github_token_configured": true,
-  "database": "D:\\Project\\RepoNoesis-v3\\backend\\data\\gitlearn.sqlite"
+  "database": "D:\\Project\\RepoNoesis\\backend\\data\\gitlearn.sqlite"
 }
 ```
 
@@ -386,7 +391,7 @@ Content-Type: application/json
 ## 项目结构
 
 ```text
-GitLearnAgent/
+RepoNoesis/
   backend/
     app/
       main.py                 FastAPI 入口与 API 路由
@@ -574,7 +579,7 @@ cd frontend
 npm run build
 ```
 
-V3·LP2.3 在 2026-08-08 的最终离线回归记录为：后端 `Ran 557 tests / OK`；前端
+OPS·NAME1 在 2026-08-08 的最终离线回归记录为：后端 `Ran 568 tests / OK`；前端
 Vitest `9 passed`；TypeScript 与 Vite production build 通过。该记录只使用
 临时 fixture、fake repository/fake Embedding 与静态检查，没有运行真实网络、BGE-M3、
 Provider、Gate A/B/C、P2 live Gate 或 M5 live pilot。
@@ -712,8 +717,7 @@ samples/demo_repositories.md
 ## 后续计划
 
 - Local Product Phase 2 P2.1 项目库/重新打开、V3·LP2.2 revision-aware 增量刷新和
-  V3·LP2.3 跨版本学习连续性已完成离线实现；下一步只能单独授权真实本地产品验收或
-  OPS 仓库命名治理。详见
+  V3·LP2.3 跨版本学习连续性已完成离线实现；真实本地产品验收仍需单独授权。详见
   [`docs/v3/LOCAL_PRODUCT_PHASE2_PLAN.md`](docs/v3/LOCAL_PRODUCT_PHASE2_PLAN.md)。
 - M5 继续作为独立的可复现实验和对照评测路线；其 live gate 未完成时不得宣称完整通过。
 - 完整学习工作台、更大仓库性能、多项目高级组织、更多语言、私有仓库认证和云多用户能力
@@ -721,7 +725,7 @@ samples/demo_repositories.md
 
 ## 项目价值
 
-GitLearnAgent 的重点不是替代通用 AI，而是探索一种更适合编程初学者的开源项目导读方式。
+源鉴 RepoNoesis 的重点不是替代通用 AI，而是探索一种更适合编程初学者的开源项目导读方式。
 
 相比直接问通用 AI，本项目强调：
 

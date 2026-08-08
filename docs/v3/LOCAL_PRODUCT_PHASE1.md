@@ -19,8 +19,8 @@ hosts resolving to non-public addresses are rejected.
 
 ## Configuration
 
-Copy `D:\Project\RepoNoesis-v3\.env.example` to the ignored file
-`D:\Project\RepoNoesis-v3\.env`. Configuration discovery is anchored to the
+Copy `D:\Project\RepoNoesis\.env.example` to the ignored file
+`D:\Project\RepoNoesis\.env`. Configuration discovery is anchored to the
 source tree and does not depend on the shell working directory. Existing
 process variables take precedence. The backend must be restarted after any
 backend setting changes; Vite must be restarted after `VITE_API_BASE_URL` or
@@ -99,7 +99,7 @@ the warning that credentials remain backend-only.
 
 ## Verification gates
 
-All commands below run from `D:\Project\RepoNoesis-v3\backend`. Default unit
+All commands below run from `D:\Project\RepoNoesis\backend`. Default unit
 tests remain offline and use injected fakes only.
 
 Gate A loads real local BGE-M3 in offline mode, imports a temporary clean local
@@ -123,7 +123,7 @@ DeepSeek pass. After the root `.env` is completed, rerun Gate C with this single
 exact command:
 
 ```powershell
-Set-Location D:\Project\RepoNoesis-v3\backend; D:\Programme\Anaconda\envs\gitlearnagent\python.exe -B -m app.local_product_smoke --gate-c
+Set-Location D:\Project\RepoNoesis\backend; D:\Programme\Anaconda\envs\gitlearnagent\python.exe -B -m app.local_product_smoke --gate-c
 ```
 
 Gate C creates a temporary local fixture, uses real BGE-M3 and the configured

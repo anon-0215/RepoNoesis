@@ -187,7 +187,7 @@ def fetch_repository(repo_url: str) -> RepositorySnapshot:
 def _request(url: str) -> bytes:
     headers = {
         "Accept": "application/vnd.github+json",
-        "User-Agent": "GitLearnAgent/0.1",
+        "User-Agent": "RepoNoesis/0.1",
     }
     token = get_env_value("GITHUB_TOKEN")
     if token:
@@ -200,12 +200,12 @@ def _request(url: str) -> bytes:
         message = exc.read().decode("utf-8", errors="ignore")
         if exc.code == 401 and get_env_value("GITHUB_TOKEN"):
             raise RuntimeError(
-                "GitHub Token 无效或已过期。请重新生成 token，并确认 D:\\Project\\GitLearnAgent\\.env "
+                "GitHub Token 无效或已过期。请重新生成 token，并确认项目根目录 .env "
                 "中的 GITHUB_TOKEN 只包含 token 本身，不要带引号、空格或注释。"
             ) from exc
         if exc.code == 403 and "rate limit" in message.lower() and not get_env_value("GITHUB_TOKEN"):
             raise RuntimeError(
-                "GitHub 匿名 API 已达到限流。请在 D:\\Project\\GitLearnAgent\\.env 中设置 "
+                "GitHub 匿名 API 已达到限流。请在项目根目录 .env 中设置 "
                 "GITHUB_TOKEN，然后重启后端。"
             ) from exc
         raise RuntimeError(f"GitHub 请求失败 {exc.code}: {message[:300]}") from exc

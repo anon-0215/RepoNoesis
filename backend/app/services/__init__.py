@@ -1,2 +1,2 @@
-"""Service layer for GitLearnAgent."""
+"""Service layer for RepoNoesis."""
 

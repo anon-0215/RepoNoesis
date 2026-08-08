@@ -1,2 +1,2 @@
-"""GitLearnAgent backend package."""
+"""RepoNoesis backend package."""
 

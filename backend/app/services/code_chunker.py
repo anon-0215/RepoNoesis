@@ -208,7 +208,7 @@ class _ChunkVisitor(ast.NodeVisitor):
         if end_line is None:
             raise RuntimeError(
                 "Python AST end_lineno is required for safe code chunk extraction. "
-                "Run GitLearnAgent with Python 3.8 or newer."
+                "Run RepoNoesis with Python 3.8 or newer."
             )
         return int(end_line)
 
