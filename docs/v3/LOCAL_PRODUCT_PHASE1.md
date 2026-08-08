@@ -26,6 +26,13 @@ process variables take precedence. The backend must be restarted after any
 backend setting changes; Vite must be restarted after `VITE_API_BASE_URL` or
 `FRONTEND_PORT` changes.
 
+OPS ENV1 makes this discovery explicit: ordinary imports, including
+`app.main`, read configuration only from the existing process environment and
+never search for `.env`. The production bootstrap `python -m app.run_server`
+calls `load_environment()` before Uvicorn imports `app.main:app`. Tests provide
+configuration through fixtures, explicit process variables, or temporary
+sentinel files and never depend on the repository's real `.env`.
+
 Required product generation values:
 
 - `LLM_PROVIDER=openai_compatible`
@@ -81,6 +88,10 @@ From the repository root, run `start_all.bat`, or start the two services with
 `backend\run_backend.bat` and `frontend\run_frontend.bat`. The launchers use
 repository-relative paths. Python/npm must be on `PATH`, or the backend may use
 `backend\.venv\Scripts\python.exe`.
+
+For a manual backend start, change to `backend` and run
+`python -m app.run_server`. This is the sole normal application bootstrap and
+preserves the required environment-before-configuration ordering.
 
 The frontend sends only `{source_type, source}` for imports. It displays import
 status, safe provider/model diagnostics, exact file/symbol/line citations, and

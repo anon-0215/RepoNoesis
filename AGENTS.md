@@ -154,7 +154,7 @@ frontend\run_frontend.bat
 
 ```powershell
 cd backend
-python -m uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
+python -m app.run_server
 ```
 
 手动启动前端：

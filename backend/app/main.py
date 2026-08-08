@@ -2,7 +2,8 @@ from __future__ import annotations
 
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any, Literal
+from threading import RLock
+from typing import Any, Callable, Literal
 
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -14,7 +15,6 @@ from app.config import (
     get_env_value,
     get_product_config_status,
     get_repository_settings,
-    load_environment,
 )
 from app.database import Database, SCHEMA_VERSION
 from app.services.analyzer import analyze_snapshot
@@ -55,13 +55,45 @@ from app.services.workspace_service import (
 from app.services.workspace_update import WorkspaceUpdateError, WorkspaceUpdateService
 
 
-load_environment()
+class _DeferredValue:
+    """Construct a runtime service only when application startup or a route uses it."""
+
+    def __init__(self, factory: Callable[[], Any]) -> None:
+        self._factory = factory
+        self._value: Any | None = None
+        self._lock = RLock()
+
+    def initialize(self) -> Any:
+        if self._value is None:
+            with self._lock:
+                if self._value is None:
+                    self._value = self._factory()
+        return self._value
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.initialize(), name)
+
+
+def _initialize_runtime_value(value: Any) -> Any:
+    return value.initialize() if isinstance(value, _DeferredValue) else value
+
+
+db = _DeferredValue(Database)
+llm = LLMClient()
+learning_service = _DeferredValue(
+    lambda: LearningService(_initialize_runtime_value(db), llm)
+)
+embedding_service = EmbeddingService(get_embedding_settings())
+agent_limits = get_agent_limits()
+repository_settings = get_repository_settings()
 
 
 @asynccontextmanager
 async def app_lifespan(_app: FastAPI):
-    WorkspaceUpdateService(db, repository_settings, embedding_service).recover_interrupted_runs()
-    LearningContinuityService(db).recover_interrupted()
+    database = _initialize_runtime_value(db)
+    _initialize_runtime_value(learning_service)
+    WorkspaceUpdateService(database, repository_settings, embedding_service).recover_interrupted_runs()
+    LearningContinuityService(database).recover_interrupted()
     yield
 
 app = FastAPI(title="源鉴 RepoNoesis API", version="0.1.0", lifespan=app_lifespan)
@@ -72,14 +104,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-db = Database()
-llm = LLMClient()
-learning_service = LearningService(db, llm)
-embedding_service = EmbeddingService(get_embedding_settings())
-agent_limits = get_agent_limits()
-repository_settings = get_repository_settings()
-
 
 class AnalyzeRequest(BaseModel):
     repo_url: str | None = Field(default=None, examples=["https://github.com/tiangolo/fastapi"])

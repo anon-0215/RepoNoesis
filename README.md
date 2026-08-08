@@ -176,7 +176,10 @@ D:\Project\my-python-repository
 
 ## 环境变量
 
-项目会读取根目录下的 `.env` 文件。
+正式后端启动入口会读取根目录下的 `.env` 文件。普通导入 `app.main`
+或其他后端模块不会搜索或读取 `.env`，也不会把其中的值写入
+`os.environ`。进程环境变量仍优先于 `.env`；测试通过 fixture、显式环境变量
+或临时目录中的哨兵 `.env` 提供配置，不依赖工作区真实 `.env`。
 
 | 变量 | 必填 | 说明 |
 | --- | --- | --- |
@@ -308,8 +311,12 @@ frontend\run_frontend.bat
 
 ```powershell
 cd backend
-python -m uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
+python -m app.run_server
 ```
+
+`app.run_server` 是正式后端 bootstrap：先显式加载 `.env`，再读取主机、端口
+并让 Uvicorn 导入 `app.main:app`。不要用 `uvicorn app.main:app` 绕过该顺序。
+工程边界与证明范围见 [OPS ENV1 记录](docs/v3/OPS_ENV1.md)。
 
 ### 手动启动前端
 

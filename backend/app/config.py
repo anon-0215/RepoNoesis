@@ -16,6 +16,10 @@ EMBEDDING_MAX_LENGTH_MAX = 8192
 ThinkingMode = Literal["enabled", "disabled"]
 
 
+class EnvironmentLoadError(RuntimeError):
+    """Raised when the explicit bootstrap cannot safely load `.env`."""
+
+
 def load_environment() -> None:
     """Load simple KEY=VALUE pairs from project .env files.
 
@@ -23,18 +27,22 @@ def load_environment() -> None:
     override settings from the command line when they want to.
     """
     env_path = PROJECT_ROOT / ".env"
-    if env_path.exists():
-        _load_env_file(env_path)
+    try:
+        if env_path.exists():
+            _load_env_file(env_path)
+    except (OSError, UnicodeError):
+        raise EnvironmentLoadError(
+            "Failed to load backend environment configuration."
+        ) from None
 
 
 def get_env_value(key: str, default: str = "") -> str:
-    if key in os.environ:
-        return os.environ[key]
-    env_path = PROJECT_ROOT / ".env"
-    if env_path.exists():
-        values = _read_env_file(env_path)
-        if key in values:
-            return values[key]
+    """Read configuration already present in the process environment.
+
+    Disk-backed ``.env`` loading is intentionally restricted to the explicit
+    production bootstrap. Ordinary imports and configuration access therefore
+    never search for or read an environment file.
+    """
     return os.getenv(key, default)
 
 
