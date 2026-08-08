@@ -1,6 +1,6 @@
-# RepoNoesis Local Product Phase 2 设计方案（建议）
+# 源鉴 RepoNoesis Local Product Phase 2 设计与实施记录
 
-> 状态：P2.1 身份契约已冻结并进入实施；P2.2/P2.3 仍为建议，尚未实施。
+> 状态：P2.1 与 V3·LP2.2 已完成离线实现；P2.3 仍未实施，必须另行评审。
 >
 > 基线：Local Product Phase 1 代码验收提交
 > `e07bfd16e16ecbb827ab002fb9f11274013b92e3`，数据库 schema v8。
@@ -29,33 +29,32 @@ Phase 1 后的当前产品路径已经改变为：相同 source + revision 的 c
 | 能力 | 当前真实状态 | 缺口类型 |
 | --- | --- | --- |
 | 项目持久化 | 项目、分析结果、索引和学习数据写入 SQLite；`GET /api/projects/{id}` 可按已知 ID 读取。 | 功能基本存在。 |
-| 已有项目重新打开 | 后端可按 ID 读取，但没有项目列表 API、项目选择器或稳定浏览器恢复；前端 `projectId` 只在 React 进程内。 | 产品功能/UX 缺口。 |
+| 已有项目重新打开 | P2.1 已提供分页 workspace 库、稳定 URL/最近 workspace 恢复和只读 reopen。 | 已实现。 |
 | `/analyze` 幂等 | Phase 1 产品请求对相同 revision 复用；failed 可原记录重试；legacy `repo_url` 路径仍创建新项目。 | 兼容路径不一致。 |
-| revision 检测 | 导入时解析 Git commit，并把 revision 纳入 source identity；没有对已有项目显式“检查更新/刷新”的 API。 | 功能缺口。 |
-| 同仓库增量更新 | 新 revision 创建新 project；`save_analysis` 全量替换该 project 的文件/模块/学习步骤和关系数据。 | 核心功能/架构缺口。 |
-| 仅重建变化部分 | EmbeddingIndexer 对同一 project 的 fresh cache 可避免重复编码，但新 revision 的产品编排没有端到端增量复用。 | 性能/规模及编排缺口。 |
-| 多项目管理 | 数据库可保存多个 project，但没有列表、搜索、选择、归档或删除产品流程。 | 产品功能/UX 缺口。 |
+| revision 检测 | V3·LP2.2 由用户显式检查 workspace 来源，服务端解析 commit 并返回 unchanged/update-available。 | 已实现。 |
+| 同仓库增量更新 | 新 revision 在同一 workspace 下构建 staging project；完整验证后原子切换 active pointer，失败保留旧 project。 | 已实现。 |
+| 仅重建变化部分 | 文件 manifest 按内容 diff；chunk 按 chunker 身份复用，Embedding 按完整有效身份复用，relation 在新 snapshot 内安全全量重建。 | 已实现安全基线；局部 relation 闭包仍未采用。 |
+| 多项目管理 | P2.1 已提供最小分页项目库和选择；搜索、归档、删除和高级组织仍未实现。 | 最小范围已实现。 |
 | 学习状态跨会话 | M4 goal/plan/task/attempt/event/state 在同一 project 下持久化并可跨后端进程恢复。 | 已实现。 |
 | 学习状态跨 revision | 新 revision 当前是新 project；不同 project 不自动合并 learner history。 | 核心功能/数据语义缺口。 |
-| M1—M4 前端 | 当前 UI 暴露导入、概览、地图、旧学习路线、问答和报告；未完整暴露 M4 goal/plan/task/attempt/review API。 | 产品功能/UX 缺口。 |
+| M1—M4 前端 | UI 已暴露 workspace reopen 与 P2.2 显式更新状态；完整 M4 goal/plan/task/attempt/review UI 仍未实现。 | 生命周期已实现；教学工作台仍是缺口。 |
 | 真实 Provider/Embedding | Gate A/B/C 在 CLI smoke 中验证；Gate C 是一个很小的本地 Python fixture。没有记录真实浏览器 E2E、长期运行或多仓库矩阵。 | 验收广度/质量缺口。 |
 | 语言 | 产品级 chunk、关系和 Gate 重点是 Python；旧分析器有轻量 JS/TS 结构识别，但不是同等产品级证据链。 | 兼容性边界。 |
-| 规模 | 同步分析，面向中小型仓库，前端进度粗粒度；未证明大仓库性能或中断恢复。 | 规模/可靠性缺口。 |
+| 规模 | 初始分析仍同步；P2.2 run/阶段持久化且中断后安全失败可重试，但未证明大仓库性能或阶段内续跑。 | 规模/可靠性边界。 |
 | 平台 | 当前本地验收记录来自 Windows；启动脚本和文档以 Windows 为主。 | 平台验证边界。 |
 
-### 1.2 必须优先处理的架构债务
+### 1.2 实施状态与剩余架构债务
 
-1. `source_identity` 同时包含稳定来源和 revision，无法直接表达“同一仓库工作区的多个
-   revision”。
-2. `project_id` 当前既是用户项目身份又是单次 revision snapshot 身份；M4 学习状态绑定
-   `project_id`，新 revision 因而断开学习连续性。
-3. 导入是同步的一次性编排，缺少持久化 run、阶段、失败恢复、原子激活和显式取消语义。
-4. 分析保存以整批替换为主；Embedding 有 freshness 机制，但产品更新链未把文件 manifest、
-   chunk identity、relation impact 和 embedding reuse 组织成一个正确的增量事务。
-5. 前端没有稳定项目路由/选择器，服务重启后的数据库持久化没有形成用户可见闭环。
-
-这些债务正好位于“持续使用”主线的入口，若先扩展完整学习 UI、更多语言或大仓库规模，
-会把错误的 project/revision 身份传播到更多 API 和页面。
+1. P2.1 已把稳定 workspace 与 revision-bound project 分离；V3·LP2.2 允许同一 workspace
+   保存多个不可变 snapshot，并只激活一个。
+2. `project_id` 继续有意承担 snapshot 身份，M1—M4 Evidence/learning 外键不变。不同
+   revision 的学习连续性仍是 P2.3 缺口，本轮没有自动合并或伪造 mastery。
+3. V3·LP2.2 已持久化 run、阶段、失败恢复和原子激活；本轮没有取消 API，进程/请求中断
+   统一安全失败并要求用户显式 retry。
+4. 文件、chunk 和 Embedding 已组织成内容/完整配置身份驱动的增量链；relation 当前选择
+   可证明正确的 snapshot 内全量重建，而非尚未证明的局部闭包更新。
+5. P2.1/P2.2 前端已形成项目选择、重启恢复、显式检查/确认、进度、失败和成功激活闭环；
+   完整教学工作台、多项目高级组织与大仓库性能仍是后续独立范围。
 
 ## 2. 候选方向比较
 
@@ -316,6 +315,18 @@ offline 自动化验证，没有运行 Gate A/B/C 或任何真实网络、Embedd
 新增表，不执行破坏性 schema 回退。
 
 ### P2.2：revision-aware 增量刷新与恢复
+
+**实施状态（2026-08-08）：已完成离线实现。** schema v9 additive 升级至 v10；新增持久化
+update run、workspace 多 revision metadata、内容 manifest、单一 active snapshot 约束和
+activation version。后端提供显式 revision check、refresh、run 查询和 retry；前端展示
+`ready`、`unchanged`、`update-available`、`updating`、`failed`，且只有用户确认后才启动。
+未变化/唯一 rename 文件在 chunker 身份相同时复用 chunk 结构；Embedding 按完整有效身份
+校验后跨 snapshot 复制，relation 在新 snapshot 内安全全量重建。完整契约见
+[`LOCAL_PRODUCT_P2_2_CONTRACT.md`](LOCAL_PRODUCT_P2_2_CONTRACT.md)。本轮只运行 fixture、
+fake Embedding 和离线自动化；没有运行真实网络、BGE-M3、Provider、Gate A/B/C 或 P2 Gate。
+最终记录为后端 `Ran 543 tests / OK`、前端 Vitest `8 passed`、TypeScript 与 Vite production
+build 通过，OpenAPI 四条 LP2.2 路由静态校验通过。P2.3 learning
+revalidation/carry-forward 保持未实现。
 
 **输入：** P2.1 workspace、当前 active snapshot、显式 refresh 请求和 local/public source。
 

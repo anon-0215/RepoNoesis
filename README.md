@@ -1,18 +1,20 @@
-# GitLearnAgent
+# 源鉴 RepoNoesis
 
 > **Local Product Phase 1: FULL PASS (2026-08-02).** The accepted code baseline
 > is `e07bfd16e16ecbb827ab002fb9f11274013b92e3`; Gate A/B/C and the 514-test
 > offline backend regression passed. Setup, safe acceptance evidence, and
 > limitations are recorded in
 > [`docs/v3/LOCAL_PRODUCT_PHASE1.md`](docs/v3/LOCAL_PRODUCT_PHASE1.md).
-> Local Product Phase 2 P2.1 now provides the persistent project library and
-> restart-safe workspace reopening. P2.2/P2.3 remain unimplemented; the plan
-> and exact identity contract are in
+> Local Product Phase 2 P2.1 provides the persistent project library and
+> restart-safe workspace reopening. V3·LP2.2 now adds explicit revision checks,
+> persistent idempotent update runs, content-based incremental rebuilds and
+> atomic snapshot activation. P2.3 learning revalidation remains unimplemented;
+> the plan and exact identity/update contracts are in
 > [`docs/v3/LOCAL_PRODUCT_PHASE2_PLAN.md`](docs/v3/LOCAL_PRODUCT_PHASE2_PLAN.md).
 
 面向编程初学者的 GitHub 开源项目学习 Agent。
 
-GitLearnAgent 可以输入一个公开 GitHub 仓库地址，自动抓取仓库结构与关键源码，进行静态分析、模块划分、核心文件排序，并生成适合初学者阅读的项目地图、学习路线、源码问答和 Markdown 报告。
+源鉴 RepoNoesis 可以输入本地 Git 仓库或公开 HTTPS Git 地址，读取仓库结构与关键源码，进行静态分析、模块划分、核心文件排序，并生成适合初学者阅读的项目地图、学习路线、源码问答和 Markdown 报告。
 
 它不是简单地把 GitHub 链接丢给大模型做摘要，而是先用确定性的工程分析建立可靠上下文，再按教学逻辑组织输出。
 
@@ -330,6 +332,10 @@ http://127.0.0.1:8000
 | `POST` | `/api/projects/analyze` | 提交本地 Git 目录或公开 HTTPS Git URL，完成产品导入/分析并返回 `project_id`；旧 `repo_url` 请求保持兼容。 |
 | `GET` | `/api/workspaces?limit=20&offset=0` | 分页读取不含源码、Evidence、Embedding 或本地路径的项目库摘要。 |
 | `GET` | `/api/workspaces/{workspace_id}` | 解析当前可重新打开的持久化 project snapshot；只读且不触发分析、索引或 Provider。 |
+| `POST` | `/api/workspaces/{workspace_id}/revision/check` | 用户显式检查当前与可用 revision；不自动启动更新。 |
+| `POST` | `/api/workspaces/{workspace_id}/refresh` | 用户确认后创建或复用幂等 update run；客户端不能指定内部 snapshot ID。 |
+| `GET` | `/api/workspaces/{workspace_id}/runs/{run_id}` | 读取持久化阶段、计数和安全失败信息。 |
+| `POST` | `/api/workspaces/{workspace_id}/runs/{run_id}/retry` | 显式重试可安全恢复的失败 run。 |
 | `GET` | `/api/projects/{project_id}` | 获取项目概览、技术栈、核心文件和模块摘要。 |
 | `GET` | `/api/projects/{project_id}/map` | 获取目录树、模块关系和核心文件列表。 |
 | `GET` | `/api/projects/{project_id}/learning-path` | 获取学习路线、任务和测验。 |
@@ -418,10 +424,19 @@ Local Product 路径支持读取干净本地 Git 工作树的 tracked files，�
 Git 仓库克隆到受控、被 Git 忽略的运行目录。两种来源都解析固定 commit revision，且不
 执行仓库代码、不安装仓库依赖。旧 `repo_url` GitHub API 路径继续作为兼容入口。
 
-schema v9 为每个既有 project snapshot 建立独立、稳定的 workspace。前端项目库可以在后端
+schema v10 在 P2.1 schema v9 的独立稳定 workspace 上保存多个不可变 revision snapshot、
+持久化 update run 和单一 active pointer。前端项目库可以在后端
 重启后按 URL 中的 `workspace` ID 或浏览器最近 workspace ID 重新打开原 project；该流程只
 读取 SQLite 和既有 project API，不重新分析、生成 chunk/Embedding、重建 relation、调用
-Provider 或写入学习事件。P2.1 不实现 revision refresh 或增量更新。
+Provider 或写入学习事件。用户可另行显式检查 revision，并确认后启动 P2.2 refresh；更新在
+staging snapshot 中完成，验证前旧 active snapshot 始终可用，成功后单事务激活。
+
+P2.2 使用文件内容哈希而非 mtime 区分新增、修改、删除、重命名和未变化文件。chunker 版本
+一致时可复制未变化 chunk；Embedding 只有在最终输入、内容、模型/revision、维度、文本格式、
+prefix/max length 和 normalize 等完整身份一致且向量校验通过时才复用。relation 在新
+`project_id + revision` 内全量重建，避免跨 snapshot 污染。refresh 不复制、修改或重验证旧
+Evidence、attempt、evaluation、immutable event 或 mastery；这些仍绑定原 project，P2.3
+跨 revision 学习重验证尚未实现。
 
 后端会解析 GitHub URL，提取 `owner/repo`，然后通过 GitHub REST API 获取：
 
@@ -542,6 +557,11 @@ node node_modules/typescript/bin/tsc
 cd frontend
 npm run build
 ```
+
+V3·LP2.2 在 2026-08-08 的最终离线回归记录为：后端 `Ran 543 tests / OK`；前端
+Vitest `8 passed`；TypeScript `tsc --noEmit` 与 Vite production build 通过。该记录只使用
+临时 fixture、fake repository/fake Embedding 与静态检查，没有运行真实网络、BGE-M3、
+Provider、Gate A/B/C、P2 live Gate 或 M5 live pilot。
 
 ## 上传 GitHub 注意事项
 
@@ -667,14 +687,16 @@ samples/demo_repositories.md
   规模和长期性能。
 - 大模型增强只支持 OpenAI 兼容接口。
 - 项目数据和 M4 学习状态可持久化，前端可通过稳定 workspace ID 重新打开；新 revision
-  当前仍创建新 project，不做端到端增量刷新或跨 project 学习历史合并。
-- 分析同步执行，进度较粗；没有持久化更新任务、阶段恢复或并发用户保证。
+  使用新的不可变 project snapshot，并在完整验证后原子激活。P2.2 不合并或重验证跨 project
+  学习历史。
+- 初始分析仍同步执行；P2.2 update run 持久化阶段和安全失败状态，但没有自动轮询仓库、
+  文件监听、多用户调度或任意规模性能保证。
 - 暂不执行被分析仓库代码，避免安全风险。
 
 ## 后续计划
 
-- Local Product Phase 2 P2.1 项目库/重新打开已完成；下一步只能另行评审 P2.2 的
-  revision-aware 增量刷新、失败恢复与原子激活，P2.3 学习状态重验证仍在其后。详见
+- Local Product Phase 2 P2.1 项目库/重新打开与 V3·LP2.2 revision-aware 增量刷新、
+  失败恢复和原子激活已完成离线实现；下一步只能另行评审 P2.3 学习状态重验证。详见
   [`docs/v3/LOCAL_PRODUCT_PHASE2_PLAN.md`](docs/v3/LOCAL_PRODUCT_PHASE2_PLAN.md)。
 - M5 继续作为独立的可复现实验和对照评测路线；其 live gate 未完成时不得宣称完整通过。
 - 完整学习工作台、更大仓库性能、多项目高级组织、更多语言、私有仓库认证和云多用户能力

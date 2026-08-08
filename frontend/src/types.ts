@@ -134,5 +134,32 @@ export interface WorkspaceDetail extends WorkspaceSummary {
     frameworks: string[];
     updated_at: string;
   };
+  latest_update_run: WorkspaceUpdateRun | null;
+}
+
+export interface WorkspaceRevisionCheck {
+  workspace_id: string;
+  current_revision: string;
+  available_revision: string;
+  state: 'unchanged' | 'update_available';
+}
+
+export interface WorkspaceUpdateRun {
+  run_id: string;
+  workspace_id: string;
+  target_revision: string;
+  status: 'pending' | 'running' | 'succeeded' | 'failed';
+  phase: string;
+  result: '' | 'unchanged' | 'activated';
+  stats: Record<string, unknown>;
+  error_code: string;
+  error_message: string;
+  retryable: boolean;
+  retry_count: number;
+  active_project_id: string | null;
+  created_at: string;
+  started_at: string | null;
+  finished_at: string | null;
+  updated_at: string;
 }
 

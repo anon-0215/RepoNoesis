@@ -77,6 +77,7 @@ class WorkspaceService:
             and row.get("revision_workspace_id") == row.get("workspace_id")
             and row.get("revision_project_id") == row.get("active_project_id")
             and row.get("linked_revision") == row.get("repository_revision")
+            and row.get("linked_activation_status") == "active"
         )
 
     @staticmethod

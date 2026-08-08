@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Literal
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -47,11 +48,18 @@ from app.services.workspace_service import (
     WorkspaceService,
     WorkspaceUnavailable,
 )
+from app.services.workspace_update import WorkspaceUpdateError, WorkspaceUpdateService
 
 
 load_environment()
 
-app = FastAPI(title="GitLearnAgent API", version="0.1.0")
+
+@asynccontextmanager
+async def app_lifespan(_app: FastAPI):
+    WorkspaceUpdateService(db, repository_settings, embedding_service).recover_interrupted_runs()
+    yield
+
+app = FastAPI(title="源鉴 RepoNoesis API", version="0.1.0", lifespan=app_lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
@@ -226,8 +234,35 @@ class WorkspaceSnapshotResponse(BaseModel):
     updated_at: str
 
 
+class WorkspaceUpdateRunResponse(BaseModel):
+    run_id: str
+    workspace_id: str
+    target_revision: str
+    status: Literal["pending", "running", "succeeded", "failed"]
+    phase: str
+    result: Literal["", "unchanged", "activated"]
+    stats: dict[str, Any]
+    error_code: str
+    error_message: str
+    retryable: bool
+    retry_count: int
+    active_project_id: str | None = None
+    created_at: str
+    started_at: str | None
+    finished_at: str | None
+    updated_at: str
+
+
+class WorkspaceRevisionCheckResponse(BaseModel):
+    workspace_id: str
+    current_revision: str
+    available_revision: str
+    state: Literal["unchanged", "update_available"]
+
+
 class WorkspaceDetailResponse(WorkspaceSummaryResponse):
     active_snapshot: WorkspaceSnapshotResponse
+    latest_update_run: WorkspaceUpdateRunResponse | None = None
 
 
 @app.get("/api/health")
@@ -273,7 +308,10 @@ def list_workspaces(
 @app.get("/api/workspaces/{workspace_id}", response_model=WorkspaceDetailResponse)
 def get_workspace(workspace_id: str) -> dict[str, Any]:
     try:
-        return WorkspaceService(db).get_workspace(workspace_id)
+        result = WorkspaceService(db).get_workspace(workspace_id)
+        latest = db.get_latest_update_run(workspace_id)
+        result["latest_update_run"] = _public_update_run(latest) if latest else None
+        return result
     except WorkspaceNotFound as exc:
         raise HTTPException(
             status_code=404,
@@ -301,6 +339,111 @@ def get_workspace(workspace_id: str) -> dict[str, Any]:
                 "retryable": False,
             },
         ) from exc
+
+
+def _update_service() -> WorkspaceUpdateService:
+    return WorkspaceUpdateService(db, repository_settings, embedding_service)
+
+
+@app.post(
+    "/api/workspaces/{workspace_id}/revision/check",
+    response_model=WorkspaceRevisionCheckResponse,
+)
+def check_workspace_revision(workspace_id: str) -> dict[str, Any]:
+    try:
+        return _update_service().check_revision(workspace_id)
+    except RepositoryImportError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.to_safe_dict()) from exc
+    except WorkspaceUpdateError as exc:
+        raise _workspace_update_http_error(exc) from exc
+
+
+@app.post(
+    "/api/workspaces/{workspace_id}/refresh",
+    response_model=WorkspaceUpdateRunResponse,
+)
+def start_workspace_refresh(
+    workspace_id: str, background_tasks: BackgroundTasks
+) -> dict[str, Any]:
+    embedding_status = get_product_config_status()["embedding"]
+    if not embedding_status["ready"]:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "embedding_not_configured",
+                "message": "Configure the local BGE-M3 provider before refreshing a workspace.",
+                "retryable": False,
+            },
+        )
+    try:
+        service = _update_service()
+        run = service.start_refresh(workspace_id)
+        if run["status"] == "pending":
+            background_tasks.add_task(service.execute_run, workspace_id, run["run_id"])
+        return _public_update_run(run)
+    except RepositoryImportError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.to_safe_dict()) from exc
+    except WorkspaceUpdateError as exc:
+        raise _workspace_update_http_error(exc) from exc
+
+
+@app.get(
+    "/api/workspaces/{workspace_id}/runs/{run_id}",
+    response_model=WorkspaceUpdateRunResponse,
+)
+def get_workspace_update_run(workspace_id: str, run_id: str) -> dict[str, Any]:
+    try:
+        return _public_update_run(_update_service().get_run(workspace_id, run_id))
+    except WorkspaceUpdateError as exc:
+        raise _workspace_update_http_error(exc) from exc
+
+
+@app.post(
+    "/api/workspaces/{workspace_id}/runs/{run_id}/retry",
+    response_model=WorkspaceUpdateRunResponse,
+)
+def retry_workspace_update_run(
+    workspace_id: str, run_id: str, background_tasks: BackgroundTasks
+) -> dict[str, Any]:
+    try:
+        service = _update_service()
+        run = service.retry_run(workspace_id, run_id)
+        background_tasks.add_task(service.execute_run, workspace_id, run_id)
+        return _public_update_run(run)
+    except WorkspaceUpdateError as exc:
+        raise _workspace_update_http_error(exc) from exc
+
+
+def _workspace_update_http_error(exc: WorkspaceUpdateError) -> HTTPException:
+    return HTTPException(
+        status_code=exc.status_code,
+        detail={
+            "code": exc.code,
+            "message": exc.message,
+            "retryable": exc.retryable,
+        },
+    )
+
+
+def _public_update_run(run: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "run_id": run["run_id"],
+        "workspace_id": run["workspace_id"],
+        "target_revision": run["target_revision"],
+        "status": run["status"],
+        "phase": run["phase"],
+        "result": run["result"],
+        "stats": run["stats"],
+        "error_code": run["error_code"],
+        "error_message": run["error_message"],
+        "retryable": run["retryable"],
+        "retry_count": run["retry_count"],
+        "active_project_id": run["project_id"] if run["result"] == "activated" else None,
+        "created_at": run["created_at"],
+        "started_at": run["started_at"],
+        "finished_at": run["finished_at"],
+        "updated_at": run["updated_at"],
+    }
 
 
 def _workspace_id_or_409(project_id: str) -> str:

@@ -179,6 +179,40 @@ button:disabled {
   color: #a33a31;
 }
 
+.workspace-update-card {
+  display: grid;
+  gap: 0.45rem;
+  padding: 0.9rem;
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.workspace-update-card span {
+  color: var(--muted);
+  font-size: 0.78rem;
+  overflow-wrap: anywhere;
+}
+
+.workspace-update-card.update-available {
+  border-color: #d9a441;
+}
+
+.workspace-update-card.failed {
+  border-color: #d66b6b;
+}
+
+.workspace-update-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.45rem;
+}
+
+.workspace-update-actions button {
+  flex: 1;
+  min-width: 6.5rem;
+}
+
 .workspace-list {
   display: grid;
   gap: 6px;

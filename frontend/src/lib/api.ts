@@ -5,7 +5,9 @@ import type {
   ProjectMap,
   ProjectResponse,
   WorkspaceDetail,
-  WorkspaceListResponse
+  WorkspaceListResponse,
+  WorkspaceRevisionCheck,
+  WorkspaceUpdateRun
 } from '../types';
 import { buildAnalyzePayload, type SourceType } from './product';
 
@@ -57,6 +59,37 @@ export async function listWorkspaces(limit = 20, offset = 0): Promise<WorkspaceL
 
 export async function getWorkspace(workspaceId: string): Promise<WorkspaceDetail> {
   return request(`/api/workspaces/${encodeURIComponent(workspaceId)}`);
+}
+
+export async function checkWorkspaceRevision(workspaceId: string): Promise<WorkspaceRevisionCheck> {
+  return request(`/api/workspaces/${encodeURIComponent(workspaceId)}/revision/check`, {
+    method: 'POST'
+  });
+}
+
+export async function startWorkspaceRefresh(workspaceId: string): Promise<WorkspaceUpdateRun> {
+  return request(`/api/workspaces/${encodeURIComponent(workspaceId)}/refresh`, {
+    method: 'POST'
+  });
+}
+
+export async function getWorkspaceUpdateRun(
+  workspaceId: string,
+  runId: string
+): Promise<WorkspaceUpdateRun> {
+  return request(
+    `/api/workspaces/${encodeURIComponent(workspaceId)}/runs/${encodeURIComponent(runId)}`
+  );
+}
+
+export async function retryWorkspaceUpdateRun(
+  workspaceId: string,
+  runId: string
+): Promise<WorkspaceUpdateRun> {
+  return request(
+    `/api/workspaces/${encodeURIComponent(workspaceId)}/runs/${encodeURIComponent(runId)}/retry`,
+    { method: 'POST' }
+  );
 }
 
 export async function getConfigStatus(): Promise<ConfigStatus> {

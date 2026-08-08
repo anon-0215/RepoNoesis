@@ -20,7 +20,7 @@ class M3SchemaAndRelationTests(unittest.TestCase):
     def tearDown(self):
         self.directory.cleanup()
 
-    def test_fresh_schema_is_v8_with_relation_tables_and_indexes(self):
+    def test_fresh_schema_is_v10_with_relation_tables_and_indexes(self):
         with self.db.connect() as conn:
             version = conn.execute(
                 "SELECT version FROM schema_versions WHERE key = 'database'"
@@ -37,8 +37,8 @@ class M3SchemaAndRelationTests(unittest.TestCase):
                     "SELECT name FROM sqlite_master WHERE type='index'"
                 )
             }
-        self.assertEqual(SCHEMA_VERSION, 9)
-        self.assertEqual(version, 9)
+        self.assertEqual(SCHEMA_VERSION, 10)
+        self.assertEqual(version, 10)
         self.assertTrue(
             {"relation_nodes", "code_relations", "relation_index_runs"}.issubset(
                 tables

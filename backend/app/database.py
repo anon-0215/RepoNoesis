@@ -15,7 +15,18 @@ from app.learning_schema import LEARNING_SCHEMA_STATEMENTS
 
 
 DEFAULT_DB_PATH = Path(__file__).resolve().parents[1] / "data" / "gitlearn.sqlite"
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
+CODE_CHUNKER_VERSION = "python_ast_chunks_v1@1"
+UPDATE_RUN_PHASES = (
+    "revision_resolution",
+    "manifest_diff",
+    "source_analysis",
+    "chunk_update",
+    "relation_update",
+    "embedding_update",
+    "snapshot_validation",
+    "activation",
+)
 
 
 SCHEMA = """
@@ -244,6 +255,7 @@ class Database:
     def __init__(self, path: Path | str | None = None) -> None:
         explicit_path = path or os.getenv("GITLEARN_DB")
         self.path = Path(explicit_path) if explicit_path else DEFAULT_DB_PATH
+        self._activation_test_hook: Any | None = None
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             self._init_schema()
@@ -405,6 +417,7 @@ class Database:
                 source_type TEXT NOT NULL,
                 source_location TEXT NOT NULL DEFAULT '',
                 active_project_id TEXT NOT NULL UNIQUE,
+                activation_version INTEGER NOT NULL DEFAULT 1,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY(active_project_id) REFERENCES projects(id) ON DELETE RESTRICT,
@@ -420,11 +433,19 @@ class Database:
                 workspace_id TEXT NOT NULL,
                 project_id TEXT NOT NULL UNIQUE,
                 repository_revision TEXT NOT NULL DEFAULT '',
+                parent_project_id TEXT,
+                manifest_hash TEXT NOT NULL DEFAULT '',
+                chunker_version TEXT NOT NULL DEFAULT '',
+                embedding_identity TEXT NOT NULL DEFAULT '',
+                activation_status TEXT NOT NULL DEFAULT 'active',
+                activated_at TEXT,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 PRIMARY KEY(workspace_id, project_id),
                 FOREIGN KEY(workspace_id) REFERENCES repository_workspaces(id)
                     ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED,
                 FOREIGN KEY(project_id) REFERENCES projects(id)
+                    ON DELETE RESTRICT DEFERRABLE INITIALLY DEFERRED,
+                FOREIGN KEY(parent_project_id) REFERENCES projects(id)
                     ON DELETE RESTRICT DEFERRABLE INITIALLY DEFERRED
             )
             """
@@ -436,6 +457,7 @@ class Database:
             ON repository_workspaces (updated_at DESC, created_at DESC, id ASC)
             """
         )
+        self._migrate_workspace_update_schema(conn)
         conn.execute(
             """
             CREATE INDEX IF NOT EXISTS idx_workspace_revisions_project
@@ -495,6 +517,137 @@ class Database:
                     row["created_at"],
                 ),
             )
+
+    def _migrate_workspace_update_schema(self, conn: sqlite3.Connection) -> None:
+        workspace_columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(repository_workspaces)")
+        }
+        if "activation_version" not in workspace_columns:
+            conn.execute(
+                "ALTER TABLE repository_workspaces "
+                "ADD COLUMN activation_version INTEGER NOT NULL DEFAULT 1"
+            )
+
+        revision_columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(workspace_revisions)")
+        }
+        additions = (
+            ("parent_project_id", "TEXT REFERENCES projects(id) ON DELETE RESTRICT"),
+            ("manifest_hash", "TEXT NOT NULL DEFAULT ''"),
+            ("chunker_version", "TEXT NOT NULL DEFAULT ''"),
+            ("embedding_identity", "TEXT NOT NULL DEFAULT ''"),
+            ("activation_status", "TEXT NOT NULL DEFAULT 'active'"),
+            ("activated_at", "TEXT"),
+        )
+        for column, declaration in additions:
+            if column not in revision_columns:
+                conn.execute(
+                    f"ALTER TABLE workspace_revisions ADD COLUMN {column} {declaration}"
+                )
+
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS repository_update_runs (
+                id TEXT PRIMARY KEY,
+                workspace_id TEXT NOT NULL,
+                base_project_id TEXT NOT NULL,
+                project_id TEXT,
+                target_revision TEXT NOT NULL,
+                config_identity TEXT NOT NULL,
+                status TEXT NOT NULL CHECK(status IN ('pending', 'running', 'succeeded', 'failed')),
+                phase TEXT NOT NULL,
+                result TEXT NOT NULL DEFAULT '' CHECK(result IN ('', 'unchanged', 'activated')),
+                stats_json TEXT NOT NULL DEFAULT '{}',
+                error_code TEXT NOT NULL DEFAULT '',
+                error_message TEXT NOT NULL DEFAULT '',
+                retryable INTEGER NOT NULL DEFAULT 0,
+                retry_count INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                started_at TEXT,
+                finished_at TEXT,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(workspace_id, target_revision, config_identity),
+                FOREIGN KEY(workspace_id) REFERENCES repository_workspaces(id) ON DELETE CASCADE,
+                FOREIGN KEY(base_project_id) REFERENCES projects(id) ON DELETE RESTRICT,
+                FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE RESTRICT
+            )
+            """
+        )
+        self._backfill_workspace_update_metadata(conn)
+        conn.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_workspace_revisions_revision
+            ON workspace_revisions(workspace_id, repository_revision)
+            """
+        )
+        conn.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_workspace_revisions_active
+            ON workspace_revisions(workspace_id)
+            WHERE activation_status = 'active'
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_repository_update_runs_status
+            ON repository_update_runs(status, updated_at, id)
+            """
+        )
+
+    def _backfill_workspace_update_metadata(self, conn: sqlite3.Connection) -> None:
+        rows = conn.execute(
+            """
+            SELECT wr.workspace_id, wr.project_id, wr.manifest_hash,
+                   wr.chunker_version, w.active_project_id
+            FROM workspace_revisions AS wr
+            JOIN repository_workspaces AS w ON w.id = wr.workspace_id
+            """
+        ).fetchall()
+        for row in rows:
+            manifest_hash = row["manifest_hash"] or self._manifest_hash_for_project(
+                conn, row["project_id"]
+            )
+            status = "active" if row["project_id"] == row["active_project_id"] else "superseded"
+            conn.execute(
+                """
+                UPDATE workspace_revisions
+                SET manifest_hash = ?,
+                    chunker_version = CASE WHEN chunker_version = '' THEN ? ELSE chunker_version END,
+                    activation_status = ?,
+                    activated_at = CASE
+                        WHEN ? = 'active' THEN COALESCE(activated_at, created_at)
+                        ELSE activated_at
+                    END
+                WHERE workspace_id = ? AND project_id = ?
+                """,
+                (
+                    manifest_hash,
+                    CODE_CHUNKER_VERSION,
+                    status,
+                    status,
+                    row["workspace_id"],
+                    row["project_id"],
+                ),
+            )
+
+    @staticmethod
+    def _manifest_hash_for_project(conn: sqlite3.Connection, project_id: str) -> str:
+        rows = conn.execute(
+            "SELECT path, content, size FROM repo_files WHERE project_id=? ORDER BY path",
+            (project_id,),
+        ).fetchall()
+        payload = [
+            {
+                "path": str(row["path"]).replace("\\", "/").lstrip("/"),
+                "content_hash": hashlib.sha256(str(row["content"]).encode("utf-8")).hexdigest(),
+                "size": int(row["size"]),
+            }
+            for row in rows
+        ]
+        digest = hashlib.sha256(
+            json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        return f"manifest-sha256:{digest}"
 
     @staticmethod
     def _workspace_id_for_project(project_id: str) -> str:
@@ -676,6 +829,19 @@ class Database:
                     analysis.get("primary_language", ""),
                     json.dumps(analysis.get("frameworks", []), ensure_ascii=False),
                     json.dumps(analysis, ensure_ascii=False),
+                    project_id,
+                ),
+            )
+            conn.execute(
+                """
+                UPDATE workspace_revisions
+                SET manifest_hash = ?,
+                    chunker_version = CASE WHEN chunker_version = '' THEN ? ELSE chunker_version END
+                WHERE project_id = ?
+                """,
+                (
+                    self._manifest_hash_for_project(conn, project_id),
+                    CODE_CHUNKER_VERSION,
                     project_id,
                 ),
             )
@@ -1561,7 +1727,7 @@ class Database:
                 FROM repository_workspaces AS w
                 JOIN workspace_revisions AS wr
                   ON wr.workspace_id = w.id AND wr.project_id = w.active_project_id
-                WHERE wr.project_id = ?
+                WHERE wr.project_id = ? AND wr.activation_status = 'active'
                 """,
                 (project_id,),
             ).fetchone()
@@ -1578,7 +1744,9 @@ class Database:
                     w.id AS workspace_id,
                     w.display_name,
                     w.source_type,
+                    w.source_location,
                     w.active_project_id,
+                    w.activation_version,
                     w.created_at,
                     w.updated_at,
                     p.repository_revision,
@@ -1589,6 +1757,8 @@ class Database:
                     wr.workspace_id AS revision_workspace_id,
                     wr.project_id AS revision_project_id,
                     wr.repository_revision AS linked_revision
+                    , wr.activation_status AS linked_activation_status
+                    , wr.manifest_hash AS linked_manifest_hash
                 FROM repository_workspaces AS w
                 LEFT JOIN projects AS p ON p.id = w.active_project_id
                 LEFT JOIN workspace_revisions AS wr
@@ -1608,7 +1778,9 @@ class Database:
                     w.id AS workspace_id,
                     w.display_name,
                     w.source_type,
+                    w.source_location,
                     w.active_project_id,
+                    w.activation_version,
                     w.created_at,
                     w.updated_at,
                     p.repository_revision,
@@ -1619,6 +1791,8 @@ class Database:
                     wr.workspace_id AS revision_workspace_id,
                     wr.project_id AS revision_project_id,
                     wr.repository_revision AS linked_revision
+                    , wr.activation_status AS linked_activation_status
+                    , wr.manifest_hash AS linked_manifest_hash
                 FROM repository_workspaces AS w
                 LEFT JOIN projects AS p ON p.id = w.active_project_id
                 LEFT JOIN workspace_revisions AS wr
@@ -1628,6 +1802,506 @@ class Database:
                 (workspace_id,),
             ).fetchone()
         return dict(row) if row is not None else None
+
+    def get_workspace_revision(
+        self, workspace_id: str, repository_revision: str
+    ) -> dict[str, Any] | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT * FROM workspace_revisions
+                WHERE workspace_id=? AND repository_revision=?
+                """,
+                (workspace_id, repository_revision),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def count_workspace_revisions(self, workspace_id: str) -> int:
+        with self.connect() as conn:
+            return int(
+                conn.execute(
+                    "SELECT COUNT(*) FROM workspace_revisions WHERE workspace_id=?",
+                    (workspace_id,),
+                ).fetchone()[0]
+            )
+
+    def create_or_get_update_run(
+        self,
+        workspace_id: str,
+        target_revision: str,
+        config_identity: str,
+    ) -> dict[str, Any]:
+        if len(target_revision) != 40:
+            raise ValueError("target revision must be a 40-character Git commit")
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            workspace = conn.execute(
+                """
+                SELECT w.active_project_id, p.repository_revision
+                FROM repository_workspaces AS w
+                JOIN projects AS p ON p.id=w.active_project_id
+                WHERE w.id=?
+                """,
+                (workspace_id,),
+            ).fetchone()
+            if workspace is None:
+                raise LookupError("workspace not found")
+            existing = conn.execute(
+                """
+                SELECT * FROM repository_update_runs
+                WHERE workspace_id=? AND target_revision=? AND config_identity=?
+                """,
+                (workspace_id, target_revision, config_identity),
+            ).fetchone()
+            if existing is not None:
+                return self._update_run_from_row(existing)
+            run_id = str(uuid.uuid4())
+            unchanged = workspace["repository_revision"] == target_revision
+            conn.execute(
+                """
+                INSERT INTO repository_update_runs (
+                    id, workspace_id, base_project_id, target_revision,
+                    config_identity, status, phase, result, finished_at
+                ) VALUES (?, ?, ?, ?, ?, ?, 'revision_resolution', ?,
+                          CASE WHEN ? THEN CURRENT_TIMESTAMP ELSE NULL END)
+                """,
+                (
+                    run_id,
+                    workspace_id,
+                    workspace["active_project_id"],
+                    target_revision,
+                    config_identity,
+                    "succeeded" if unchanged else "pending",
+                    "unchanged" if unchanged else "",
+                    1 if unchanged else 0,
+                ),
+            )
+            row = conn.execute(
+                "SELECT * FROM repository_update_runs WHERE id=?", (run_id,)
+            ).fetchone()
+        return self._update_run_from_row(row)
+
+    def get_update_run(self, workspace_id: str, run_id: str) -> dict[str, Any] | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM repository_update_runs WHERE workspace_id=? AND id=?",
+                (workspace_id, run_id),
+            ).fetchone()
+        return self._update_run_from_row(row) if row is not None else None
+
+    def get_latest_update_run(self, workspace_id: str) -> dict[str, Any] | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT * FROM repository_update_runs
+                WHERE workspace_id=?
+                ORDER BY created_at DESC, id DESC LIMIT 1
+                """,
+                (workspace_id,),
+            ).fetchone()
+        return self._update_run_from_row(row) if row is not None else None
+
+    def claim_update_run(self, workspace_id: str, run_id: str) -> bool:
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            changed = conn.execute(
+                """
+                UPDATE repository_update_runs
+                SET status='running', phase='revision_resolution',
+                    started_at=CURRENT_TIMESTAMP, finished_at=NULL,
+                    error_code='', error_message='', retryable=0,
+                    updated_at=CURRENT_TIMESTAMP
+                WHERE workspace_id=? AND id=? AND status='pending'
+                """,
+                (workspace_id, run_id),
+            ).rowcount
+        return changed == 1
+
+    def update_run_phase(
+        self,
+        workspace_id: str,
+        run_id: str,
+        phase: str,
+        stats: dict[str, Any] | None = None,
+    ) -> None:
+        if phase not in UPDATE_RUN_PHASES:
+            raise ValueError("unknown update run phase")
+        with self.connect() as conn:
+            current = conn.execute(
+                "SELECT phase, status FROM repository_update_runs WHERE workspace_id=? AND id=?",
+                (workspace_id, run_id),
+            ).fetchone()
+            if current is None or current["status"] != "running":
+                raise RuntimeError("update run is not running")
+            if UPDATE_RUN_PHASES.index(phase) < UPDATE_RUN_PHASES.index(current["phase"]):
+                raise RuntimeError("update run phases cannot move backwards")
+            conn.execute(
+                """
+                UPDATE repository_update_runs
+                SET phase=?, stats_json=COALESCE(?, stats_json), updated_at=CURRENT_TIMESTAMP
+                WHERE workspace_id=? AND id=? AND status='running'
+                """,
+                (
+                    phase,
+                    json.dumps(stats, ensure_ascii=False, sort_keys=True) if stats is not None else None,
+                    workspace_id,
+                    run_id,
+                ),
+            )
+
+    def create_staging_project(
+        self,
+        workspace_id: str,
+        snapshot: dict[str, Any],
+        parent_project_id: str,
+        manifest_hash: str,
+        chunker_version: str,
+        run_id: str | None = None,
+    ) -> str:
+        revision = str(snapshot.get("repository_revision", ""))
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            workspace = conn.execute(
+                "SELECT active_project_id FROM repository_workspaces WHERE id=?",
+                (workspace_id,),
+            ).fetchone()
+            if workspace is None:
+                raise LookupError("workspace not found")
+            if workspace["active_project_id"] != parent_project_id:
+                raise RuntimeError("active snapshot changed")
+            existing = conn.execute(
+                """
+                SELECT project_id FROM workspace_revisions
+                WHERE workspace_id=? AND repository_revision=?
+                """,
+                (workspace_id, revision),
+            ).fetchone()
+            if existing is not None:
+                project_id = str(existing["project_id"])
+                if run_id:
+                    self._attach_update_project_in_connection(
+                        conn, workspace_id, run_id, project_id
+                    )
+                return project_id
+            project_id = str(uuid.uuid4())
+            staging_identity = "staging-sha256:" + hashlib.sha256(
+                f"{workspace_id}\0{snapshot.get('source_identity', '')}".encode("utf-8")
+            ).hexdigest()
+            conn.execute(
+                """
+                INSERT INTO projects (
+                    id, repo_url, owner, repo, default_branch,
+                    repository_revision, source_type, source_location,
+                    source_identity, status
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'analyzing')
+                """,
+                (
+                    project_id,
+                    snapshot["repo_url"],
+                    snapshot["owner"],
+                    snapshot["repo"],
+                    snapshot["default_branch"],
+                    revision,
+                    snapshot.get("source_type", "legacy_github"),
+                    snapshot.get("source_location", ""),
+                    staging_identity,
+                ),
+            )
+            conn.execute(
+                """
+                INSERT INTO workspace_revisions (
+                    workspace_id, project_id, repository_revision,
+                    parent_project_id, manifest_hash, chunker_version,
+                    activation_status
+                ) VALUES (?, ?, ?, ?, ?, ?, 'staging')
+                """,
+                (
+                    workspace_id,
+                    project_id,
+                    revision,
+                    parent_project_id,
+                    manifest_hash,
+                    chunker_version,
+                ),
+            )
+            if run_id:
+                self._attach_update_project_in_connection(
+                    conn, workspace_id, run_id, project_id
+                )
+        return project_id
+
+    @staticmethod
+    def _attach_update_project_in_connection(
+        conn: sqlite3.Connection,
+        workspace_id: str,
+        run_id: str,
+        project_id: str,
+    ) -> None:
+        changed = conn.execute(
+            """
+            UPDATE repository_update_runs SET project_id=?, updated_at=CURRENT_TIMESTAMP
+            WHERE workspace_id=? AND id=? AND status='running'
+              AND (project_id IS NULL OR project_id=?)
+            """,
+            (project_id, workspace_id, run_id, project_id),
+        ).rowcount
+        if changed != 1:
+            raise RuntimeError("update run project association changed")
+
+    def set_workspace_revision_embedding_identity(
+        self, workspace_id: str, project_id: str, identity: str
+    ) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE workspace_revisions SET embedding_identity=?
+                WHERE workspace_id=? AND project_id=? AND activation_status='staging'
+                """,
+                (identity, workspace_id, project_id),
+            )
+
+    def fail_update_run(
+        self,
+        workspace_id: str,
+        run_id: str,
+        *,
+        code: str,
+        message: str,
+        retryable: bool,
+    ) -> None:
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT project_id FROM repository_update_runs WHERE workspace_id=? AND id=?",
+                (workspace_id, run_id),
+            ).fetchone()
+            if row is None:
+                return
+            if row["project_id"]:
+                conn.execute(
+                    """
+                    UPDATE workspace_revisions SET activation_status='failed'
+                    WHERE workspace_id=? AND project_id=? AND activation_status='staging'
+                    """,
+                    (workspace_id, row["project_id"]),
+                )
+                conn.execute(
+                    """
+                    UPDATE projects SET status='failed', error_message=?, updated_at=CURRENT_TIMESTAMP
+                    WHERE id=?
+                    """,
+                    (message[:500], row["project_id"]),
+                )
+            conn.execute(
+                """
+                UPDATE repository_update_runs
+                SET status='failed', error_code=?, error_message=?, retryable=?,
+                    finished_at=CURRENT_TIMESTAMP, updated_at=CURRENT_TIMESTAMP
+                WHERE workspace_id=? AND id=? AND status IN ('pending', 'running')
+                """,
+                (code, message[:500], 1 if retryable else 0, workspace_id, run_id),
+            )
+
+    def retry_update_run(self, workspace_id: str, run_id: str) -> dict[str, Any] | None:
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            changed = conn.execute(
+                """
+                UPDATE repository_update_runs
+                SET status='pending', phase='revision_resolution', result='',
+                    error_code='', error_message='', retryable=0,
+                    retry_count=retry_count+1, started_at=NULL, finished_at=NULL,
+                    updated_at=CURRENT_TIMESTAMP
+                WHERE workspace_id=? AND id=? AND status='failed' AND retryable=1
+                """,
+                (workspace_id, run_id),
+            ).rowcount
+            if changed == 1:
+                row = conn.execute(
+                    "SELECT project_id FROM repository_update_runs WHERE id=?", (run_id,)
+                ).fetchone()
+                if row["project_id"]:
+                    conn.execute(
+                        "UPDATE projects SET status='analyzing', error_message='' WHERE id=?",
+                        (row["project_id"],),
+                    )
+                    conn.execute(
+                        """
+                        UPDATE workspace_revisions SET activation_status='staging'
+                        WHERE workspace_id=? AND project_id=? AND activation_status='failed'
+                        """,
+                        (workspace_id, row["project_id"]),
+                    )
+            result = conn.execute(
+                "SELECT * FROM repository_update_runs WHERE workspace_id=? AND id=?",
+                (workspace_id, run_id),
+            ).fetchone()
+        return self._update_run_from_row(result) if result is not None else None
+
+    def activate_workspace_snapshot(
+        self,
+        workspace_id: str,
+        run_id: str,
+        *,
+        project_id: str,
+        expected_active_project_id: str,
+        source_identity: str,
+        stats: dict[str, Any],
+    ) -> None:
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            workspace = conn.execute(
+                "SELECT active_project_id FROM repository_workspaces WHERE id=?",
+                (workspace_id,),
+            ).fetchone()
+            project = conn.execute(
+                "SELECT status FROM projects WHERE id=?", (project_id,)
+            ).fetchone()
+            revision = conn.execute(
+                """
+                SELECT activation_status FROM workspace_revisions
+                WHERE workspace_id=? AND project_id=?
+                """,
+                (workspace_id, project_id),
+            ).fetchone()
+            if (
+                workspace is None
+                or workspace["active_project_id"] != expected_active_project_id
+                or project is None
+                or project["status"] != "done"
+                or revision is None
+                or revision["activation_status"] != "staging"
+            ):
+                raise RuntimeError("snapshot activation precondition failed")
+            conn.execute(
+                """
+                UPDATE workspace_revisions SET activation_status='superseded'
+                WHERE workspace_id=? AND project_id=? AND activation_status='active'
+                """,
+                (workspace_id, expected_active_project_id),
+            )
+            if self._activation_test_hook is not None:
+                self._activation_test_hook()
+            conn.execute(
+                """
+                UPDATE workspace_revisions
+                SET activation_status='active', activated_at=CURRENT_TIMESTAMP
+                WHERE workspace_id=? AND project_id=? AND activation_status='staging'
+                """,
+                (workspace_id, project_id),
+            )
+            conn.execute(
+                """
+                UPDATE repository_workspaces
+                SET active_project_id=?, activation_version=activation_version+1,
+                    updated_at=CURRENT_TIMESTAMP
+                WHERE id=? AND active_project_id=?
+                """,
+                (project_id, workspace_id, expected_active_project_id),
+            )
+            conn.execute(
+                "UPDATE projects SET source_identity=? WHERE id=?",
+                (source_identity, project_id),
+            )
+            changed = conn.execute(
+                """
+                UPDATE repository_update_runs
+                SET status='succeeded', phase='activation', result='activated',
+                    stats_json=?, finished_at=CURRENT_TIMESTAMP, updated_at=CURRENT_TIMESTAMP
+                WHERE workspace_id=? AND id=? AND status='running' AND project_id=?
+                """,
+                (json.dumps(stats, ensure_ascii=False, sort_keys=True), workspace_id, run_id, project_id),
+            ).rowcount
+            if changed != 1:
+                raise RuntimeError("update run activation state changed")
+
+    def recover_interrupted_update_runs(self) -> int:
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            rows = conn.execute(
+                "SELECT id, workspace_id, project_id FROM repository_update_runs WHERE status IN ('pending', 'running')"
+            ).fetchall()
+            for row in rows:
+                if row["project_id"]:
+                    conn.execute(
+                        """
+                        UPDATE workspace_revisions SET activation_status='failed'
+                        WHERE workspace_id=? AND project_id=? AND activation_status='staging'
+                        """,
+                        (row["workspace_id"], row["project_id"]),
+                    )
+                    conn.execute(
+                        "UPDATE projects SET status='failed', error_message='Update interrupted.' WHERE id=?",
+                        (row["project_id"],),
+                    )
+            conn.execute(
+                """
+                UPDATE repository_update_runs
+                SET status='failed', error_code='update_interrupted',
+                    error_message='The previous update was interrupted and can be retried safely.',
+                    retryable=1, finished_at=CURRENT_TIMESTAMP, updated_at=CURRENT_TIMESTAMP
+                WHERE status IN ('pending', 'running')
+                """
+            )
+        return len(rows)
+
+    def learning_record_counts(self, project_id: str) -> dict[str, int]:
+        direct_tables = (
+            "learning_goals",
+            "learning_targets",
+            "learning_plans",
+            "learning_tasks",
+            "learning_attempts",
+            "learning_events",
+            "learner_target_states",
+        )
+        with self.connect() as conn:
+            counts = {
+                table: int(
+                    conn.execute(
+                        f"SELECT COUNT(*) FROM {table} WHERE project_id=?", (project_id,)
+                    ).fetchone()[0]
+                )
+                for table in direct_tables
+            }
+            counts["learning_evaluations"] = int(
+                conn.execute(
+                    """
+                    SELECT COUNT(*) FROM learning_evaluations AS e
+                    JOIN learning_attempts AS a ON a.attempt_id=e.attempt_id
+                    WHERE a.project_id=?
+                    """,
+                    (project_id,),
+                ).fetchone()[0]
+            )
+            return counts
+
+    @staticmethod
+    def _update_run_from_row(row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
+        value = dict(row)
+        try:
+            stats = json.loads(value.get("stats_json") or "{}")
+        except (TypeError, json.JSONDecodeError):
+            stats = {}
+        return {
+            "run_id": value["id"],
+            "workspace_id": value["workspace_id"],
+            "base_project_id": value["base_project_id"],
+            "project_id": value.get("project_id"),
+            "target_revision": value["target_revision"],
+            "status": value["status"],
+            "phase": value["phase"],
+            "result": value["result"],
+            "stats": stats,
+            "error_code": value["error_code"],
+            "error_message": value["error_message"],
+            "retryable": bool(value["retryable"]),
+            "retry_count": int(value["retry_count"]),
+            "created_at": value["created_at"],
+            "started_at": value["started_at"],
+            "finished_at": value["finished_at"],
+            "updated_at": value["updated_at"],
+        }
 
     def get_bundle(self, project_id: str) -> dict[str, Any] | None:
         project = self.get_project(project_id)

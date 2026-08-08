@@ -49,8 +49,8 @@ class M4LearningServiceTests(unittest.TestCase):
             tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
             indexes = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='index'")}
             triggers = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='trigger'")}
-        self.assertEqual(SCHEMA_VERSION, 9)
-        self.assertEqual(version, 9)
+        self.assertEqual(SCHEMA_VERSION, 10)
+        self.assertEqual(version, 10)
         self.assertTrue({"learning_goals", "learning_plans", "learning_tasks", "learning_events", "learner_target_states"}.issubset(tables))
         self.assertIn("idx_learning_states_review", indexes)
         self.assertEqual(

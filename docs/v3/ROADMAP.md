@@ -1,4 +1,4 @@
-# RepoNoesis V3 路线图
+# 源鉴 RepoNoesis V3 路线图
 
 共同约束：前一阶段验收后才开始下一阶段；保持旧 API/数据库可用；不执行或修改目标仓库。规划阈值不等于已通过。
 
@@ -124,14 +124,17 @@ M1 是第一个代码开发里程碑。本设计阶段提交后停止，不提�
 该结果是受控 smoke 的真实集成验收，不是任意仓库、语言、规模、平台、Provider 或教学
 效果的生产级证明，也不表示 M5 live pilot 已完成。
 
-### Local Product Phase 2：持久化仓库工作区生命周期（P2.1 已完成）
+### Local Product Phase 2：持久化仓库工作区生命周期（P2.1/P2.2 已完成）
 
 仓库在 Phase 1 封存前没有正式 Phase 2 定义。当前建议的唯一主线是：把一次性导入升级为
 可重新打开、revision-aware、可恢复、可增量刷新并保持学习连续性的本地仓库工作区。
 
 当前状态：P2.1 已实现 schema v8→v9 additive migration、每个历史 project 独立 workspace、
 分页项目库、只读 workspace 详情/重新打开，以及前端 URL/最近 workspace 恢复。重新打开不
-执行分析、Embedding、relation 或 Provider，也不写学习事件。P2.2/P2.3 尚未实现。
+执行分析、Embedding、relation 或 Provider，也不写学习事件。V3·LP2.2 进一步实现 schema
+v9→v10 additive migration、显式 revision check、持久化幂等 update run、内容哈希增量
+chunk/Embedding、snapshot 内 relation 重建、失败/中断恢复与原子 active snapshot 激活。
+P2.3 跨 revision 学习重验证仍未实现。
 
 实施顺序：
 

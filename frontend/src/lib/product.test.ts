@@ -7,7 +7,8 @@ import {
   normalizeWorkspaceId,
   providerSummary,
   selectWorkspaceToRestore,
-  workspaceLibraryStatus
+  workspaceLibraryStatus,
+  workspaceUpdateState
 } from './product';
 
 describe('local product presentation', () => {
@@ -89,5 +90,27 @@ describe('local product presentation', () => {
     expect(workspaceLibraryStatus('error')).toBe('error');
     expect(workspaceLibraryStatus('success', 0)).toBe('empty');
     expect(workspaceLibraryStatus('success', 2)).toBe('ready');
+  });
+
+  it('keeps explicit workspace update states distinct', () => {
+    const check = {
+      workspace_id: 'workspace',
+      current_revision: 'a'.repeat(40),
+      available_revision: 'b'.repeat(40),
+      state: 'update_available' as const
+    };
+    const run = {
+      run_id: 'run', workspace_id: 'workspace', target_revision: 'b'.repeat(40),
+      status: 'running' as const, phase: 'chunk_update', result: '' as const,
+      stats: {}, error_code: '', error_message: '', retryable: false, retry_count: 0,
+      active_project_id: null, created_at: '', started_at: '', finished_at: null, updated_at: ''
+    };
+    expect(workspaceUpdateState(null, null)).toBe('ready');
+    expect(workspaceUpdateState({ ...check, state: 'unchanged' }, null)).toBe('unchanged');
+    expect(workspaceUpdateState(check, null)).toBe('update-available');
+    expect(workspaceUpdateState(check, run)).toBe('updating');
+    expect(workspaceUpdateState(check, { ...run, status: 'failed' })).toBe('failed');
+    expect(workspaceUpdateState(check, { ...run, status: 'succeeded', result: 'unchanged' })).toBe('unchanged');
+    expect(workspaceUpdateState(check, { ...run, status: 'succeeded', result: 'activated' })).toBe('ready');
   });
 });

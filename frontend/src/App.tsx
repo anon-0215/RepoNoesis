@@ -17,13 +17,17 @@ import { FormEvent, useEffect, useMemo, useState } from 'react';
 import {
   analyzeProject,
   askProject,
+  checkWorkspaceRevision,
   getConfigStatus,
   getLearningPath,
   getProject,
   getProjectMap,
   getReport,
   getWorkspace,
-  listWorkspaces
+  getWorkspaceUpdateRun,
+  listWorkspaces,
+  retryWorkspaceUpdateRun,
+  startWorkspaceRefresh
 } from './lib/api';
 import {
   citationLabel,
@@ -32,6 +36,7 @@ import {
   RECENT_WORKSPACE_KEY,
   selectWorkspaceToRestore,
   workspaceLibraryStatus,
+  workspaceUpdateState,
   type WorkspaceLibraryStatus,
   type SourceType
 } from './lib/product';
@@ -42,7 +47,9 @@ import type {
   ProjectMap,
   ProjectResponse,
   TreeNode,
-  WorkspaceSummary
+  WorkspaceSummary,
+  WorkspaceRevisionCheck,
+  WorkspaceUpdateRun
 } from './types';
 
 type Tab = 'dashboard' | 'map' | 'learning' | 'ask' | 'report';
@@ -63,6 +70,9 @@ export default function App() {
   const [workspaces, setWorkspaces] = useState<WorkspaceSummary[]>([]);
   const [libraryStatus, setLibraryStatus] = useState<WorkspaceLibraryStatus>('loading');
   const [projectId, setProjectId] = useState('');
+  const [currentRevision, setCurrentRevision] = useState('');
+  const [revisionCheck, setRevisionCheck] = useState<WorkspaceRevisionCheck | null>(null);
+  const [updateRun, setUpdateRun] = useState<WorkspaceUpdateRun | null>(null);
   const [project, setProject] = useState<ProjectResponse | null>(null);
   const [projectMap, setProjectMap] = useState<ProjectMap | null>(null);
   const [learningSteps, setLearningSteps] = useState<LearningStep[]>([]);
@@ -74,6 +84,7 @@ export default function App() {
   const [message, setMessage] = useState('');
 
   const hasProject = Boolean(project && projectId);
+  const updateState = workspaceUpdateState(revisionCheck, updateRun);
 
   useEffect(() => {
     getConfigStatus().then(setConfigStatus).catch((error) => {
@@ -81,6 +92,12 @@ export default function App() {
     });
     void initializeWorkspace();
   }, []);
+
+  useEffect(() => {
+    if (!workspaceId || !updateRun || !['pending', 'running'].includes(updateRun.status)) return;
+    const timer = window.setTimeout(() => void pollUpdateRun(workspaceId, updateRun.run_id), 1000);
+    return () => window.clearTimeout(timer);
+  }, [workspaceId, updateRun]);
 
   async function initializeWorkspace() {
     await loadWorkspaceLibrary();
@@ -136,6 +153,9 @@ export default function App() {
       await loadAll(workspace.active_snapshot.project_id);
       setWorkspaceId(workspace.workspace_id);
       setProjectId(workspace.active_snapshot.project_id);
+      setCurrentRevision(workspace.active_snapshot.repository_revision);
+      setRevisionCheck(null);
+      setUpdateRun(workspace.latest_update_run);
       setAnswers([]);
       window.localStorage.setItem(RECENT_WORKSPACE_KEY, workspace.workspace_id);
       replaceWorkspaceUrl(workspace.workspace_id);
@@ -149,6 +169,9 @@ export default function App() {
       if (source === 'url' || source === 'recent') replaceWorkspaceUrl(null);
       setWorkspaceId('');
       setProjectId('');
+      setCurrentRevision('');
+      setRevisionCheck(null);
+      setUpdateRun(null);
       setProject(null);
       setMessage(
         `${error instanceof Error ? error.message : '项目重新打开失败'} 请从项目库选择其他项目或重新分析。`
@@ -156,6 +179,66 @@ export default function App() {
       return false;
     } finally {
       setLoading(false);
+    }
+  }
+
+  async function handleCheckRevision() {
+    if (!workspaceId) return;
+    setMessage('正在显式检查仓库 revision…');
+    try {
+      const result = await checkWorkspaceRevision(workspaceId);
+      setRevisionCheck(result);
+      setMessage(result.state === 'unchanged' ? '当前 snapshot 已是最新 revision。' : '检测到可用的新 revision；确认后才会开始更新。');
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : 'revision 检查失败');
+    }
+  }
+
+  async function handleStartRefresh() {
+    if (!workspaceId || revisionCheck?.state !== 'update_available') return;
+    if (!window.confirm('确认显式更新到检测到的新 revision？旧 snapshot 会在成功激活前保持可用。')) return;
+    try {
+      const run = await startWorkspaceRefresh(workspaceId);
+      setUpdateRun(run);
+      setMessage(run.result === 'unchanged' ? '仓库 revision 未变化，未创建 snapshot。' : '更新已启动；旧 snapshot 仍可继续使用。');
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : '更新启动失败');
+    }
+  }
+
+  async function handleRetryRefresh() {
+    if (!workspaceId || !updateRun?.retryable) return;
+    if (!window.confirm('确认重试这次更新？旧 snapshot 在重试期间仍保持可用。')) return;
+    try {
+      const run = await retryWorkspaceUpdateRun(workspaceId, updateRun.run_id);
+      setUpdateRun(run);
+      setMessage('更新重试已启动。');
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : '更新重试失败');
+    }
+  }
+
+  async function pollUpdateRun(nextWorkspaceId: string, runId: string) {
+    try {
+      const run = await getWorkspaceUpdateRun(nextWorkspaceId, runId);
+      setUpdateRun(run);
+      if (run.status === 'failed') {
+        setMessage(`${run.error_message || '更新失败'} 旧 snapshot 仍可用。`);
+      } else if (run.status === 'succeeded' && run.result === 'activated') {
+        const workspace = await getWorkspace(nextWorkspaceId);
+        await loadAll(workspace.active_snapshot.project_id);
+        setProjectId(workspace.active_snapshot.project_id);
+        setCurrentRevision(workspace.active_snapshot.repository_revision);
+        setRevisionCheck(null);
+        setUpdateRun(workspace.latest_update_run);
+        await loadWorkspaceLibrary();
+        setMessage('新 revision 已完整验证并原子激活。');
+      } else if (run.status === 'succeeded') {
+        setRevisionCheck(null);
+        setMessage('仓库 revision 未变化，未创建 snapshot 或运行 Embedding。');
+      }
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : '无法恢复更新状态');
     }
   }
 
@@ -228,8 +311,8 @@ export default function App() {
         <div className="brand">
           <GitBranch aria-hidden="true" />
           <div>
-            <strong>GitLearnAgent</strong>
-            <span>开源项目学习导读系统</span>
+            <strong>源鉴 RepoNoesis</strong>
+            <span>源码证据驱动的项目学习工作台</span>
           </div>
         </div>
         <div className="status-line">{message || providerSummary(configStatus)}</div>
@@ -268,6 +351,29 @@ export default function App() {
               </div>
             )}
           </section>
+
+          {workspaceId && (
+            <section className={`workspace-update-card ${updateState}`} aria-label="revision 更新">
+              <strong>Revision 更新</strong>
+              <span>当前：{currentRevision.slice(0, 12) || 'unknown'}</span>
+              {revisionCheck?.state === 'update_available' && (
+                <span>可用：{revisionCheck.available_revision.slice(0, 12)}</span>
+              )}
+              {updateState === 'updating' && <span>阶段：{updateRun?.phase}</span>}
+              {updateState === 'failed' && <span>{updateRun?.error_code || 'update_failed'}</span>}
+              <div className="workspace-update-actions">
+                <button type="button" onClick={() => void handleCheckRevision()} disabled={updateState === 'updating'}>
+                  检查更新
+                </button>
+                {updateState === 'update-available' && (
+                  <button type="button" onClick={() => void handleStartRefresh()}>确认更新</button>
+                )}
+                {updateState === 'failed' && updateRun?.retryable && (
+                  <button type="button" onClick={() => void handleRetryRefresh()}>安全重试</button>
+                )}
+              </div>
+            </section>
+          )}
 
           <form className="analyze-form" onSubmit={handleAnalyze}>
             <label htmlFor="repo-source">仓库来源</label>
