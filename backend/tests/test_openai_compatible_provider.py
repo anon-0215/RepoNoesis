@@ -2,12 +2,26 @@ from __future__ import annotations
 
 import io
 import json
+import hashlib
+import time
 import unittest
 import urllib.error
+from threading import Event
 
 from app.config import LLMSettings
 from app.services.llm_client import LLMClient, ProviderError
 from app.services.smoke_diagnostics import SmokeDiagnosticsRecorder
+
+
+class _Clock:
+    def __init__(self, value=100.0):
+        self.value = float(value)
+
+    def __call__(self):
+        return self.value
+
+    def advance(self, seconds):
+        self.value += float(seconds)
 
 
 class _Response:
@@ -42,6 +56,142 @@ def _settings(**overrides) -> LLMSettings:
 
 
 class OpenAICompatibleProviderTests(unittest.TestCase):
+    def test_small_real_wall_clock_budget_does_not_accumulate_fixed_retry_timeouts(self):
+        blocker = Event()
+        calls = []
+
+        def opener(_request, *, timeout):
+            calls.append(timeout)
+            blocker.wait(0.06)
+            raise urllib.error.URLError("safe fake timeout")
+
+        client = LLMClient(
+            _settings(timeout_seconds=45.0, max_retries=2),
+            opener=opener,
+        )
+        started = time.monotonic()
+        with self.assertRaises(ProviderError) as raised:
+            client.chat(
+                [{"role": "user", "content": "hello"}],
+                deadline_monotonic=started + 0.05,
+            )
+        elapsed = time.monotonic() - started
+
+        self.assertEqual(raised.exception.code, "deadline_exceeded")
+        self.assertEqual(len(calls), 1)
+        self.assertLess(elapsed, 0.5)
+
+    def test_each_http_attempt_recomputes_timeout_from_absolute_deadline(self):
+        clock = _Clock()
+        timeouts = []
+
+        def opener(_request, *, timeout):
+            timeouts.append(timeout)
+            clock.advance(0.75)
+            if len(timeouts) == 1:
+                raise urllib.error.URLError("safe fake failure")
+            return _Response({"choices": [{"message": {"content": "ok"}}]})
+
+        client = LLMClient(
+            _settings(timeout_seconds=2.0, max_retries=1),
+            opener=opener,
+            sleep=lambda seconds: clock.advance(seconds),
+            monotonic=clock,
+        )
+        result = client.chat(
+            [{"role": "user", "content": "hello"}],
+            deadline_monotonic=clock() + 2.0,
+        )
+
+        self.assertEqual(result, "ok")
+        self.assertEqual(len(timeouts), 2)
+        self.assertLess(timeouts[1], timeouts[0])
+        self.assertLessEqual(timeouts[1], 1.0)
+
+    def test_consumed_budget_prevents_a_second_http_attempt(self):
+        clock = _Clock()
+        calls = []
+
+        def opener(_request, *, timeout):
+            calls.append(timeout)
+            clock.advance(timeout)
+            raise urllib.error.URLError("safe fake timeout")
+
+        client = LLMClient(
+            _settings(timeout_seconds=45.0, max_retries=2),
+            opener=opener,
+            sleep=lambda seconds: clock.advance(seconds),
+            monotonic=clock,
+        )
+        with self.assertRaises(ProviderError) as raised:
+            client.chat(
+                [{"role": "user", "content": "hello"}],
+                deadline_monotonic=clock() + 0.2,
+            )
+
+        self.assertEqual(raised.exception.code, "deadline_exceeded")
+        self.assertEqual(len(calls), 1)
+        self.assertLessEqual(calls[0], 0.200_001)
+
+    def test_backoff_is_checked_against_remaining_budget(self):
+        clock = _Clock()
+        calls = []
+        sleeps = []
+
+        def opener(_request, *, timeout):
+            calls.append(timeout)
+            clock.advance(0.1)
+            raise urllib.error.URLError("safe fake failure")
+
+        client = LLMClient(
+            _settings(timeout_seconds=2.0, max_retries=2),
+            opener=opener,
+            sleep=lambda seconds: (sleeps.append(seconds), clock.advance(seconds)),
+            monotonic=clock,
+        )
+        with self.assertRaises(ProviderError) as raised:
+            client.chat(
+                [{"role": "user", "content": "hello"}],
+                deadline_monotonic=clock() + 0.2,
+            )
+
+        self.assertEqual(raised.exception.code, "deadline_exceeded")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(sleeps, [])
+
+    def test_http_attempt_diagnostics_are_distinct_from_logical_calls(self):
+        clock = _Clock()
+        recorder = SmokeDiagnosticsRecorder()
+        calls = []
+
+        def opener(_request, *, timeout):
+            calls.append(timeout)
+            clock.advance(0.05)
+            if len(calls) == 1:
+                raise urllib.error.URLError("safe fake failure")
+            return _Response({"choices": [{"message": {"content": "ok"}}]})
+
+        client = LLMClient(
+            _settings(max_retries=1),
+            opener=opener,
+            sleep=lambda seconds: clock.advance(seconds),
+            monotonic=clock,
+        )
+        client.chat(
+            [{"role": "user", "content": "hello"}],
+            purpose="planner",
+            diagnostics_recorder=recorder,
+            deadline_monotonic=clock() + 2.0,
+        )
+        snapshot = recorder.snapshot()
+
+        self.assertEqual(snapshot["provider_logical_calls"], 1)
+        self.assertEqual(snapshot["provider_http_attempt_count"], 2)
+        self.assertEqual(snapshot["provider_attempt_outcomes"], ["network_error", "success"])
+        self.assertEqual(len(snapshot["provider_attempt_durations_ms"]), 2)
+        self.assertEqual(len(snapshot["provider_attempt_timeouts_ms"]), 2)
+        self.assertGreater(snapshot["backoff_total_ms"], 0)
+
     def test_chat_completions_uses_configured_values(self):
         captured = {}
 
@@ -113,6 +263,72 @@ class OpenAICompatibleProviderTests(unittest.TestCase):
         self.assertEqual(safe["diagnostics"]["finish_reason"], "length")
         self.assertEqual(safe["diagnostics"]["usage"]["total_tokens"], 138)
         self.assertNotIn("sensitive-reasoning-body", repr(safe))
+
+    def test_length_with_nonempty_content_is_rejected_before_content_return(self):
+        body = '{"status":"answer","decision_summary":"truncated"}'
+        client = LLMClient(
+            _settings(),
+            opener=lambda *_args, **_kwargs: _Response(
+                {
+                    "choices": [
+                        {
+                            "finish_reason": "length",
+                            "message": {
+                                "content": body,
+                                "reasoning_content": "private reasoning",
+                            },
+                        }
+                    ]
+                }
+            ),
+            sleep=lambda _value: None,
+        )
+
+        with self.assertRaises(ProviderError) as raised:
+            client.chat([{"role": "user", "content": "hello"}])
+
+        self.assertEqual(raised.exception.code, "provider_output_truncated")
+        diagnostics = raised.exception.to_safe_dict()["diagnostics"]
+        self.assertEqual(diagnostics["output_chars"], len(body))
+        self.assertEqual(
+            diagnostics["output_sha256"],
+            hashlib.sha256(body.encode("utf-8")).hexdigest(),
+        )
+        self.assertNotIn(body, repr(raised.exception.to_safe_dict()))
+        self.assertNotIn("private reasoning", repr(raised.exception.to_safe_dict()))
+
+    def test_missing_finish_reason_with_nonempty_content_remains_compatible(self):
+        client = LLMClient(
+            _settings(),
+            opener=lambda *_args, **_kwargs: _Response(
+                {"choices": [{"message": {"content": "ok"}}]}
+            ),
+            sleep=lambda _value: None,
+        )
+        self.assertEqual(client.chat([{"role": "user", "content": "hello"}]), "ok")
+
+    def test_reasoning_content_is_never_used_when_content_is_empty(self):
+        client = LLMClient(
+            _settings(),
+            opener=lambda *_args, **_kwargs: _Response(
+                {
+                    "choices": [
+                        {
+                            "finish_reason": "stop",
+                            "message": {
+                                "content": "",
+                                "reasoning_content": "not final content",
+                            },
+                        }
+                    ]
+                }
+            ),
+            sleep=lambda _value: None,
+        )
+        with self.assertRaises(ProviderError) as raised:
+            client.chat([{"role": "user", "content": "hello"}])
+        self.assertEqual(raised.exception.code, "provider_empty_content")
+        self.assertNotIn("not final content", repr(raised.exception.to_safe_dict()))
 
     def test_stop_with_empty_content_is_typed_empty_content(self):
         payload = {
@@ -248,6 +464,41 @@ class OpenAICompatibleProviderTests(unittest.TestCase):
         self.assertNotIn("sensitive-content-body", serialized)
         self.assertNotIn("sensitive-reasoning-body", serialized)
         self.assertNotIn("secret prompt", serialized)
+
+    def test_call_scoped_recorder_supports_ordinary_request_isolation(self):
+        recorder = SmokeDiagnosticsRecorder()
+        client = LLMClient(
+            _settings(),
+            opener=lambda *_args, **_kwargs: _Response(
+                {
+                    "choices": [
+                        {
+                            "finish_reason": "stop",
+                            "message": {
+                                "content": "grounded answer",
+                                "reasoning_content": "private reasoning",
+                            },
+                        }
+                    ]
+                }
+            ),
+            sleep=lambda _value: None,
+        )
+
+        result = client.chat(
+            [{"role": "user", "content": "private prompt"}],
+            purpose="final_answer",
+            diagnostics_recorder=recorder,
+        )
+
+        self.assertEqual(result, "grounded answer")
+        snapshot = recorder.snapshot()
+        self.assertEqual(len(snapshot["provider_calls"]), 1)
+        self.assertEqual(snapshot["provider_calls"][0]["purpose"], "final_answer")
+        serialized = json.dumps(snapshot)
+        self.assertNotIn("grounded answer", serialized)
+        self.assertNotIn("private reasoning", serialized)
+        self.assertNotIn("private prompt", serialized)
 
     def test_failure_before_response_does_not_invent_status_or_usage(self):
         recorder = SmokeDiagnosticsRecorder()

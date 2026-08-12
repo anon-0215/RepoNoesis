@@ -95,7 +95,10 @@ class M4AgentAndApiTests(unittest.TestCase):
             self.service.get_learning_context(self.project_id),
         )
         calls = [step["tool_calls"][0] for step in result["agent_trace"] if step["tool_calls"]]
-        self.assertEqual(calls[0]["status"], "rejected")
+        # The invalid identity-bearing input is rejected by the Planner contract
+        # before execution; the repair call succeeds, and the next duplicate is
+        # still rejected by the existing per-run tool limit.
+        self.assertEqual(calls[0]["status"], "succeeded")
         self.assertEqual(calls[-1]["status"], "rejected")
 
     def test_agent_trace_never_leaks_user_attempt_answer(self):

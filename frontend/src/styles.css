@@ -618,6 +618,16 @@ button:disabled {
   padding: 18px;
 }
 
+.ask-error {
+  border-color: #b45309;
+  background: #fff7ed;
+}
+
+.ask-error h2,
+.ask-error p {
+  color: #7c2d12;
+}
+
 .citation-grid {
   display: grid;
   gap: 10px;

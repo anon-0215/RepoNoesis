@@ -151,6 +151,35 @@ def symbol_result(chunk, project_id, score=1.0, rank=1, reasons=("qualified_symb
 
 
 class RetrievalV2Tests(unittest.TestCase):
+    def test_deadline_check_prevents_starting_dense_after_lexical(self):
+        checks = 0
+
+        def check_active():
+            nonlocal checks
+            checks += 1
+            if checks >= 3:
+                raise RuntimeError("deadline marker")
+
+        lexical = RecordingLexicalRetriever([])
+        dense = RecordingSemanticRetriever([])
+        orchestrator = RetrievalV2Orchestrator(
+            self.database,
+            self.enabled_embedding,
+            lexical_retriever=lexical,
+            semantic_retriever=dense,
+            symbol_retriever=RecordingSymbolRetriever(),
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "deadline marker"):
+            orchestrator.search(
+                self.project_id,
+                "target",
+                check_active=check_active,
+            )
+
+        self.assertEqual(len(lexical.calls), 1)
+        self.assertEqual(dense.calls, [])
+
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
         self.database = Database(Path(self.directory.name) / "retrieval-v2.sqlite")

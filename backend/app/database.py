@@ -3,7 +3,6 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-import os
 import sqlite3
 import struct
 import tempfile
@@ -11,10 +10,10 @@ import uuid
 from pathlib import Path
 from typing import Any, Sequence
 
+from app.config import get_database_path, get_env_value
 from app.learning_schema import LEARNING_SCHEMA_STATEMENTS
 
 
-DEFAULT_DB_PATH = Path(__file__).resolve().parents[1] / "data" / "gitlearn.sqlite"
 SCHEMA_VERSION = 11
 CODE_CHUNKER_VERSION = "python_ast_chunks_v1@1"
 LEARNING_CONTINUITY_CONFIG_IDENTITY = "learning-continuity-v1@1"
@@ -255,14 +254,15 @@ class _ManagedConnection(sqlite3.Connection):
 
 class Database:
     def __init__(self, path: Path | str | None = None) -> None:
-        explicit_path = path or os.getenv("GITLEARN_DB")
-        self.path = Path(explicit_path) if explicit_path else DEFAULT_DB_PATH
+        explicit_path = path or None
+        configured_environment_path = get_env_value("GITLEARN_DB", "").strip()
+        self.path = Path(explicit_path) if explicit_path else get_database_path()
         self._activation_test_hook: Any | None = None
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             self._init_schema()
         except (PermissionError, sqlite3.OperationalError):
-            if explicit_path:
+            if explicit_path or configured_environment_path:
                 raise
             self.path = Path(tempfile.gettempdir()) / "gitlearnagent.sqlite"
             self.path.parent.mkdir(parents=True, exist_ok=True)

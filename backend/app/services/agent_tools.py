@@ -3,7 +3,6 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import hashlib
 import json
-from pathlib import PurePosixPath, PureWindowsPath
 import time
 from typing import Any, Callable
 
@@ -20,7 +19,9 @@ from app.services.agent_contracts import (
     SearchCodeInput,
     ToolCall,
     ToolObservation,
+    RequestBudget,
     ValidateEvidenceInput,
+    normalize_repository_relative_path,
     utc_now,
 )
 from app.services.embedding_service import EmbeddingService
@@ -46,6 +47,7 @@ from app.services.retrieval_v2 import (
     validate_retrieval_version,
 )
 from app.services.symbol_retriever import SymbolRetriever
+from app.services.smoke_diagnostics import SmokeDiagnosticsRecorder
 
 
 ToolHandler = Callable[["ToolContext", BaseModel], tuple[Any, list[str], bool]]
@@ -63,24 +65,42 @@ class ToolSpec:
     max_bytes: int
 
 
-@dataclass
 class EvidenceStore:
-    _items: dict[str, Evidence] = field(default_factory=dict)
-    _owners: dict[str, str] = field(default_factory=dict)
-    _next_id: int = 1
+    """Request-owned Evidence with one immutable, deduplicated capacity."""
+
+    def __init__(self, capacity: int = 20) -> None:
+        if not isinstance(capacity, int) or isinstance(capacity, bool) or capacity < 0:
+            raise ValueError("EvidenceStore capacity must be a non-negative integer")
+        object.__setattr__(self, "_capacity", capacity)
+        self._items: dict[str, Evidence] = {}
+        self._owners: dict[str, str] = {}
+        self._next_id = 1
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        if name == "_capacity" and hasattr(self, "_capacity"):
+            raise AttributeError("EvidenceStore capacity is immutable")
+        object.__setattr__(self, name, value)
+
+    @property
+    def capacity(self) -> int:
+        return self._capacity
 
     def add(self, owner_id: str, evidence: list[Evidence]) -> list[Evidence]:
         added: list[Evidence] = []
         known_identities = {item.chunk_identity for item in self._items.values()}
+        remaining = max(0, self.capacity - len(self.all(owner_id)))
         for item in evidence:
             if item.chunk_identity in known_identities:
                 continue
+            if remaining <= 0:
+                break
             item.evidence_id = f"E{self._next_id}"
             self._next_id += 1
             self._items[item.evidence_id] = item
             self._owners[item.evidence_id] = owner_id
             known_identities.add(item.chunk_identity)
             added.append(item)
+            remaining -= 1
         return added
 
     def get_many(self, owner_id: str, evidence_ids: list[str]) -> list[Evidence]:
@@ -113,6 +133,10 @@ class ToolContext:
     limits: AgentLimits
     cancellation: CancellationToken
     deadline_monotonic: float
+    work_deadline_monotonic: float
+    diagnostics_recorder: SmokeDiagnosticsRecorder | None = None
+    active_tool_deadline_monotonic: float | None = None
+    active_tool_deadline_reason: str | None = None
     learning_context: dict[str, Any] = field(default_factory=dict)
     retrieval_version: str = RETRIEVAL_VERSION_V1
     hierarchy_mode: str = HIERARCHY_MODE_OFF
@@ -121,8 +145,31 @@ class ToolContext:
     def check_active(self) -> None:
         if self.cancellation.cancelled:
             raise ToolCancelled("request was cancelled")
-        if time.monotonic() >= self.deadline_monotonic:
-            raise ToolDeadlineExceeded("request deadline was reached")
+        now = time.monotonic()
+        if now >= self.deadline_monotonic:
+            raise ToolDeadlineExceeded(
+                "deadline_exceeded", "request deadline was reached"
+            )
+        if now >= self.effective_deadline_monotonic:
+            reason = self.active_tool_deadline_reason or "final_answer_not_attempted"
+            message = {
+                "tool_timeout": "tool cooperative timeout was reached",
+                "final_answer_not_attempted": "work cutoff was reached",
+            }.get(reason, "request deadline was reached")
+            raise ToolDeadlineExceeded(reason, message)
+
+    @property
+    def effective_deadline_monotonic(self) -> float:
+        if self.active_tool_deadline_monotonic is None:
+            return min(self.deadline_monotonic, self.work_deadline_monotonic)
+        return min(
+            self.deadline_monotonic,
+            self.work_deadline_monotonic,
+            self.active_tool_deadline_monotonic,
+        )
+
+    def remaining_ms(self) -> int:
+        return max(0, int((self.effective_deadline_monotonic - time.monotonic()) * 1000))
 
 
 class ToolError(Exception):
@@ -134,7 +181,9 @@ class ToolCancelled(ToolError):
 
 
 class ToolDeadlineExceeded(ToolError):
-    code = "deadline_exceeded"
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
 
 
 class ToolRegistry:
@@ -167,12 +216,99 @@ class ToolRegistry:
         context: ToolContext,
         call: ToolCall,
     ) -> ToolObservation:
+        try:
+            spec = self.get(call.tool_name)
+        except KeyError:
+            spec = None
+        return self._execute_resolved(context, call, spec)
+
+    def execute_resolved(
+        self,
+        context: ToolContext,
+        call: ToolCall,
+        spec: ToolSpec,
+    ) -> ToolObservation:
+        """Execute a call with the request-local Registry resolution."""
+
+        return self._execute_resolved(context, call, spec)
+
+    def _execute_resolved(
+        self,
+        context: ToolContext,
+        call: ToolCall,
+        spec: ToolSpec | None,
+    ) -> ToolObservation:
+        started = time.monotonic()
+        remaining_at_start = max(
+            0, int((context.deadline_monotonic - started) * 1000)
+        )
+        timeout_ms = max(0, call.timeout_ms)
+        if spec is not None:
+            timeout_ms = min(timeout_ms, max(0, spec.timeout_ms))
+        stage_deadline = RequestBudget.derive_tool_deadline(
+            request_deadline_at=context.deadline_monotonic,
+            work_cutoff_at=context.work_deadline_monotonic,
+            started_at=started,
+            timeout_ms=timeout_ms,
+        )
+        context.active_tool_deadline_monotonic = stage_deadline.deadline_monotonic
+        context.active_tool_deadline_reason = stage_deadline.reason
+        try:
+            observation = self._execute_once(context, call, spec)
+        finally:
+            context.active_tool_deadline_monotonic = None
+            context.active_tool_deadline_reason = None
+        ended = time.monotonic()
+        duration_ms = max(0, int((ended - started) * 1000))
+        remaining_at_end = max(
+            0, int((context.deadline_monotonic - ended) * 1000)
+        )
+        overrun_ms = max(0, int((ended - context.deadline_monotonic) * 1000))
+        tool_overrun_ms = max(
+            0, int((ended - stage_deadline.deadline_monotonic) * 1000)
+        )
+        observation.metrics.update(
+            {
+                "duration_ms": duration_ms,
+                "deadline_remaining_at_start_ms": remaining_at_start,
+                "deadline_remaining_at_end_ms": remaining_at_end,
+                "deadline_overrun_ms": overrun_ms,
+                "deadline_overrun": int(overrun_ms > 0),
+                "tool_deadline_reason": stage_deadline.reason,
+                "tool_deadline_overrun_ms": tool_overrun_ms,
+                "tool_deadline_overrun": int(tool_overrun_ms > 0),
+            }
+        )
+        if context.diagnostics_recorder is not None:
+            context.diagnostics_recorder.record_stage_duration("tool", duration_ms)
+            context.diagnostics_recorder.record_tool_deadline_overrun(
+                tool_overrun_ms > 0,
+                overrun_ms=tool_overrun_ms,
+            )
+            context.diagnostics_recorder.record_request_deadline_reached(
+                ended >= context.deadline_monotonic
+            )
+            context.diagnostics_recorder.record_deadline_state(
+                remaining_ms=remaining_at_end,
+                overrun_ms=overrun_ms,
+            )
+        return observation
+
+    def _execute_once(
+        self,
+        context: ToolContext,
+        call: ToolCall,
+        spec: ToolSpec | None,
+    ) -> ToolObservation:
         started = time.monotonic()
         call.started_at = utc_now()
         call.status = "running"
         try:
             context.check_active()
-            spec = self.get(call.tool_name)
+            if spec is None:
+                return self._finish_error(
+                    call, started, "rejected", "unknown_tool", "tool is not registered"
+                )
             if call.tool_version != spec.version:
                 raise ToolError("unsupported tool version")
             try:
@@ -228,17 +364,13 @@ class ToolRegistry:
                     **handler_metrics,
                 },
             )
-        except KeyError:
-            return self._finish_error(
-                call, started, "rejected", "unknown_tool", "tool is not registered"
-            )
         except ToolCancelled:
             return self._finish_error(
                 call, started, "cancelled", "cancelled", "request was cancelled"
             )
-        except ToolDeadlineExceeded:
+        except ToolDeadlineExceeded as exc:
             return self._finish_error(
-                call, started, "timed_out", "deadline_exceeded", "request deadline was reached"
+                call, started, "timed_out", exc.code, str(exc)
             )
         except ToolError as exc:
             return self._finish_error(
@@ -370,10 +502,12 @@ def build_tool_context(
     limits: AgentLimits,
     cancellation: CancellationToken,
     deadline_monotonic: float,
+    work_deadline_monotonic: float | None = None,
     learning_context: dict[str, Any] | None = None,
     retrieval_version: str = RETRIEVAL_VERSION_V1,
     hierarchy_mode: str = HIERARCHY_MODE_OFF,
     relation_mode: str = RELATION_MODE_OFF,
+    diagnostics_recorder: SmokeDiagnosticsRecorder | None = None,
 ) -> ToolContext:
     project = bundle.get("project") or {}
     project_id = str(project.get("id", ""))
@@ -409,6 +543,12 @@ def build_tool_context(
         limits=limits,
         cancellation=cancellation,
         deadline_monotonic=deadline_monotonic,
+        work_deadline_monotonic=(
+            deadline_monotonic
+            if work_deadline_monotonic is None
+            else work_deadline_monotonic
+        ),
+        diagnostics_recorder=diagnostics_recorder,
         learning_context=dict(learning_context or {}),
         retrieval_version=retrieval_version,
         hierarchy_mode=hierarchy_mode,
@@ -456,13 +596,17 @@ def _search_code(
         symbol=values.symbol,
         hierarchy_mode=context.hierarchy_mode,
         relation_mode=context.relation_mode,
+        check_active=context.check_active,
+        diagnostics_recorder=context.diagnostics_recorder,
     )
+    context.check_active()
     project = context.bundle.get("project") or {}
     built = EvidenceBuilder().build(
         outcome.results,
         project,
         retrieval_strategy_version=outcome.retrieval_strategy_version,
     )
+    context.check_active()
     built = [
         item
         for item in built
@@ -516,6 +660,9 @@ def _search_code(
         "retrieval_metrics": {
             "candidate_count": len(outcome.results),
             "new_evidence_count": len(added),
+        },
+        "_observation_metrics": {
+            "result_count": len(outcome.results),
         },
     }
     if context.retrieval_version != RETRIEVAL_VERSION_V1:
@@ -936,16 +1083,11 @@ def _evidence_summary(item: Evidence) -> dict[str, Any]:
 
 
 def _is_safe_relative_path(path: str) -> bool:
-    if not path or "\\" in path:
+    try:
+        normalized = normalize_repository_relative_path(path)
+    except ValueError:
         return False
-    posix = PurePosixPath(path)
-    windows = PureWindowsPath(path)
-    return (
-        not posix.is_absolute()
-        and not windows.is_absolute()
-        and all(part not in {"", ".", ".."} for part in posix.parts)
-        and str(posix) == path
-    )
+    return normalized == path
 
 
 def _bounded_serialization(

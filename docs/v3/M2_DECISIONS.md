@@ -155,9 +155,16 @@ bind -> plan -> validate decision -> execute one tool -> observe
      -> mandatory final validation -> constrained answer
 ```
 
-任何 step、call、Planner token 或 deadline 预算耗尽后不再启动 Planner 或工具。
-deadline 如果在 Planner 返回后到达，也不会启动工具。预算耗尽和取消时最终生成
-不再调用 LLM，只对已有 Evidence 强制复验并给出确定性部分回答或证据不足。
+正式 `/ask` 在 route 入口只创建一个基于 `time.monotonic()` 的请求级绝对
+`request_deadline_at`。work/planning cutoff 由该 deadline 减去 final-answer reserve
+派生；Planner 首次调用、repair、HTTP retry/backoff、普通工具和检索共享同一 cutoff，
+不能逐步重新取得完整预算。final-answer Provider 使用请求剩余总预算，但仍受同一
+绝对 request deadline 约束。
+
+任何 step、call、Planner token、work cutoff 或 request deadline 耗尽后不再启动
+新的 Planner、repair 或工具。deadline 快失败返回空 `answer/citations/evidence`；
+不再在预算失败后构造或持久化“确定性部分答案”。reserve 只是 final answer 的启动
+门禁和预算保留，不保证同步 Provider、校验或持久化一定能在 deadline 前完成。
 
 ## 默认预算与配置
 
@@ -171,7 +178,8 @@ deadline 如果在 Planner 返回后到达，也不会启动工具。预算耗�
 | max same tool calls | 3 |
 | max no-progress steps | 2 |
 | total deadline | 60,000 ms |
-| default tool timeout | 15,000 ms |
+| default tool timeout | 40,000 ms |
+| minimum final-answer reserve | 5,000 ms (`AGENT_FINAL_ANSWER_RESERVE_MS`, bounded 100–30,000 ms) |
 | search results | 20 |
 | observation bytes | 65,536 |
 | source lines / bytes | 200 / 32,768 |
@@ -189,20 +197,28 @@ fingerprint 由工具名、规范化参数、服务器绑定 project 和 revisio
 每个工具最多 3 次。因为成功 fingerprint 会被记住，A→B→A 的第三步 A 被拒绝。
 
 进展只承认新的 Evidence ID、symbol chunk identity、源码范围/hash 或
-Evidence validation 状态。连续 2 步无新进展即停止；有有效 Evidence 时给出部分
-回答，否则返回证据不足。所有路径仍受全局 step/call/deadline 限制。
+Evidence validation 状态。连续 2 步无新进展即停止；只有仍满足统一成功门禁时才
+能返回并持久化答案，否则返回有界安全失败。所有路径仍受全局
+step/call/work-cutoff/request-deadline 限制。
 
 ## timeout 与 cancellation 的真实边界
 
 同步 SQLite、BM25 和本地 handler 采用调用前后 deadline/cancellation 检查与
-耗时复核。超过单工具上限返回 `timed_out`，但 Python 同步函数无法安全抢占，
-因此指标明确标记 `timeout_enforcement=cooperative`，不宣称硬中断。M2 没有创建
-后台线程或残留任务。
+耗时复核。单工具自身上限先到返回 canonical `tool_timeout`（HTTP 503）；真实请求
+deadline 先到或同边界到达返回 `deadline_exceeded`（HTTP 504）。诊断分别记录
+tool deadline overrun 与 request deadline overrun。Python 同步函数无法安全抢占，
+所以这仍是 cooperative timeout：只能在启动前阻止、阶段间停止或返回后发现
+overrun，不能宣称真正取消。M2 没有创建后台线程、future 或残留 Provider 请求。
 
-`LLMClient` 使用 provider HTTP timeout（最大 45 秒，且 Planner 受剩余 deadline
-限制）。Agent Core 提供可测试的 `CancellationToken` 并在 Planner 前后、工具
-前后检查。当前同步 FastAPI 路由没有低风险接入客户端断开检测，所以网络断开不能
-抢占正在进行的同步 SQLite/本地模型调用；这是 M2 的已知限制。
+`LLMClient` 使用 provider HTTP timeout（最大 45 秒）；Planner/repair 的每个
+attempt 与 backoff 都重新计算 work cutoff 的剩余时间，final answer 则重新计算请求
+deadline 的剩余时间。Agent Core 提供可测试的 `CancellationToken` 并在 Planner
+前后、工具前后检查。当前同步 FastAPI 路由没有低风险接入客户端断开检测，所以
+网络断开不能抢占模型加载、Embedding encode、lexical/semantic SQLite 查询、
+BM25/评分、symbol/hierarchy/relation expansion 或同步 SQLite 持久化；这是已知限制。
+成功路径在 `save_chat_answer()` 调用前立即复核同一 request deadline；已到期则 504
+且零写入。同步 SQLite 写入一旦开始仍不能被安全硬抢占，本轮没有把它描述成严格
+硬中止。
 
 ## Prompt Injection 与安全
 
@@ -247,6 +263,12 @@ budget_usage
 
 旧 citation 仍只由最终 valid Evidence 派生。`answer_from_evidence()` 是 M1/M2
 共用的最终回答边界，避免 `/ask` 与工具层维护两套校验规则。
+
+所有项目类型在 `save_chat_answer()` 前执行同一失败门禁。deadline、work/reserve、
+Provider、Evidence、Citation、Relation、tool timeout 或持久化异常都不会作为成功
+`AskResponse` 返回，也不会写入聊天历史；legacy 的正常确定性降级成功仍保持兼容并
+只写入一次。终止性 request deadline 高于较早记录的 citation/relation/tool/provider
+次级失败，历史阶段计数和有界失败码仍可保留在 diagnostics 中。
 
 ## 确定性工程评测
 

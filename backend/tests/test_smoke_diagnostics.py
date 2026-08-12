@@ -75,17 +75,21 @@ class SmokeDiagnosticsTests(unittest.TestCase):
 
     def test_final_answer_failure_reason_is_a_fixed_enum(self):
         recorder = SmokeDiagnosticsRecorder()
-        for reason in (
+        recorder.record_final_answer_failure("citation_location_missing")
+        self.assertEqual(
+            recorder.snapshot()["final_answer_failure_reason_code"],
             "citation_location_missing",
+        )
+        for reason in (
             "citation_path_mismatch",
             "citation_line_range_mismatch",
             "citation_evidence_binding_failed",
         ):
             recorder.record_final_answer_failure(reason)
-            self.assertEqual(
-                recorder.snapshot()["final_answer_failure_reason_code"],
-                reason,
-            )
+        self.assertEqual(
+            recorder.snapshot()["final_answer_failure_reason_code"],
+            "citation_path_mismatch",
+        )
         with self.assertRaises(ValueError):
             recorder.record_final_answer_failure("dynamic-sensitive-reason")
 

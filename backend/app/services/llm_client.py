@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import hashlib
+import re
 import time
 import urllib.error
 import urllib.request
@@ -55,6 +57,7 @@ class LLMClient:
         *,
         opener: Callable[..., Any] | None = None,
         sleep: Callable[[float], None] | None = None,
+        monotonic: Callable[[], float] | None = None,
         diagnostics_recorder: SmokeDiagnosticsRecorder | None = None,
     ) -> None:
         self.settings = settings or get_llm_settings()
@@ -63,6 +66,7 @@ class LLMClient:
         self.model = self.settings.model
         self._opener = opener or urllib.request.urlopen
         self._sleep = sleep or time.sleep
+        self._monotonic = monotonic or time.monotonic
         self._diagnostics_recorder = diagnostics_recorder
 
     @property
@@ -92,6 +96,8 @@ class LLMClient:
         timeout_seconds: float | None = None,
         thinking: ThinkingMode | None = None,
         purpose: ProviderPurpose | None = None,
+        diagnostics_recorder: SmokeDiagnosticsRecorder | None = None,
+        deadline_monotonic: float | None = None,
     ) -> str | None:
         self.require_available()
         if thinking not in {None, "enabled", "disabled"}:
@@ -113,21 +119,28 @@ class LLMClient:
             },
             method="POST",
         )
+        recorder = diagnostics_recorder or self._diagnostics_recorder
         provider_call_id = (
-            self._diagnostics_recorder.start_provider_call(purpose)
-            if self._diagnostics_recorder is not None and purpose is not None
+            recorder.start_provider_call(purpose)
+            if recorder is not None and purpose is not None
             else None
         )
-        timeout = max(
-            0.1,
-            min(
-                self.settings.timeout_seconds,
-                float(timeout_seconds or self.settings.timeout_seconds),
-            ),
+        configured_timeout = min(
+            self.settings.timeout_seconds,
+            float(timeout_seconds or self.settings.timeout_seconds),
         )
         attempts = self.settings.max_retries + 1
         http_status: int | None = None
         for attempt in range(attempts):
+            remaining = self._remaining_seconds(deadline_monotonic)
+            if remaining is not None and remaining <= 0:
+                raise _deadline_error()
+            timeout = configured_timeout
+            if remaining is not None:
+                timeout = min(timeout, remaining)
+            if timeout <= 0:
+                raise _deadline_error()
+            attempt_started = self._monotonic()
             try:
                 # urllib.request.urlopen's second positional argument is POST data,
                 # not the timeout. Keep this keyword-only so request.data remains JSON.
@@ -136,34 +149,62 @@ class LLMClient:
                     self._record_provider_metadata(
                         provider_call_id,
                         {"response_received": True, "http_status": http_status},
+                        recorder=recorder,
                     )
                     data: Any = json.loads(response.read().decode("utf-8"))
-                return _parse_chat_content(
+                content = _parse_chat_content(
                     data,
                     http_status=http_status,
                     provider=self.provider_name,
                     model=self.model,
                     diagnostics_callback=lambda metadata: self._record_provider_metadata(
-                        provider_call_id, metadata
+                        provider_call_id, metadata, recorder=recorder
                     ),
                 )
+                self._record_provider_attempt(
+                    provider_call_id,
+                    outcome="success",
+                    started=attempt_started,
+                    timeout=timeout,
+                    recorder=recorder,
+                )
+                return content
             except urllib.error.HTTPError as exc:
                 self._record_provider_metadata(
                     provider_call_id,
                     {"response_received": True, "http_status": exc.code},
+                    recorder=recorder,
                 )
                 error = _http_error(exc.code)
-            except (TimeoutError, urllib.error.URLError):
+                outcome = "http_error"
+            except TimeoutError:
                 error = ProviderError(
                     "provider_unavailable",
                     "The generation provider could not be reached before the timeout.",
                     retryable=True,
                     status_code=503,
                 )
+                outcome = "timeout"
+            except urllib.error.URLError:
+                error = ProviderError(
+                    "provider_unavailable",
+                    "The generation provider could not be reached before the timeout.",
+                    retryable=True,
+                    status_code=503,
+                )
+                outcome = "network_error"
             except (UnicodeDecodeError, json.JSONDecodeError, TypeError) as exc:
                 self._record_provider_metadata(
                     provider_call_id,
                     {"response_json_valid": False},
+                    recorder=recorder,
+                )
+                self._record_provider_attempt(
+                    provider_call_id,
+                    outcome="invalid_response",
+                    started=attempt_started,
+                    timeout=timeout,
+                    recorder=recorder,
                 )
                 raise _invalid_response_error(
                     {
@@ -173,16 +214,75 @@ class LLMClient:
                         "response_json_valid": False,
                     }
                 ) from exc
+            except ProviderError:
+                self._record_provider_attempt(
+                    provider_call_id,
+                    outcome="invalid_response",
+                    started=attempt_started,
+                    timeout=timeout,
+                    recorder=recorder,
+                )
+                raise
+            self._record_provider_attempt(
+                provider_call_id,
+                outcome=outcome,
+                started=attempt_started,
+                timeout=timeout,
+                recorder=recorder,
+            )
+            remaining = self._remaining_seconds(deadline_monotonic)
+            if remaining is not None and remaining <= 0:
+                raise _deadline_error()
             if not error.retryable or attempt == attempts - 1:
                 raise error
-            self._sleep(min(0.25 * (2**attempt), 1.0))
+            backoff = min(0.25 * (2**attempt), 1.0)
+            remaining = self._remaining_seconds(deadline_monotonic)
+            if remaining is not None:
+                if remaining <= 0 or remaining < backoff:
+                    raise _deadline_error()
+            backoff_started = self._monotonic()
+            self._sleep(backoff)
+            if recorder is not None:
+                recorder.record_backoff(
+                    max(0, int((self._monotonic() - backoff_started) * 1000))
+                )
+            remaining = self._remaining_seconds(deadline_monotonic)
+            if remaining is not None and remaining <= 0:
+                raise _deadline_error()
         raise ProviderError("provider_unavailable", "The generation provider is unavailable.")
 
-    def _record_provider_metadata(
-        self, call_id: int | None, metadata: dict[str, Any]
+    def _remaining_seconds(self, deadline_monotonic: float | None) -> float | None:
+        if deadline_monotonic is None:
+            return None
+        return deadline_monotonic - self._monotonic()
+
+    def _record_provider_attempt(
+        self,
+        call_id: int | None,
+        *,
+        outcome: str,
+        started: float,
+        timeout: float,
+        recorder: SmokeDiagnosticsRecorder | None,
     ) -> None:
-        if self._diagnostics_recorder is not None:
-            self._diagnostics_recorder.record_provider_response(call_id, metadata)
+        if recorder is not None:
+            recorder.record_provider_attempt(
+                call_id,
+                outcome=outcome,
+                duration_ms=max(0, int((self._monotonic() - started) * 1000)),
+                timeout_ms=max(0, int(timeout * 1000)),
+            )
+
+    def _record_provider_metadata(
+        self,
+        call_id: int | None,
+        metadata: dict[str, Any],
+        *,
+        recorder: SmokeDiagnosticsRecorder | None = None,
+    ) -> None:
+        target = recorder or self._diagnostics_recorder
+        if target is not None:
+            target.record_provider_response(call_id, metadata)
 
 
 def _chat_completions_url(base_url: str) -> str:
@@ -190,6 +290,15 @@ def _chat_completions_url(base_url: str) -> str:
     if base.endswith("/chat/completions"):
         return base
     return f"{base}/chat/completions"
+
+
+def _deadline_error() -> ProviderError:
+    return ProviderError(
+        "deadline_exceeded",
+        "The request deadline was exhausted before another provider attempt could start.",
+        retryable=False,
+        status_code=504,
+    )
 
 
 def _parse_chat_content(
@@ -278,12 +387,18 @@ def _parse_chat_content(
                 "reasoning_content_type": _json_type(reasoning),
             }
         )
+        if isinstance(content, str):
+            diagnostics.update(
+                {
+                    "output_chars": len(content),
+                    "output_sha256": hashlib.sha256(
+                        content.encode("utf-8")
+                    ).hexdigest(),
+                    "markdown_fence_detected": "```" in content,
+                }
+            )
         if not content_valid_type or (reasoning_present and not reasoning_valid_type):
             raise _invalid_response_error(diagnostics)
-        if isinstance(content, str) and content.strip():
-            if diagnostics_callback is not None:
-                diagnostics_callback(_compact_diagnostics(diagnostics))
-            return content.strip()
         if finish_reason == "length":
             raise ProviderError(
                 "provider_output_truncated",
@@ -291,6 +406,12 @@ def _parse_chat_content(
                 retryable=False,
                 diagnostics=_compact_diagnostics(diagnostics),
             )
+        if finish_reason not in {None, "stop"}:
+            raise _invalid_response_error(diagnostics)
+        if isinstance(content, str) and content.strip():
+            if diagnostics_callback is not None:
+                diagnostics_callback(_compact_diagnostics(diagnostics))
+            return content.strip()
         if finish_reason == "stop":
             raise ProviderError(
                 "provider_empty_content",
@@ -334,6 +455,9 @@ def _compact_diagnostics(value: dict[str, Any]) -> dict[str, Any]:
         "content_empty",
         "reasoning_content_present",
         "reasoning_content_type",
+        "output_chars",
+        "output_sha256",
+        "markdown_fence_detected",
     }
     result = {
         key: item
@@ -343,6 +467,11 @@ def _compact_diagnostics(value: dict[str, Any]) -> dict[str, Any]:
     usage = _safe_usage(value.get("usage"))
     if usage:
         result["usage"] = usage
+    output_sha256 = result.get("output_sha256")
+    if not isinstance(output_sha256, str) or re.fullmatch(
+        r"[0-9a-f]{64}", output_sha256
+    ) is None:
+        result.pop("output_sha256", None)
     return result
 
 

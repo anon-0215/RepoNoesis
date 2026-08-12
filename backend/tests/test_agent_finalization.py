@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 import io
+import json
 from pathlib import Path
 import tempfile
 import unittest
@@ -20,6 +21,19 @@ from app.services.retrieval_v2 import retrieve_code
 from app.services.smoke_diagnostics import SmokeDiagnosticsRecorder
 from tests.m1_helpers import disabled_embedding_service, make_project
 from tests.test_m2_agent import ScriptedPlanner, decision
+
+
+def _structured(text="Grounded answer", aliases=None):
+    return json.dumps(
+        {
+            "parts": [
+                {
+                    "text": text,
+                    "evidence_aliases": aliases or ["A1"],
+                }
+            ]
+        }
+    )
 
 
 class _FinalAnswerLlm:
@@ -77,7 +91,7 @@ class AgentFinalizationTests(unittest.TestCase):
                 decision("answer"),
             ]
         )
-        llm = _FinalAnswerLlm("Grounded answer [E1] src/auth.py:1-2.")
+        llm = _FinalAnswerLlm(_structured())
         recorder = SmokeDiagnosticsRecorder()
         limits = replace(AgentLimits(), max_tool_calls=1)
 
@@ -105,7 +119,9 @@ class AgentFinalizationTests(unittest.TestCase):
         self.assertEqual(diagnostics["agent_status"], "completed")
 
     def test_tool_budget_exhausted_without_evidence_does_not_call_final_answer(self):
-        planner = ScriptedPlanner([decision("continue", "unknown_tool", {})])
+        planner = ScriptedPlanner([
+            decision("continue", "search_code", {"query": "definitely_absent"})
+        ])
         llm = _FinalAnswerLlm("must not be used")
         recorder = SmokeDiagnosticsRecorder()
 
@@ -147,7 +163,7 @@ class AgentFinalizationTests(unittest.TestCase):
                 decision("answer"),
             ]
         )
-        llm = _FinalAnswerLlm("Grounded answer [E1] src/auth.py:1-2.")
+        llm = _FinalAnswerLlm(_structured())
 
         result = self._run(planner, llm, limits=AgentLimits())
 
@@ -183,7 +199,7 @@ class AgentFinalizationTests(unittest.TestCase):
         planner = ScriptedPlanner(
             [decision("continue", "search_code", {"query": "authenticate_user"})]
         )
-        llm = _FinalAnswerLlm("Unsupported answer [E999] src/missing.py:1-1.")
+        llm = _FinalAnswerLlm(_structured(aliases=["A999"]))
 
         result = self._run(
             planner,
@@ -205,7 +221,7 @@ class AgentFinalizationTests(unittest.TestCase):
         recorder = SmokeDiagnosticsRecorder()
         result = self._run(
             planner,
-            _FinalAnswerLlm("Answer without a source citation."),
+            _FinalAnswerLlm(json.dumps({"parts": [{"text": "Answer", "evidence_aliases": []}]})),
             limits=replace(AgentLimits(), max_tool_calls=1),
             recorder=recorder,
         )
@@ -223,18 +239,23 @@ class AgentFinalizationTests(unittest.TestCase):
         cases = (
             (
                 "unknown",
-                "Unsupported [E999] src/auth.py:1-2.",
+                _structured(aliases=["A999"]),
                 "citation_unknown",
             ),
             (
                 "malformed",
-                "Malformed citation E1 at src/auth.py:1-2.",
+                "not-json",
                 "citation_format_invalid",
             ),
             (
-                "binding",
-                "Wrong range [E1] src/auth.py:99-100.",
-                "citation_line_range_mismatch",
+                "invalid_type",
+                json.dumps({"parts": [{"text": "Fact", "evidence_aliases": "A1"}]}),
+                "citation_format_invalid",
+            ),
+            (
+                "extra_location_field",
+                json.dumps({"parts": [{"text": "Fact", "evidence_aliases": ["A1"], "path": "src/missing.py"}]}),
+                "citation_format_invalid",
             ),
         )
         for label, response, expected_reason in cases:
@@ -267,6 +288,26 @@ class AgentFinalizationTests(unittest.TestCase):
                 self.assertFalse(
                     diagnostics["grounded_reference_validation_passed"]
                 )
+
+    def test_evidence_id_and_location_binding_failure_is_distinct(self):
+        planner = ScriptedPlanner(
+            [decision("continue", "search_code", {"query": "authenticate_user upload_file"})]
+        )
+        recorder = SmokeDiagnosticsRecorder()
+        result = self._run(
+            planner,
+            _FinalAnswerLlm(
+                json.dumps({"parts": [{"text": "Fact", "evidence_aliases": ["A1"], "revision": "fake"}]})
+            ),
+            limits=replace(AgentLimits(), max_tool_calls=1),
+            recorder=recorder,
+        )
+        diagnostics = recorder.snapshot()
+        self.assertEqual(result["agent_status"], "final_answer_failed")
+        self.assertEqual(
+            diagnostics["final_answer_failure_reason_code"],
+            "citation_format_invalid",
+        )
 
     def test_empty_provider_result_records_response_empty_without_validation_fabrication(self):
         recorder = SmokeDiagnosticsRecorder()
@@ -320,7 +361,7 @@ class AgentFinalizationTests(unittest.TestCase):
         self.assertFalse(diagnostics["citation_validation_passed"])
         self.assertNotIn("grounded_answer_candidate_received", diagnostics)
 
-    def test_relation_validation_failure_is_visible_without_rejecting_direct_evidence(self):
+    def test_relation_validation_failure_has_its_own_reason_code(self):
         recorder = SmokeDiagnosticsRecorder()
         planner = ScriptedPlanner(
             [
@@ -335,7 +376,7 @@ class AgentFinalizationTests(unittest.TestCase):
         ):
             result = self._run(
                 planner,
-                _FinalAnswerLlm("Grounded answer [E1] src/auth.py:1-2."),
+                _FinalAnswerLlm(_structured()),
                 limits=AgentLimits(),
                 recorder=recorder,
             )
@@ -345,9 +386,12 @@ class AgentFinalizationTests(unittest.TestCase):
         self.assertTrue(diagnostics["relation_validation_completed"])
         self.assertFalse(diagnostics["relation_validation_passed"])
         self.assertTrue(diagnostics["grounded_answer_accepted"])
-        self.assertNotIn("final_answer_failure_reason_code", diagnostics)
+        self.assertEqual(
+            diagnostics["final_answer_failure_reason_code"],
+            "relation_validation_failed",
+        )
 
-    def test_post_generation_validation_failure_is_distinct(self):
+    def test_post_generation_validation_failure_keeps_sticky_citation_code(self):
         def change_persisted_source():
             with self.database.connect() as connection:
                 connection.execute(
@@ -366,7 +410,7 @@ class AgentFinalizationTests(unittest.TestCase):
         result = self._run(
             planner,
             _FinalAnswerLlm(
-                "Grounded answer [E1] src/auth.py:1-2.",
+                _structured(),
                 callback=change_persisted_source,
             ),
             limits=replace(AgentLimits(), max_tool_calls=1),
@@ -379,7 +423,11 @@ class AgentFinalizationTests(unittest.TestCase):
         self.assertFalse(diagnostics["grounded_answer_accepted"])
         self.assertEqual(
             diagnostics["final_answer_failure_reason_code"],
-            "post_generation_validation_failed",
+            "citation_evidence_binding_failed",
+        )
+        self.assertEqual(
+            diagnostics["citation_failure_reason_code"],
+            "citation_evidence_binding_failed",
         )
 
     def test_provider_failure_records_attempt_and_failure_status_then_propagates(self):
@@ -472,7 +520,7 @@ class AgentFinalizationTests(unittest.TestCase):
                 decision("answer"),
             ]
         )
-        llm = _FinalAnswerLlm("Grounded answer [E1] src/auth.py:1-2.")
+        llm = _FinalAnswerLlm(_structured())
 
         result = self._run(planner, llm, limits=AgentLimits())
 

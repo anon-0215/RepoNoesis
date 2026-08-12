@@ -6,9 +6,14 @@ from dataclasses import dataclass
 from typing import Any, Literal
 
 
-MAX_SMOKE_DIAGNOSTICS_BYTES = 8_192
+MAX_SMOKE_DIAGNOSTICS_BYTES = 4_096
 MAX_PROVIDER_CALLS = 16
+MAX_LOGICAL_PROVIDER_CALLS = 1_000_000
 MAX_TOOL_ENTRIES = 16
+MAX_PROVIDER_ATTEMPT_DETAILS = 8
+MAX_PLANNER_ATTEMPTS = 10
+PUBLIC_DEADLINE_REASON_CODE = "deadline_exceeded"
+INTERNAL_DEADLINE_REASON_CODE = "deadline_exhausted"
 
 SmokeStage = Literal[
     "fixture_creation",
@@ -60,6 +65,21 @@ FALLBACK_REASON_CODES = frozenset(FallbackReasonCode.__args__)
 FINAL_ANSWER_FAILURE_REASON_CODES = frozenset(
     FinalAnswerFailureReasonCode.__args__
 )
+_VALIDATOR_CITATION_FAILURE_PRIORITY = {
+    "citation_path_mismatch": 0,
+    "citation_line_range_mismatch": 1,
+    "citation_evidence_binding_failed": 2,
+}
+AGENT_FAILURE_REASON_CODES = frozenset(
+    {
+        "planner_budget_exhausted",
+        "planner_invalid",
+        "planner_repair_failed",
+        PUBLIC_DEADLINE_REASON_CODE,
+        "final_answer_not_attempted",
+        "tool_timeout",
+    }
+)
 SMOKE_ERROR_MESSAGES = {
     "smoke_embedding_configuration_incomplete": (
         "The smoke gate embedding configuration is incomplete."
@@ -88,9 +108,62 @@ _AGENT_STATUSES = frozenset(
         "final_answer_failed",
         "budget_exhausted",
         "cancelled",
+        "failed",
     }
 )
 _TOOL_STATUSES = frozenset({"succeeded", "failed", "rejected", "timed_out", "cancelled"})
+_TOOL_PHASES = frozenset({"seed", "planner"})
+_TOOL_REASON_CODES = frozenset(
+    {
+        "cancelled",
+        "deadline_exceeded",
+        "final_answer_not_attempted",
+        "invalid_parameters",
+        "repeat_call",
+        "tool_error",
+        "tool_failed",
+        "tool_timeout",
+        "unknown_tool",
+    }
+)
+_PROVIDER_ATTEMPT_OUTCOMES = frozenset(
+    {"success", "http_error", "timeout", "network_error", "invalid_response", "deadline"}
+)
+_PLANNER_VALIDATION_STAGES = frozenset({"adapter", "parser", "schema", "semantic"})
+_PLANNER_VALIDATION_CODES = frozenset(
+    {
+        "valid",
+        "invalid_json",
+        "wrong_top_level_type",
+        "schema_missing_field",
+        "schema_extra_field",
+        "schema_invalid_type",
+        "schema_invalid_literal",
+        "semantic_invalid_decision",
+        "semantic_invalid_tool_contract",
+        "provider_output_truncated",
+        "provider_empty_content",
+        "provider_invalid_response",
+        "provider_unavailable",
+        "provider_authentication_failed",
+        "provider_rate_limited",
+        "provider_request_rejected",
+        "deadline_exceeded",
+    }
+)
+_FINAL_ANSWER_PROTOCOL_CODES = frozenset(
+    {
+        "final_answer_invalid_json",
+        "final_answer_schema_invalid",
+        "citation_alias_missing",
+        "citation_alias_unknown",
+        "citation_alias_invalid_type",
+        "citation_alias_limit_exceeded",
+        "canonical_render_failed",
+        "citation_format_invalid",
+        "citation_binding_failed",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -136,10 +209,70 @@ class SmokeDiagnosticsRecorder:
     def __init__(self) -> None:
         self.stage: str | None = None
         self._provider_calls: list[dict[str, Any]] = []
+        self._provider_logical_calls = 0
+        self._provider_http_attempt_count = 0
+        self._provider_attempt_outcomes: list[str] = []
+        self._provider_attempt_durations_ms: list[int] = []
+        self._provider_attempt_timeouts_ms: list[int] = []
+        self._backoff_total_ms = 0
         self._agent: dict[str, Any] = {}
         self._registered_tools: set[str] = set()
         self._tool_calls: dict[str, dict[str, int | str]] = {}
+        self._tool_executions: list[dict[str, Any]] = []
+        self._planner_attempts: list[dict[str, Any]] = []
+        self._final_answer_protocol_failure: dict[str, Any] | None = None
         self._truncated = False
+
+    def begin_request(self, *, deadline_budget_ms: int, remaining_ms: int) -> None:
+        self._agent["deadline_budget_ms"] = _bounded_duration(deadline_budget_ms)
+        self._agent["deadline_remaining_ms"] = _bounded_duration(remaining_ms)
+
+    def record_route_elapsed(self, elapsed_ms: int) -> None:
+        self._agent["route_elapsed_ms"] = _bounded_duration(elapsed_ms)
+
+    def record_agent_elapsed(self, elapsed_ms: int) -> None:
+        self._agent["agent_elapsed_ms"] = _bounded_duration(elapsed_ms)
+
+    def record_deadline_state(self, *, remaining_ms: int, overrun_ms: int) -> None:
+        self._agent["deadline_remaining_ms"] = _bounded_duration(remaining_ms)
+        self._agent["deadline_overrun_ms"] = _bounded_duration(overrun_ms)
+
+    def record_request_deadline_reached(self, reached: bool) -> None:
+        self._agent["request_deadline_reached"] = bool(
+            self._agent.get("request_deadline_reached", False) or reached
+        )
+
+    def record_stage_duration(self, stage: str, duration_ms: int) -> None:
+        key = {
+            "planner": "planner_duration_ms",
+            "tool": "tool_duration_ms",
+            "finalization": "finalization_duration_ms",
+        }.get(stage)
+        if key is None:
+            raise ValueError("unsupported timed stage")
+        self._agent[key] = _bounded_duration(
+            int(self._agent.get(key, 0)) + _bounded_duration(duration_ms)
+        )
+
+    def record_tool_deadline_overrun(
+        self, occurred: bool, *, overrun_ms: int = 0
+    ) -> None:
+        self._agent["tool_deadline_overrun"] = bool(
+            self._agent.get("tool_deadline_overrun", False) or occurred
+        )
+        self._agent["tool_deadline_overrun_ms"] = max(
+            int(self._agent.get("tool_deadline_overrun_ms", 0)),
+            _bounded_duration(overrun_ms),
+        )
+
+    def record_embedding_stage(self, stage: str) -> None:
+        key = {
+            "model_load": "model_load_attempted",
+            "query_encode": "query_encode_attempted",
+        }.get(stage)
+        if key is None:
+            raise ValueError("unsupported embedding stage")
+        self._agent[key] = True
 
     def enter_stage(self, stage: SmokeStage) -> None:
         if stage not in SMOKE_STAGES:
@@ -149,6 +282,9 @@ class SmokeDiagnosticsRecorder:
     def start_provider_call(self, purpose: ProviderPurpose) -> int | None:
         if purpose not in PROVIDER_PURPOSES:
             raise ValueError("unsupported provider diagnostics purpose")
+        self._provider_logical_calls = min(
+            MAX_LOGICAL_PROVIDER_CALLS, self._provider_logical_calls + 1
+        )
         if len(self._provider_calls) >= MAX_PROVIDER_CALLS:
             self._truncated = True
             return None
@@ -168,7 +304,39 @@ class SmokeDiagnosticsRecorder:
             return
         self._provider_calls[call_id].update(_safe_provider_metadata(metadata))
 
-    def begin_agent(self, registered_tools: list[str]) -> None:
+    def record_provider_attempt(
+        self,
+        call_id: int | None,
+        *,
+        outcome: str,
+        duration_ms: int,
+        timeout_ms: int,
+    ) -> None:
+        if outcome not in _PROVIDER_ATTEMPT_OUTCOMES:
+            raise ValueError("unsupported provider attempt outcome")
+        self._provider_http_attempt_count = min(
+            MAX_LOGICAL_PROVIDER_CALLS, self._provider_http_attempt_count + 1
+        )
+        if len(self._provider_attempt_outcomes) < MAX_PROVIDER_ATTEMPT_DETAILS:
+            self._provider_attempt_outcomes.append(outcome)
+            self._provider_attempt_durations_ms.append(_bounded_duration(duration_ms))
+            self._provider_attempt_timeouts_ms.append(_bounded_duration(timeout_ms))
+        else:
+            self._truncated = True
+        if call_id is not None and 0 <= call_id < len(self._provider_calls):
+            self._provider_calls[call_id]["http_attempt_count"] = min(
+                MAX_PROVIDER_ATTEMPT_DETAILS,
+                int(self._provider_calls[call_id].get("http_attempt_count", 0)) + 1,
+            )
+
+    def record_backoff(self, duration_ms: int) -> None:
+        self._backoff_total_ms = _bounded_duration(
+            self._backoff_total_ms + _bounded_duration(duration_ms)
+        )
+
+    def begin_agent(
+        self, registered_tools: list[str], *, request_id: str | None = None
+    ) -> None:
         self._registered_tools = {
             item for item in registered_tools[:MAX_TOOL_ENTRIES] if _safe_tool_name(item)
         }
@@ -184,6 +352,8 @@ class SmokeDiagnosticsRecorder:
                 "final_answer_response_received": False,
             }
         )
+        if isinstance(request_id, str) and re.fullmatch(r"[A-Za-z0-9-]{1,64}", request_id):
+            self._agent["request_id"] = request_id
 
     def record_planner_request(self, *, repair: bool) -> None:
         self.enter_stage("agent_planner")
@@ -201,6 +371,20 @@ class SmokeDiagnosticsRecorder:
 
     def record_planner_validation(self, valid: bool) -> None:
         self._agent["planner_json_valid"] = bool(valid)
+
+    def record_planner_attempt(
+        self, value: dict[str, Any], *, duration_ms: int
+    ) -> None:
+        """Keep one bounded, content-free Planner validation result."""
+
+        safe = _safe_planner_attempt({**value, "duration_ms": duration_ms})
+        if not safe:
+            self._truncated = True
+            return
+        if len(self._planner_attempts) >= MAX_PLANNER_ATTEMPTS:
+            self._truncated = True
+            return
+        self._planner_attempts.append(safe)
 
     def record_fallback(self, reason: FallbackReasonCode) -> None:
         if reason not in FALLBACK_REASON_CODES:
@@ -229,12 +413,98 @@ class SmokeDiagnosticsRecorder:
                 item["succeeded" if succeeded else "failed"]
             ) + 1
 
+    def record_tool_execution(
+        self,
+        *,
+        phase: str,
+        tool_name: str,
+        status: str,
+        result_count: int,
+        evidence_added: int,
+        reason_code: str | None,
+    ) -> None:
+        """Record one fixed-shape, content-free summary of a real tool execution."""
+
+        if len(self._tool_executions) >= MAX_TOOL_ENTRIES:
+            self._truncated = True
+            return
+        if (
+            phase not in _TOOL_PHASES
+            or tool_name not in self._registered_tools
+            or status not in _TOOL_STATUSES
+        ):
+            raise ValueError("unsupported tool execution diagnostics")
+        self._tool_executions.append(
+            {
+                "phase": phase,
+                "tool_name": tool_name,
+                "status": status,
+                "result_count": _bounded_count(result_count),
+                "evidence_added": _bounded_count(evidence_added),
+                "reason_code": (
+                    reason_code if reason_code in _TOOL_REASON_CODES else None
+                ),
+            }
+        )
+
+    def record_unknown_tool_rejection(self) -> None:
+        """Record a content-free sentinel for an unregistered Planner tool."""
+
+        if len(self._tool_executions) >= MAX_TOOL_ENTRIES:
+            self._truncated = True
+            return
+        self._tool_executions.append(
+            {
+                "phase": "planner",
+                "tool_name": "unknown_tool",
+                "status": "rejected",
+                "result_count": 0,
+                "evidence_added": 0,
+                "reason_code": "unknown_tool",
+            }
+        )
+
+    def clear_agent_failure(self, reason: str) -> None:
+        if self._agent.get("agent_failure_reason_code") == reason:
+            self._agent.pop("agent_failure_reason_code", None)
+
     def record_tool_budget_exhausted(self) -> None:
         self._agent["tool_budget_exhausted"] = True
+
+    def record_agent_progress(
+        self, *, steps_used: int, tool_calls_used: int, elapsed_ms: int
+    ) -> None:
+        for key, value in (
+            ("steps_used", steps_used),
+            ("tool_calls_used", tool_calls_used),
+            ("elapsed_ms", elapsed_ms),
+        ):
+            if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                self._agent[key] = min(value, 86_400_000 if key == "elapsed_ms" else 1_000_000)
+
+    def record_evidence_count(self, count: int) -> None:
+        if isinstance(count, int) and not isinstance(count, bool) and count >= 0:
+            self._agent["evidence_count"] = max(
+                int(self._agent.get("evidence_count", 0)), min(count, 1_000_000)
+            )
+
+    def record_agent_failure(self, reason: str) -> None:
+        if reason not in AGENT_FAILURE_REASON_CODES:
+            raise ValueError("unsupported agent failure reason")
+        self._agent["agent_failure_reason_code"] = reason
 
     def record_final_answer_attempt(self) -> None:
         self.enter_stage("final_answer")
         self._agent["final_answer_attempted"] = True
+
+    def record_final_answer_protocol_failure(self, value: dict[str, Any]) -> None:
+        """Record one content-free structured-answer rejection."""
+
+        safe = _safe_final_answer_protocol_failure(value)
+        if not safe:
+            self._truncated = True
+            return
+        self._final_answer_protocol_failure = safe
 
     def record_final_answer_response(self) -> None:
         self._agent["final_answer_response_received"] = True
@@ -280,7 +550,24 @@ class SmokeDiagnosticsRecorder:
     ) -> None:
         if reason not in FINAL_ANSWER_FAILURE_REASON_CODES:
             raise ValueError("unsupported final answer failure reason")
-        self._agent["final_answer_failure_reason_code"] = reason
+        existing_citation = self._agent.get("citation_failure_reason_code")
+        if reason.startswith("citation_"):
+            selected = reason
+            if isinstance(existing_citation, str):
+                if reason in _VALIDATOR_CITATION_FAILURE_PRIORITY:
+                    if existing_citation in _VALIDATOR_CITATION_FAILURE_PRIORITY:
+                        selected = min(
+                            (existing_citation, reason),
+                            key=_VALIDATOR_CITATION_FAILURE_PRIORITY.__getitem__,
+                        )
+                else:
+                    selected = existing_citation
+            self._agent["citation_failure_reason_code"] = selected
+            self._agent["final_answer_failure_reason_code"] = selected
+        elif not isinstance(existing_citation, str):
+            self._agent["final_answer_failure_reason_code"] = reason
+        if reason == "relation_validation_failed":
+            self._agent["relation_failure_reason_code"] = reason
 
     def record_agent_result(self, result: dict[str, Any]) -> None:
         for key, allowed in (
@@ -294,33 +581,79 @@ class SmokeDiagnosticsRecorder:
         evidence = result.get("evidence")
         citations = result.get("citations")
         if isinstance(evidence, list):
-            self._agent["evidence_count"] = len(evidence)
+            self.record_evidence_count(len(evidence))
         if isinstance(citations, list):
             self._agent["citation_count"] = len(citations)
 
     def snapshot(self) -> dict[str, Any]:
         payload: dict[str, Any] = dict(self._agent)
+        if self._provider_logical_calls:
+            payload["provider_logical_calls"] = self._provider_logical_calls
+        if self._provider_http_attempt_count:
+            payload["provider_http_attempt_count"] = self._provider_http_attempt_count
+            payload["provider_attempt_outcomes"] = list(self._provider_attempt_outcomes)
+            payload["provider_attempt_durations_ms"] = list(
+                self._provider_attempt_durations_ms
+            )
+            payload["provider_attempt_timeouts_ms"] = list(
+                self._provider_attempt_timeouts_ms
+            )
+        if self._backoff_total_ms:
+            payload["backoff_total_ms"] = self._backoff_total_ms
         if self._provider_calls:
             payload["provider_calls"] = [dict(item) for item in self._provider_calls]
         if self._tool_calls:
             payload["tool_calls"] = [
                 dict(self._tool_calls[name]) for name in sorted(self._tool_calls)
             ][:MAX_TOOL_ENTRIES]
+        if self._tool_executions:
+            payload["tool_executions"] = [dict(item) for item in self._tool_executions]
+        if self._planner_attempts:
+            payload["planner_attempts"] = [dict(item) for item in self._planner_attempts]
+        if self._final_answer_protocol_failure is not None:
+            payload["final_answer_protocol_failure"] = dict(
+                self._final_answer_protocol_failure
+            )
         if self._truncated:
             payload["diagnostics_truncated"] = True
         payload = _safe_smoke_diagnostics(payload)
         while (
-            len(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8"))
+            len(json.dumps(payload, sort_keys=True).encode("utf-8"))
             > MAX_SMOKE_DIAGNOSTICS_BYTES
             and payload.get("provider_calls")
         ):
             payload["provider_calls"].pop(0)
             payload["diagnostics_truncated"] = True
         if (
-            len(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8"))
+            len(json.dumps(payload, sort_keys=True).encode("utf-8"))
             > MAX_SMOKE_DIAGNOSTICS_BYTES
         ):
             payload.pop("tool_calls", None)
+            payload["diagnostics_truncated"] = True
+        while (
+            len(json.dumps(payload, sort_keys=True).encode("utf-8"))
+            > MAX_SMOKE_DIAGNOSTICS_BYTES
+            and payload.get("tool_executions")
+        ):
+            payload["tool_executions"].pop(0)
+            payload["diagnostics_truncated"] = True
+        while (
+            len(json.dumps(payload, sort_keys=True).encode("utf-8"))
+            > MAX_SMOKE_DIAGNOSTICS_BYTES
+            and payload.get("provider_attempt_outcomes")
+        ):
+            payload["provider_attempt_outcomes"].pop(0)
+            if payload.get("provider_attempt_durations_ms"):
+                payload["provider_attempt_durations_ms"].pop(0)
+            if payload.get("provider_attempt_timeouts_ms"):
+                payload["provider_attempt_timeouts_ms"].pop(0)
+            payload["diagnostics_truncated"] = True
+        while (
+            len(json.dumps(payload, sort_keys=True).encode("utf-8"))
+            > MAX_SMOKE_DIAGNOSTICS_BYTES
+            and len(payload.get("planner_attempts", [])) > 2
+        ):
+            payload["planner_attempts"].pop(0)
             payload["diagnostics_truncated"] = True
         return payload
 
@@ -338,6 +671,21 @@ def _safe_smoke_diagnostics(value: Any) -> dict[str, Any]:
         "evidence_count",
         "citation_count",
         "grounded_candidate_citation_count",
+        "steps_used",
+        "tool_calls_used",
+        "elapsed_ms",
+        "provider_logical_calls",
+        "provider_http_attempt_count",
+        "route_elapsed_ms",
+        "agent_elapsed_ms",
+        "deadline_budget_ms",
+        "deadline_remaining_ms",
+        "deadline_overrun_ms",
+        "tool_deadline_overrun_ms",
+        "planner_duration_ms",
+        "tool_duration_ms",
+        "finalization_duration_ms",
+        "backoff_total_ms",
     }
     boolean_keys = {
         "planner_response_received",
@@ -356,6 +704,10 @@ def _safe_smoke_diagnostics(value: Any) -> dict[str, Any]:
         "grounded_reference_validation_completed",
         "grounded_reference_validation_passed",
         "diagnostics_truncated",
+        "tool_deadline_overrun",
+        "request_deadline_reached",
+        "model_load_attempted",
+        "query_encode_attempted",
     }
     for key in integer_keys:
         item = value.get(key)
@@ -371,10 +723,16 @@ def _safe_smoke_diagnostics(value: Any) -> dict[str, Any]:
         ("answer_mode", _ANSWER_MODES),
         ("agent_status", _AGENT_STATUSES),
         ("final_answer_failure_reason_code", FINAL_ANSWER_FAILURE_REASON_CODES),
+        ("citation_failure_reason_code", FINAL_ANSWER_FAILURE_REASON_CODES),
+        ("relation_failure_reason_code", FINAL_ANSWER_FAILURE_REASON_CODES),
+        ("agent_failure_reason_code", AGENT_FAILURE_REASON_CODES),
     ):
         item = value.get(key)
         if isinstance(item, str) and item in allowed:
             result[key] = item
+    request_id = value.get("request_id")
+    if isinstance(request_id, str) and re.fullmatch(r"[A-Za-z0-9-]{1,64}", request_id):
+        result["request_id"] = request_id
     provider_calls = value.get("provider_calls")
     if isinstance(provider_calls, list):
         safe_calls = []
@@ -390,6 +748,29 @@ def _safe_smoke_diagnostics(value: Any) -> dict[str, Any]:
                 safe_calls.append(safe)
         if safe_calls:
             result["provider_calls"] = safe_calls
+    outcomes = value.get("provider_attempt_outcomes")
+    durations = value.get("provider_attempt_durations_ms")
+    timeouts = value.get("provider_attempt_timeouts_ms")
+    if isinstance(outcomes, list):
+        safe_outcomes = [
+            item
+            for item in outcomes[:MAX_PROVIDER_ATTEMPT_DETAILS]
+            if isinstance(item, str) and item in _PROVIDER_ATTEMPT_OUTCOMES
+        ]
+        if safe_outcomes:
+            result["provider_attempt_outcomes"] = safe_outcomes
+    for key, items in (
+        ("provider_attempt_durations_ms", durations),
+        ("provider_attempt_timeouts_ms", timeouts),
+    ):
+        if isinstance(items, list):
+            safe_values = [
+                _bounded_duration(item)
+                for item in items[:MAX_PROVIDER_ATTEMPT_DETAILS]
+                if isinstance(item, int) and not isinstance(item, bool) and item >= 0
+            ]
+            if safe_values:
+                result[key] = safe_values
     tool_calls = value.get("tool_calls")
     if isinstance(tool_calls, list):
         safe_tools = []
@@ -404,7 +785,63 @@ def _safe_smoke_diagnostics(value: Any) -> dict[str, Any]:
             safe_tools.append(safe_item)
         if safe_tools:
             result["tool_calls"] = safe_tools
+    tool_executions = value.get("tool_executions")
+    if isinstance(tool_executions, list):
+        safe_executions = []
+        for item in tool_executions[:MAX_TOOL_ENTRIES]:
+            if not isinstance(item, dict):
+                continue
+            phase = item.get("phase")
+            tool_name = item.get("tool_name")
+            status = item.get("status")
+            reason_code = item.get("reason_code")
+            if (
+                phase not in _TOOL_PHASES
+                or not _safe_tool_name(tool_name)
+                or status not in _TOOL_STATUSES
+            ):
+                continue
+            safe_executions.append(
+                {
+                    "phase": phase,
+                    "tool_name": tool_name,
+                    "status": status,
+                    "result_count": _bounded_count(item.get("result_count")),
+                    "evidence_added": _bounded_count(item.get("evidence_added")),
+                    "reason_code": (
+                        reason_code if reason_code in _TOOL_REASON_CODES else None
+                    ),
+                }
+            )
+        if safe_executions:
+            result["tool_executions"] = safe_executions
+    planner_attempts = value.get("planner_attempts")
+    if isinstance(planner_attempts, list):
+        safe_attempts = [
+            safe
+            for item in planner_attempts[:MAX_PLANNER_ATTEMPTS]
+            if (safe := _safe_planner_attempt(item))
+        ]
+        if safe_attempts:
+            result["planner_attempts"] = safe_attempts
+    protocol_failure = _safe_final_answer_protocol_failure(
+        value.get("final_answer_protocol_failure")
+    )
+    if protocol_failure:
+        result["final_answer_protocol_failure"] = protocol_failure
     return result
+
+
+def _bounded_duration(value: int) -> int:
+    if not isinstance(value, int) or isinstance(value, bool):
+        return 0
+    return min(86_400_000, max(0, value))
+
+
+def _bounded_count(value: Any) -> int:
+    if not isinstance(value, int) or isinstance(value, bool):
+        return 0
+    return min(1_000_000, max(0, value))
 
 
 def _safe_provider_metadata(value: Any) -> dict[str, Any]:
@@ -421,7 +858,9 @@ def _safe_provider_metadata(value: Any) -> dict[str, Any]:
         "choices_present",
         "content_present",
         "content_empty",
+        "finish_reason_present",
         "reasoning_content_present",
+        "markdown_fence_detected",
     ):
         item = value.get(key)
         if isinstance(item, bool):
@@ -439,9 +878,100 @@ def _safe_provider_metadata(value: Any) -> dict[str, Any]:
         item = value.get(key)
         if isinstance(item, str) and item in _TYPE_VALUES:
             result[key] = item
+    output_chars = value.get("output_chars")
+    if isinstance(output_chars, int) and not isinstance(output_chars, bool):
+        result["output_chars"] = _bounded_count(output_chars)
+    output_sha256 = value.get("output_sha256")
+    if isinstance(output_sha256, str) and re.fullmatch(
+        r"[0-9a-f]{64}", output_sha256
+    ):
+        result["output_sha256"] = output_sha256
     usage = _safe_usage(value.get("usage"))
     if usage:
         result["usage"] = usage
+    return result
+
+
+def _safe_planner_attempt(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    stage = value.get("stage")
+    code = value.get("stable_code")
+    if stage not in _PLANNER_VALIDATION_STAGES or code not in _PLANNER_VALIDATION_CODES:
+        return {}
+    result: dict[str, Any] = {
+        "stage": stage,
+        "stable_code": code,
+        "field_path": [],
+        "output_chars": _bounded_count(value.get("output_chars")),
+        "duration_ms": _bounded_duration(value.get("duration_ms")),
+        "finish_reason_present": value.get("finish_reason_present") is True,
+        "content_present": value.get("content_present") is True,
+        "reasoning_content_present": value.get("reasoning_content_present") is True,
+        "markdown_fence_detected": value.get("markdown_fence_detected") is True,
+        "repair_attempt": value.get("repair_attempt") is True,
+    }
+    path = value.get("field_path")
+    if isinstance(path, list):
+        result["field_path"] = [
+            item
+            for item in path[:16]
+            if (
+                isinstance(item, int)
+                and not isinstance(item, bool)
+                and item >= 0
+            )
+            or (
+                isinstance(item, str)
+                and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,63}", item)
+            )
+        ]
+    finish_reason = value.get("finish_reason_value")
+    if finish_reason in _FINISH_REASONS:
+        result["finish_reason_value"] = finish_reason
+    output_sha256 = value.get("output_sha256")
+    if isinstance(output_sha256, str) and re.fullmatch(
+        r"[0-9a-f]{64}", output_sha256
+    ):
+        result["output_sha256"] = output_sha256
+    return result
+
+
+def _safe_final_answer_protocol_failure(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    code = value.get("stable_code")
+    if code not in _FINAL_ANSWER_PROTOCOL_CODES:
+        return {}
+    result: dict[str, Any] = {
+        "stage": "final_answer",
+        "stable_code": code,
+        "field_path": [],
+        "output_chars": _bounded_count(value.get("output_chars")),
+        "part_count": _bounded_count(value.get("part_count")),
+        "alias_count": _bounded_count(value.get("alias_count")),
+        "markdown_fence_detected": value.get("markdown_fence_detected") is True,
+    }
+    path = value.get("field_path")
+    if isinstance(path, list):
+        result["field_path"] = [
+            item
+            for item in path[:16]
+            if (
+                isinstance(item, int)
+                and not isinstance(item, bool)
+                and item >= 0
+            )
+            or (
+                isinstance(item, str)
+                and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,63}", item)
+            )
+        ]
+    output_sha256 = value.get("output_sha256")
+    if isinstance(output_sha256, str) and re.fullmatch(
+        r"[0-9a-f]{64}", output_sha256
+    ):
+        result["output_sha256"] = output_sha256
     return result
 
 
@@ -462,3 +992,9 @@ def _safe_usage(value: Any) -> dict[str, int | float]:
 
 def _safe_tool_name(value: Any) -> bool:
     return isinstance(value, str) and bool(re.fullmatch(r"[a-z][a-z0-9_]{0,63}", value))
+
+
+def normalize_public_failure_reason(value: Any) -> Any:
+    if value == INTERNAL_DEADLINE_REASON_CODE:
+        return PUBLIC_DEADLINE_REASON_CODE
+    return value

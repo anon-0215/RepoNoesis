@@ -276,7 +276,6 @@ class M2ToolTests(unittest.TestCase):
     def test_read_source_rejects_paths_ranges_missing_files_and_revision_change(self):
         bad_paths = [
             "../secret.py",
-            "src\\auth.py",
             "C:/secret.py",
             "/secret.py",
         ]
@@ -285,7 +284,12 @@ class M2ToolTests(unittest.TestCase):
                 _call, observation = self._call(
                     "read_source", {"path": path, "start_line": 1, "end_line": 1}
                 )
-                self.assertEqual(observation.status, "failed")
+                self.assertEqual(observation.status, "rejected")
+        _call, normalized = self._call(
+            "read_source", {"path": "src\\auth.py", "start_line": 1, "end_line": 1}
+        )
+        self.assertEqual(normalized.status, "succeeded")
+        self.assertEqual(normalized.structured_results["path"], "src/auth.py")
         for parameters in (
             {"path": "missing.py", "start_line": 1, "end_line": 1},
             {"path": "src/auth.py", "start_line": 9, "end_line": 9},

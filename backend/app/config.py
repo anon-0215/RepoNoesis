@@ -154,6 +154,13 @@ def get_repository_settings() -> RepositorySettings:
     )
 
 
+def get_database_path() -> Path:
+    """Return the normalized product database path for environment configuration."""
+    return _env_path(
+        "GITLEARN_DB", BACKEND_ROOT / "data" / "gitlearn.sqlite"
+    ).resolve(strict=False)
+
+
 def get_product_config_status() -> dict[str, Any]:
     """Return diagnostics that intentionally contain no credential value or metadata."""
     llm = get_llm_settings()
@@ -196,7 +203,7 @@ def get_product_config_status() -> dict[str, Any]:
             "missing": embedding_missing,
         },
         "runtime": {
-            "database": str(_env_path("GITLEARN_DB", BACKEND_ROOT / "data" / "gitlearn.sqlite")),
+            "database": str(get_database_path()),
             "data_dir": str(repository.runtime_dir),
             "clone_dir": str(repository.runtime_dir / "repositories"),
         },
@@ -217,7 +224,10 @@ def get_agent_limits() -> AgentLimits:
             "AGENT_TOTAL_DEADLINE_MS", 60_000, 1_000, 60_000
         ),
         default_tool_timeout_ms=_bounded_env_int(
-            "AGENT_TOOL_TIMEOUT_MS", 15_000, 100, 15_000
+            "AGENT_TOOL_TIMEOUT_MS", 40_000, 100, 40_000
+        ),
+        min_final_answer_budget_ms=_bounded_env_int(
+            "AGENT_FINAL_ANSWER_RESERVE_MS", 5_000, 100, 30_000
         ),
         max_search_results=_bounded_env_int(
             "AGENT_MAX_SEARCH_RESULTS", 20, 1, 20

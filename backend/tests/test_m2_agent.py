@@ -125,7 +125,7 @@ class M2AgentTests(unittest.TestCase):
         )
         self.assertTrue(result["citations"])
 
-    def test_tool_failure_can_replan_to_legal_tool(self):
+    def test_invalid_tool_input_is_repaired_before_any_tool_executes(self):
         planner = ScriptedPlanner(
             [
                 decision("continue", "read_source", {"path": "../x", "start_line": 1, "end_line": 1}),
@@ -135,7 +135,12 @@ class M2AgentTests(unittest.TestCase):
         )
         result = self._run(planner)
         self.assertEqual(result["agent_status"], "completed")
-        self.assertEqual(result["agent_trace"][0]["tool_calls"][0]["status"], "failed")
+        self.assertEqual(result["agent_trace"][0]["tool_calls"][0]["status"], "succeeded")
+        self.assertEqual(
+            planner.repair_hints[1]["stable_code"],
+            "semantic_invalid_tool_contract",
+        )
+        self.assertEqual(planner.repair_hints[1]["field_path"], ["arguments", "path"])
         self.assertTrue(result["evidence"])
 
     def test_malformed_decision_gets_one_controlled_repair(self):
@@ -172,14 +177,19 @@ class M2AgentTests(unittest.TestCase):
             ]
         )
         result = self._run(planner)
-        self.assertEqual(result["agent_status"], "insufficient_evidence")
-        self.assertEqual(result["citations"], [])
+        self.assertEqual(result["agent_status"], "degraded")
+        self.assertTrue(result["evidence"])
         statuses = [
             step["tool_calls"][0]["status"]
             for step in result["agent_trace"]
             if step["tool_calls"]
         ]
-        self.assertEqual(statuses, ["rejected", "rejected"])
+        self.assertEqual(statuses, ["succeeded"])
+        self.assertNotIn("shell", [step["action"] for step in result["agent_trace"]])
+        self.assertEqual(
+            planner.repair_hints[1]["stable_code"],
+            "semantic_invalid_tool_contract",
+        )
 
     def test_identical_call_and_a_b_a_loop_are_rejected_and_terminate(self):
         search = decision("continue", "search_code", {"query": "authenticate_user"})
@@ -289,8 +299,9 @@ class M2AgentTests(unittest.TestCase):
             ]
         )
         result = self._run(planner)
-        self.assertEqual(result["agent_status"], "insufficient_evidence")
+        self.assertEqual(result["agent_status"], "final_answer_failed")
         self.assertEqual(result["citations"], [])
+        self.assertEqual(result["evidence"], [])
 
     def test_prompt_injection_cannot_raise_budget_or_execute_unknown_tool(self):
         with self.db.connect() as conn:
@@ -366,10 +377,11 @@ class M2AgentTests(unittest.TestCase):
             for step in result["agent_trace"]
             if step["tool_calls"]
         ]
-        self.assertEqual(statuses, ["succeeded", "rejected", "rejected"])
-        self.assertEqual(result["agent_status"], "insufficient_evidence")
+        self.assertEqual(statuses, ["succeeded", "succeeded"])
+        self.assertEqual(result["agent_status"], "degraded")
         self.assertEqual(result["budget_usage"]["limits"]["max_agent_steps"], 5)
-        self.assertEqual(result["citations"], [])
+        self.assertEqual([item["path"] for item in result["citations"]], ["README.md"])
+        self.assertNotIn("shell", [step["action"] for step in result["agent_trace"]])
 
     def test_formal_route_defaults_through_agent_core_and_schema_is_v10(self):
         route_directory = tempfile.TemporaryDirectory()

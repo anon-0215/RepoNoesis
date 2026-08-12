@@ -1,13 +1,26 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+from collections.abc import Iterator, Mapping, Sequence, Set
+import json
+import logging
+import math
 from pathlib import Path
 from threading import RLock
+import time
 from typing import Any, Callable, Literal
+import uuid
 
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    FiniteFloat,
+    field_validator,
+    model_validator,
+)
 
 from app.config import (
     get_agent_limits,
@@ -19,6 +32,19 @@ from app.config import (
 from app.database import Database, SCHEMA_VERSION
 from app.services.analyzer import analyze_snapshot
 from app.services.agent_core import run_bounded_agent
+from app.services.agent_contracts import (
+    RequestBudget,
+    normalize_repository_relative_path,
+)
+from app.services.ask_diagnostics import (
+    ask_result_is_failure,
+    ask_failure_http_status,
+    build_ask_failure_detail,
+    build_ask_success_diagnostics,
+    format_ask_failure_log,
+    format_ask_success_log,
+    normalize_provider_failure_code,
+)
 from app.services.code_chunker import extract_python_code_chunks_from_files
 from app.services.embedding_indexer import EmbeddingIndexer
 from app.services.embedding_service import EmbeddingService
@@ -40,6 +66,7 @@ from app.services.learning_contracts import (
 )
 from app.services.learning_service import LearningError, LearningService
 from app.services.llm_client import LLMClient, ProviderError
+from app.services.smoke_diagnostics import SmokeDiagnosticsRecorder
 from app.services.repository_import import RepositoryImportError, import_repository
 from app.services.report import generate_report
 from app.services.relation_analysis import index_project_relations
@@ -86,6 +113,18 @@ learning_service = _DeferredValue(
 embedding_service = EmbeddingService(get_embedding_settings())
 agent_limits = get_agent_limits()
 repository_settings = get_repository_settings()
+logger = logging.getLogger(__name__)
+
+
+def _log_ask_failure(detail: dict[str, Any]) -> None:
+    logger.warning(format_ask_failure_log(detail), extra={"ask_failure": detail})
+
+
+def _log_ask_success(diagnostics: dict[str, Any]) -> None:
+    logger.info(
+        format_ask_success_log(diagnostics),
+        extra={"ask_success": diagnostics},
+    )
 
 
 @asynccontextmanager
@@ -131,6 +170,13 @@ class AskRequest(BaseModel):
     hierarchy_mode: Literal["off", "normalize_v1"] = "off"
     relation_mode: Literal["off", "expand_v1"] = "off"
 
+    @field_validator("path")
+    @classmethod
+    def validate_repository_path(cls, value: str | None) -> str | None:
+        if value is not None:
+            normalize_repository_relative_path(value)
+        return value
+
     @model_validator(mode="after")
     def validate_retrieval_hierarchy_pair(self) -> "AskRequest":
         validate_hierarchy_mode(
@@ -171,11 +217,11 @@ class EvidenceResponse(BaseModel):
     content_hash: str
     excerpt: str
     retrieval_sources: list[str]
-    lexical_score: float | None
+    lexical_score: FiniteFloat | None
     lexical_rank: int | None
-    semantic_score: float | None
+    semantic_score: FiniteFloat | None
     semantic_rank: int | None
-    fusion_score: float
+    fusion_score: FiniteFloat
     fusion_rank: int
     selection_reason: str
     validation_status: Literal["valid", "invalid", "unvalidated"]
@@ -194,6 +240,9 @@ class EvidenceChainResponse(BaseModel):
 
 
 class AskResponse(BaseModel):
+    model_config = ConfigDict(hide_input_in_errors=True)
+
+    request_id: str = Field(..., min_length=1, max_length=64)
     answer: str
     citations: list[CitationResponse]
     evidence_schema_version: Literal[1]
@@ -208,6 +257,8 @@ class AskResponse(BaseModel):
         "insufficient_evidence",
         "degraded",
         "budget_exhausted",
+        "tool_budget_exhausted",
+        "final_answer_failed",
         "cancelled",
         "failed",
     ]
@@ -224,6 +275,53 @@ class AskResponse(BaseModel):
     recommended_next_action: dict[str, Any] | None
     learning_warnings: list[str]
     answer_mode: Literal["llm_grounded", "deterministic"]
+
+    @model_validator(mode="before")
+    @classmethod
+    def reject_unsafe_response_metadata(cls, value: Any) -> Any:
+        if not isinstance(value, Mapping):
+            return value
+
+        pending = [
+            value.get(field_name)
+            for field_name in (
+                "agent_trace",
+                "budget_usage",
+                "relation_summary",
+                "learning_context_summary",
+                "learning_plan_summary",
+                "recommended_next_action",
+            )
+        ]
+        visited: set[int] = set()
+        while pending:
+            current = pending.pop()
+            if isinstance(current, Iterator):
+                raise ValueError("response metadata contains a one-shot iterator")
+            if isinstance(current, float) and not math.isfinite(current):
+                raise ValueError("response metadata contains a non-finite float")
+            if isinstance(current, Mapping):
+                identity = id(current)
+                if identity in visited:
+                    continue
+                visited.add(identity)
+                pending.extend(current.keys())
+                pending.extend(current.values())
+            elif isinstance(current, Set):
+                identity = id(current)
+                if identity in visited:
+                    continue
+                visited.add(identity)
+                pending.extend(current)
+            elif isinstance(current, Sequence) and not isinstance(
+                current, (str, bytes, bytearray)
+            ):
+                identity = id(current)
+                if identity in visited:
+                    continue
+                visited.add(identity)
+                pending.extend(current)
+        return value
 
 
 class LearningResponse(BaseModel):
@@ -781,13 +879,53 @@ def get_learning_path(project_id: str) -> dict[str, Any]:
 
 @app.post("/api/projects/{project_id}/ask", response_model=AskResponse)
 def ask_project(project_id: str, request: AskRequest) -> dict[str, Any]:
+    started = time.monotonic()
+    request_id = str(uuid.uuid4())
+    recorder = SmokeDiagnosticsRecorder()
+    request_budget = RequestBudget.create(started_at=started, limits=agent_limits)
+    recorder.begin_request(
+        deadline_budget_ms=request_budget.total_budget_ms,
+        remaining_ms=request_budget.request_remaining_ms(started),
+    )
     bundle = _bundle_or_404(project_id)
     product_project = bundle["project"].get("source_type") in {"local", "git_url"}
     if product_project:
         try:
             llm.require_available()
         except ProviderError as exc:
-            raise HTTPException(status_code=exc.status_code, detail=exc.to_safe_dict()) from exc
+            now = time.monotonic()
+            recorder.record_route_elapsed(int((now - started) * 1000))
+            if request_budget.request_expired(now):
+                recorder.record_agent_failure("deadline_exceeded")
+                recorder.record_deadline_state(
+                    remaining_ms=0,
+                    overrun_ms=max(
+                        0,
+                        int((now - request_budget.request_deadline_at) * 1000),
+                    ),
+                )
+                recorder.record_request_deadline_reached(True)
+            detail = build_ask_failure_detail(
+                result={
+                    "request_id": request_id,
+                    "budget_usage": {"elapsed_ms": int((now - started) * 1000)},
+                },
+                recorder_snapshot=recorder.snapshot(),
+                retrieval_version=request.retrieval_version,
+                hierarchy_mode=request.hierarchy_mode,
+                relation_mode=request.relation_mode,
+                retryable=exc.retryable,
+                terminal_reason=normalize_provider_failure_code(exc.code),
+            )
+            _log_ask_failure(detail)
+            raise HTTPException(
+                status_code=(
+                    ask_failure_http_status(detail)
+                    if detail["code"] == "deadline_exceeded"
+                    else exc.status_code
+                ),
+                detail=detail,
+            ) from exc
     learning_context = learning_service.get_learning_context(project_id)
     try:
         result = run_bounded_agent(
@@ -805,23 +943,166 @@ def ask_project(project_id: str, request: AskRequest) -> dict[str, Any]:
             retrieval_version=request.retrieval_version,
             hierarchy_mode=request.hierarchy_mode,
             relation_mode=request.relation_mode,
+            diagnostics_recorder=recorder,
+            request_id=request_id,
+            request_budget=request_budget,
+            allow_planner_failure_fallback=not product_project,
         )
     except ProviderError as exc:
-        raise HTTPException(status_code=exc.status_code, detail=exc.to_safe_dict()) from exc
-    if product_project and (
-        result.get("answer_mode") != "llm_grounded"
-        or result.get("agent_mode") != "bounded"
-    ):
-        raise HTTPException(
-            status_code=502,
-            detail={
-                "code": "provider_grounding_failed",
-                "message": "The provider response did not pass the source-evidence citation constraints. No fallback answer was presented as a model answer.",
-                "retryable": False,
-            },
+        now = time.monotonic()
+        route_elapsed_ms = int((now - started) * 1000)
+        recorder.record_route_elapsed(route_elapsed_ms)
+        canonical_budget_reason = exc.code in {
+            "deadline_exceeded",
+            "planner_budget_exhausted",
+            "final_answer_not_attempted",
+            "tool_timeout",
+        }
+        if exc.code == "deadline_exceeded" or request_budget.request_expired(now):
+            recorder.record_agent_failure("deadline_exceeded")
+            recorder.record_deadline_state(
+                remaining_ms=request_budget.request_remaining_ms(now),
+                overrun_ms=max(
+                    0, int((now - request_budget.request_deadline_at) * 1000)
+                ),
+            )
+            recorder.record_request_deadline_reached(True)
+        elif canonical_budget_reason:
+            recorder.record_agent_failure(exc.code)
+        terminal_reason = (
+            exc.code
+            if canonical_budget_reason
+            else normalize_provider_failure_code(exc.code)
         )
-    db.save_chat_answer(project_id, request.question, result["answer"], result["citations"])
-    return result
+        detail = build_ask_failure_detail(
+            result={
+                "request_id": request_id,
+                "budget_usage": {
+                    "elapsed_ms": route_elapsed_ms,
+                    "limits": {"total_deadline_ms": agent_limits.total_deadline_ms},
+                },
+            },
+            recorder_snapshot=recorder.snapshot(),
+            retrieval_version=request.retrieval_version,
+            hierarchy_mode=request.hierarchy_mode,
+            relation_mode=request.relation_mode,
+            retryable=exc.retryable,
+            terminal_reason=terminal_reason,
+        )
+        _log_ask_failure(detail)
+        raise HTTPException(
+            status_code=(
+                ask_failure_http_status(detail)
+                if detail["code"] == "deadline_exceeded"
+                else exc.status_code
+            ),
+            detail=detail,
+        ) from exc
+    recorder.record_route_elapsed(int((time.monotonic() - started) * 1000))
+    recorder_snapshot = recorder.snapshot()
+    if ask_result_is_failure(
+        result,
+        recorder_snapshot,
+        product_project=product_project,
+    ):
+        detail = build_ask_failure_detail(
+            result=result,
+            recorder_snapshot=recorder_snapshot,
+            retrieval_version=request.retrieval_version,
+            hierarchy_mode=request.hierarchy_mode,
+            relation_mode=request.relation_mode,
+        )
+        _log_ask_failure(detail)
+        status_code = ask_failure_http_status(detail)
+        raise HTTPException(status_code=status_code, detail=detail)
+    response_candidate = dict(result)
+    response_candidate["request_id"] = request_id
+    try:
+        initially_validated_response = AskResponse.model_validate(response_candidate)
+        serialized_response = initially_validated_response.model_dump_json()
+        validated_response = AskResponse.model_validate_json(serialized_response)
+        validated_payload = json.loads(validated_response.model_dump_json())
+    except Exception as exc:
+        now = time.monotonic()
+        recorder.record_route_elapsed(int((now - started) * 1000))
+        terminal_reason = "response_contract_invalid"
+        if request_budget.request_expired(now):
+            terminal_reason = "deadline_exceeded"
+            recorder.record_agent_failure("deadline_exceeded")
+            recorder.record_deadline_state(
+                remaining_ms=0,
+                overrun_ms=max(
+                    0,
+                    int((now - request_budget.request_deadline_at) * 1000),
+                ),
+            )
+            recorder.record_request_deadline_reached(True)
+        detail = build_ask_failure_detail(
+            result={
+                "request_id": request_id,
+                "budget_usage": response_candidate.get("budget_usage", {}),
+            },
+            recorder_snapshot=recorder.snapshot(),
+            retrieval_version=request.retrieval_version,
+            hierarchy_mode=request.hierarchy_mode,
+            relation_mode=request.relation_mode,
+            terminal_reason=terminal_reason,
+        )
+        _log_ask_failure(detail)
+        raise HTTPException(
+            status_code=ask_failure_http_status(detail), detail=detail
+        ) from exc
+    before_save = time.monotonic()
+    if request_budget.request_expired(before_save):
+        recorder.record_agent_failure("deadline_exceeded")
+        recorder.record_deadline_state(
+            remaining_ms=0,
+            overrun_ms=max(
+                0,
+                int((before_save - request_budget.request_deadline_at) * 1000),
+            ),
+        )
+        recorder.record_request_deadline_reached(True)
+        recorder.record_route_elapsed(int((before_save - started) * 1000))
+        detail = build_ask_failure_detail(
+            result=validated_payload,
+            recorder_snapshot=recorder.snapshot(),
+            retrieval_version=request.retrieval_version,
+            hierarchy_mode=request.hierarchy_mode,
+            relation_mode=request.relation_mode,
+            terminal_reason="deadline_exceeded",
+        )
+        _log_ask_failure(detail)
+        raise HTTPException(status_code=504, detail=detail)
+    try:
+        db.save_chat_answer(
+            project_id,
+            request.question,
+            validated_payload["answer"],
+            validated_payload["citations"],
+        )
+    except Exception as exc:
+        recorder.record_route_elapsed(int((time.monotonic() - started) * 1000))
+        detail = build_ask_failure_detail(
+            result=validated_payload,
+            recorder_snapshot=recorder.snapshot(),
+            retrieval_version=request.retrieval_version,
+            hierarchy_mode=request.hierarchy_mode,
+            relation_mode=request.relation_mode,
+            terminal_reason="persistence_failed",
+        )
+        _log_ask_failure(detail)
+        raise HTTPException(status_code=500, detail=detail) from exc
+    _log_ask_success(
+        build_ask_success_diagnostics(
+            result=validated_payload,
+            recorder_snapshot=recorder.snapshot(),
+            retrieval_version=request.retrieval_version,
+            hierarchy_mode=request.hierarchy_mode,
+            relation_mode=request.relation_mode,
+        )
+    )
+    return validated_payload
 
 
 @app.post(

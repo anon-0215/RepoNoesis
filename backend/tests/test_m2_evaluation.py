@@ -154,7 +154,10 @@ class M2EvaluationTests(unittest.TestCase):
             if scenario["expected_evidence"]
             else ""
         )
-        query = "upload_file" if expected_path == "src/upload.py" else "authenticate_user"
+        if scenario["category"] == "insufficient" and not expected_path:
+            query = "definitely_missing_repository_fact"
+        else:
+            query = "upload_file" if expected_path == "src/upload.py" else "authenticate_user"
         symbol = query
         scripted = []
         for action in scenario["fake_planner_decisions"]:

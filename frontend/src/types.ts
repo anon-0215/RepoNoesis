@@ -87,6 +87,36 @@ export interface ChatAnswer {
   warnings: string[];
 }
 
+export interface AskFailureDiagnostics {
+  request_id: string;
+  agent_mode: 'bounded' | 'deterministic_fallback' | 'unknown';
+  agent_status: string;
+  answer_mode: 'llm_grounded' | 'deterministic' | 'not_available';
+  failure_stage: string;
+  failure_reason_code: string;
+  retrieval_version: 'v1' | 'v2';
+  hierarchy_mode: 'off' | 'normalize_v1';
+  relation_mode: 'off' | 'expand_v1';
+  steps_used: number;
+  tool_calls_used: number;
+  planner_logical_calls: number;
+  planner_repair_calls: number;
+  final_answer_attempted: boolean;
+  provider_logical_calls: number;
+  evidence_count: number;
+  citation_count: number;
+  citation_failure_reason_code: string | null;
+  relation_failure_reason_code: string | null;
+  elapsed_ms: number;
+}
+
+export interface AskFailure {
+  code: string;
+  message: string;
+  retryable: boolean;
+  diagnostics: AskFailureDiagnostics;
+}
+
 export interface ConfigStatus {
   llm: {
     provider: string | null;

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import math
-from typing import Any, Literal
+from typing import Any, Callable, Literal
 
 from app.database import Database
 from app.services.embedding_service import EmbeddingService
@@ -26,6 +26,7 @@ from app.services.relation_retrieval import (
 )
 from app.services.semantic_retriever import SemanticRetriever, SemanticSearchResult
 from app.services.symbol_retriever import SymbolRetriever, SymbolSearchResult
+from app.services.smoke_diagnostics import SmokeDiagnosticsRecorder
 
 
 RetrievalVersion = Literal["v1", "v2"]
@@ -305,7 +306,10 @@ class RetrievalV2Orchestrator:
         symbol: str | None = None,
         hierarchy_mode: str = HIERARCHY_MODE_OFF,
         relation_mode: str = RELATION_MODE_OFF,
+        check_active: Callable[[], None] | None = None,
+        diagnostics_recorder: SmokeDiagnosticsRecorder | None = None,
     ) -> RetrievalExecutionOutcome:
+        _check(check_active)
         if not str(query).strip():
             raise ValueError("retrieval query must not be empty")
         hierarchy_mode = validate_hierarchy_mode(
@@ -317,6 +321,7 @@ class RetrievalV2Orchestrator:
             retrieval_version=RETRIEVAL_VERSION_V2,
         )
         analysis = self.query_analyzer.analyze(query)
+        _check(check_active)
         weights, budgets, policy_warnings = _validated_policy(analysis, self.config)
         source_candidates: list[RetrievalSourceCandidate] = []
         warnings = list(policy_warnings)
@@ -337,6 +342,7 @@ class RetrievalV2Orchestrator:
             language=language,
             symbol=symbol,
         )
+        _check(check_active)
         lexical = sorted(lexical, key=_lexical_sort_key)[: budgets["lexical"]]
         source_candidates.extend(_adapt_lexical(item) for item in lexical)
         source_audit["lexical"] = {
@@ -356,7 +362,10 @@ class RetrievalV2Orchestrator:
                     language=language,
                     symbol=symbol,
                     local_files_only=True,
+                    check_active=check_active,
+                    diagnostics_recorder=diagnostics_recorder,
                 )
+                _check(check_active)
                 dense = list(dense_outcome.results)[: budgets["dense"]]
                 warnings.extend(dense_outcome.warnings)
                 source_audit["dense"] = {
@@ -366,6 +375,7 @@ class RetrievalV2Orchestrator:
                     "model_name": dense_outcome.model_name,
                 }
             except Exception as exc:
+                _check(check_active)
                 warnings.append(
                     "Dense retrieval unavailable; continuing with the other v2 "
                     f"sources: {type(exc).__name__}."
@@ -397,7 +407,9 @@ class RetrievalV2Orchestrator:
             budget=budgets["symbol"],
             path=path,
             language=language,
+            check_active=check_active,
         )
+        _check(check_active)
         source_candidates.extend(symbol_candidates)
         source_audit["symbol"] = {
             "status": symbol_status,
@@ -413,6 +425,7 @@ class RetrievalV2Orchestrator:
             weights=weights,
             config=self.config,
         )
+        _check(check_active)
         limit = min(
             self.config.max_final_top_k,
             max(1, int(evidence_count)),
@@ -425,6 +438,7 @@ class RetrievalV2Orchestrator:
                 self.database,
                 self.hierarchy_limits,
             ).resolve(merged)
+            _check(check_active)
             normalized = normalize_hierarchy_candidates(
                 merged,
                 resolution,
@@ -466,6 +480,7 @@ class RetrievalV2Orchestrator:
         )
         final_results = base_results
         if relation_mode == RELATION_MODE_EXPAND_V1:
+            _check(check_active)
             try:
                 expansion = RelationRetrievalExpander(self.database).expand(
                     project_id=project_id,
@@ -474,6 +489,7 @@ class RetrievalV2Orchestrator:
                     hierarchy_mode=hierarchy_mode,
                     hierarchy_audit=hierarchy_audit,
                 )
+                _check(check_active)
                 selection = select_relation_aware_candidates(
                     base_results,
                     expansion.candidates,
@@ -495,6 +511,7 @@ class RetrievalV2Orchestrator:
                     ],
                 }
             except Exception as exc:
+                _check(check_active)
                 warning = (
                     "Relation expansion failed safely; the frozen base retrieval "
                     f"candidates were preserved: {type(exc).__name__}."
@@ -528,12 +545,14 @@ class RetrievalV2Orchestrator:
         budget: int,
         path: str | None,
         language: str | None,
+        check_active: Callable[[], None] | None = None,
     ) -> tuple[list[RetrievalSourceCandidate], str]:
         raw: list[tuple[SymbolSearchResult, str | None]] = []
         repository_revision = _project_revision(self.database, project_id)
         if hints:
             per_hint = max(1, math.ceil(budget / len(hints)))
             for hint in hints:
+                _check(check_active)
                 ranked = self.symbol_retriever.search(
                     project_id,
                     hint,
@@ -546,6 +565,7 @@ class RetrievalV2Orchestrator:
                 )
                 raw.extend((item, hint) for item in ranked[:per_hint])
         else:
+            _check(check_active)
             ranked = self.symbol_retriever.search(
                 project_id,
                 query,
@@ -575,7 +595,10 @@ def retrieve_code(
     symbol: str | None = None,
     hierarchy_mode: str = HIERARCHY_MODE_OFF,
     relation_mode: str = RELATION_MODE_OFF,
+    check_active: Callable[[], None] | None = None,
+    diagnostics_recorder: SmokeDiagnosticsRecorder | None = None,
 ) -> RetrievalExecutionOutcome:
+    _check(check_active)
     version = validate_retrieval_version(retrieval_version)
     hierarchy_mode = validate_hierarchy_mode(
         hierarchy_mode,
@@ -593,6 +616,8 @@ def retrieve_code(
             path=path,
             language=language,
             symbol=symbol,
+            check_active=check_active,
+            diagnostics_recorder=diagnostics_recorder,
         )
         return RetrievalExecutionOutcome(
             results=outcome.results,
@@ -610,7 +635,14 @@ def retrieve_code(
         symbol=symbol,
         hierarchy_mode=hierarchy_mode,
         relation_mode=relation_mode,
+        check_active=check_active,
+        diagnostics_recorder=diagnostics_recorder,
     )
+
+
+def _check(callback: Callable[[], None] | None) -> None:
+    if callback is not None:
+        callback()
 
 
 def validate_retrieval_version(value: str) -> RetrievalVersion:

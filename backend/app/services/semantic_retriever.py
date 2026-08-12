@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 import math
-from typing import Any
+from typing import Any, Callable
 
 from app.database import Database
 from app.services.embedding_service import (
@@ -10,6 +10,7 @@ from app.services.embedding_service import (
     EmbeddingService,
     build_code_chunk_embedding_input_hash,
 )
+from app.services.smoke_diagnostics import SmokeDiagnosticsRecorder
 
 
 DEFAULT_TOP_K = 5
@@ -66,14 +67,21 @@ class SemanticRetriever:
         language: str | None = None,
         symbol: str | None = None,
         local_files_only: bool = False,
+        check_active: Callable[[], None] | None = None,
+        diagnostics_recorder: SmokeDiagnosticsRecorder | None = None,
     ) -> SemanticSearchOutcome:
+        _check(check_active)
         cleaned_query = query.strip()
         if not cleaned_query:
             raise ValueError("semantic search query must not be empty")
         limit = _bounded_top_k(top_k)
+        if diagnostics_recorder is not None:
+            diagnostics_recorder.record_embedding_stage("model_load")
         identity = self.embedding_service.ensure_effective_embedding_identity(
-            local_files_only=local_files_only
+            local_files_only=local_files_only,
+            check_active=check_active,
         )
+        _check(check_active)
         embedding_config_hash = identity.embedding_config_hash
         candidates = self.database.get_code_chunk_embeddings_for_project(
             project_id,
@@ -97,6 +105,7 @@ class SemanticRetriever:
                 self.embedding_service.settings,
             )
         ]
+        _check(check_active)
         if not candidates:
             return SemanticSearchOutcome(
                 status="no_embeddings",
@@ -114,10 +123,14 @@ class SemanticRetriever:
                     f"model {identity.model_name}"
                 )
 
+        if diagnostics_recorder is not None:
+            diagnostics_recorder.record_embedding_stage("query_encode")
         query_vector = self.embedding_service.encode_query(
             cleaned_query,
             local_files_only=local_files_only,
+            check_active=check_active,
         )
+        _check(check_active)
         if len(query_vector) != dimension:
             raise ValueError(
                 f"query embedding dimension {len(query_vector)} does not match "
@@ -131,6 +144,7 @@ class SemanticRetriever:
             )
             for candidate in candidates
         ]
+        _check(check_active)
         if any(not _is_finite(score) for score, _candidate in scored):
             raise ValueError("semantic score must be finite")
         scored.sort(
@@ -171,6 +185,11 @@ class SemanticRetriever:
                 else ["Semantic scores are raw dot products because embeddings are not normalized."]
             ),
         )
+
+
+def _check(callback: Callable[[], None] | None) -> None:
+    if callback is not None:
+        callback()
 
 
 def _bounded_top_k(top_k: int) -> int:

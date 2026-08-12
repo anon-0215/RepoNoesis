@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
-from typing import Any
+from typing import Any, Callable
 
 from app.database import Database
 from app.services.embedding_service import EmbeddingService
 from app.services.lexical_retriever import LexicalRetriever
 from app.services.semantic_retriever import SemanticRetriever
+from app.services.smoke_diagnostics import SmokeDiagnosticsRecorder
 
 
 RRF_K = 60
@@ -82,7 +83,10 @@ class HybridRetriever:
         path: str | None = None,
         language: str | None = None,
         symbol: str | None = None,
+        check_active: Callable[[], None] | None = None,
+        diagnostics_recorder: SmokeDiagnosticsRecorder | None = None,
     ) -> HybridSearchOutcome:
+        _check(check_active)
         limit = min(MAXIMUM_EVIDENCE_COUNT, max(1, int(evidence_count)))
         lexical = self.lexical_retriever.search(
             project_id,
@@ -92,6 +96,7 @@ class HybridRetriever:
             language=language,
             symbol=symbol,
         )
+        _check(check_active)
         warnings: list[str] = []
         semantic = []
         if self.embedding_service.settings.enabled:
@@ -104,10 +109,14 @@ class HybridRetriever:
                     language=language,
                     symbol=symbol,
                     local_files_only=True,
+                    check_active=check_active,
+                    diagnostics_recorder=diagnostics_recorder,
                 )
+                _check(check_active)
                 semantic = semantic_outcome.results
                 warnings.extend(semantic_outcome.warnings)
             except Exception as exc:
+                _check(check_active)
                 warnings.append(
                     f"Semantic retrieval unavailable; using lexical code-chunk search: "
                     f"{type(exc).__name__}."
@@ -121,6 +130,7 @@ class HybridRetriever:
             str(chunk["repository_revision"])
             for chunk in self.database.get_code_chunks(project_id)
         }
+        _check(check_active)
         valid_semantic = []
         for item in semantic:
             if (
@@ -179,6 +189,7 @@ class HybridRetriever:
             result.semantic_rank = semantic_rank
 
         results = list(by_identity.values())
+        _check(check_active)
         for result in results:
             if result.lexical_rank is not None:
                 result.fusion_score += LEXICAL_WEIGHT / (RRF_K + result.lexical_rank)
@@ -206,6 +217,11 @@ class HybridRetriever:
             retrieval_mode=mode,
             warnings=_deduplicate(warnings),
         )
+
+
+def _check(callback: Callable[[], None] | None) -> None:
+    if callback is not None:
+        callback()
 
 
 def _identity(item: Any) -> tuple[Any, ...]:

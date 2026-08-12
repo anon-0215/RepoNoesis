@@ -14,6 +14,7 @@ from app.services.embedding_service import (
     build_model_identity,
 )
 from app.services.semantic_retriever import SemanticRetriever
+from app.services.smoke_diagnostics import SmokeDiagnosticsRecorder
 
 
 MODEL_NAME = "fake-model"
@@ -159,10 +160,18 @@ class SemanticRetrieverTests(unittest.TestCase):
                 ]
             )
 
-            outcome = SemanticRetriever(db, _service()).search(project_id, "auth", top_k=2)
+            recorder = SmokeDiagnosticsRecorder()
+            outcome = SemanticRetriever(db, _service()).search(
+                project_id,
+                "auth",
+                top_k=2,
+                diagnostics_recorder=recorder,
+            )
 
             self.assertEqual(outcome.status, "ok")
             self.assertEqual([item.qualified_name for item in outcome.results], ["authenticate_user", "init_db"])
+            self.assertTrue(recorder.snapshot()["model_load_attempted"])
+            self.assertTrue(recorder.snapshot()["query_encode_attempted"])
 
     def test_equal_scores_have_stable_sort_order(self):
         with tempfile.TemporaryDirectory() as directory:

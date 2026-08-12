@@ -19,6 +19,11 @@ EMBEDDING_CONFIG_HASH_VERSION = "embedding-config-v1"
 EFFECTIVE_EMBEDDING_IDENTITY_VERSION = "embedding-effective-v1"
 
 
+def _check_active(callback: Callable[[], None] | None) -> None:
+    if callback is not None:
+        callback()
+
+
 class EmbeddingError(RuntimeError):
     pass
 
@@ -229,8 +234,15 @@ class EmbeddingService:
         self._dimension: int | None = None
         self._lock = RLock()
 
-    def load_model(self, local_files_only: bool = False) -> None:
+    def load_model(
+        self,
+        local_files_only: bool = False,
+        *,
+        check_active: Callable[[], None] | None = None,
+    ) -> None:
+        _check_active(check_active)
         with self._lock:
+            _check_active(check_active)
             if self._backend is not None:
                 return
             if not self.settings.enabled:
@@ -250,6 +262,7 @@ class EmbeddingService:
             if isinstance(backend, SentenceTransformerEmbeddingBackend):
                 backend.local_files_only = local_files_only
             try:
+                _check_active(check_active)
                 backend.load_model(
                     self.settings.model_name_or_path,
                     device,
@@ -265,6 +278,7 @@ class EmbeddingService:
                     if local_files_only
                     else ""
                 )
+                _check_active(check_active)
                 raise EmbeddingModelLoadError(
                     f"failed to load embedding model {identity.model_name} on {device}{suffix}"
                 ) from exc
@@ -301,6 +315,8 @@ class EmbeddingService:
         self,
         texts: Sequence[str],
         local_files_only: bool = False,
+        *,
+        check_active: Callable[[], None] | None = None,
     ) -> list[list[float]]:
         if not texts:
             return []
@@ -309,9 +325,16 @@ class EmbeddingService:
             prefixed,
             "documents",
             local_files_only=local_files_only,
+            check_active=check_active,
         )
 
-    def encode_query(self, text: str, local_files_only: bool = False) -> list[float]:
+    def encode_query(
+        self,
+        text: str,
+        local_files_only: bool = False,
+        *,
+        check_active: Callable[[], None] | None = None,
+    ) -> list[float]:
         query = text.strip()
         if not query:
             raise EmbeddingEncodeError("embedding query must not be empty")
@@ -319,6 +342,7 @@ class EmbeddingService:
             [self.settings.query_prefix + query],
             "query",
             local_files_only=local_files_only,
+            check_active=check_active,
         )[0]
 
     def get_model_identity(self) -> EmbeddingModelIdentity:
@@ -355,8 +379,14 @@ class EmbeddingService:
     def get_effective_embedding_identity(
         self,
         local_files_only: bool = False,
+        *,
+        check_active: Callable[[], None] | None = None,
     ) -> EffectiveEmbeddingIdentity:
-        dimension = self.get_embedding_dimension(local_files_only=local_files_only)
+        _check_active(check_active)
+        dimension = self.get_embedding_dimension(
+            local_files_only=local_files_only,
+            check_active=check_active,
+        )
         if dimension is None:
             raise EmbeddingConfigurationError("embedding dimension is unavailable")
         return build_effective_embedding_identity(
@@ -369,12 +399,30 @@ class EmbeddingService:
     def ensure_effective_embedding_identity(
         self,
         local_files_only: bool = False,
+        *,
+        check_active: Callable[[], None] | None = None,
     ) -> EffectiveEmbeddingIdentity:
-        return self.get_effective_embedding_identity(local_files_only=local_files_only)
+        _check_active(check_active)
+        value = self.get_effective_embedding_identity(
+            local_files_only=local_files_only,
+            check_active=check_active,
+        )
+        _check_active(check_active)
+        return value
 
-    def get_embedding_dimension(self, local_files_only: bool = False) -> int | None:
+    def get_embedding_dimension(
+        self,
+        local_files_only: bool = False,
+        *,
+        check_active: Callable[[], None] | None = None,
+    ) -> int | None:
+        _check_active(check_active)
         if self._dimension is None:
-            self.load_model(local_files_only=local_files_only)
+            self.load_model(
+                local_files_only=local_files_only,
+                check_active=check_active,
+            )
+        _check_active(check_active)
         return self._dimension
 
     def unload_model(self) -> None:
@@ -399,17 +447,25 @@ class EmbeddingService:
         texts: Sequence[str],
         operation: str,
         local_files_only: bool = False,
+        check_active: Callable[[], None] | None = None,
     ) -> list[list[float]]:
+        _check_active(check_active)
         with self._lock:
-            self.load_model(local_files_only=local_files_only)
+            self.load_model(
+                local_files_only=local_files_only,
+                check_active=check_active,
+            )
+            _check_active(check_active)
             assert self._backend is not None
             identity = self.get_model_identity()
             try:
+                _check_active(check_active)
                 raw_vectors = self._backend.encode(
                     texts,
                     batch_size=self.settings.batch_size,
                     normalize=self.settings.normalize,
                 )
+                _check_active(check_active)
             except EmbeddingError:
                 raise
             except Exception as exc:

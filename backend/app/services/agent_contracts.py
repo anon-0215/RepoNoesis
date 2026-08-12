@@ -2,13 +2,52 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
+from pathlib import PurePosixPath, PureWindowsPath
 from threading import Event
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 AGENT_SCHEMA_VERSION = 1
+_PUBLIC_AGENT_ACTIONS = frozenset(
+    {
+        "answer",
+        "expand_relations",
+        "get_learning_context",
+        "insufficient_evidence",
+        "lookup_symbol",
+        "read_source",
+        "search_code",
+        "unknown_tool",
+        "validate_evidence",
+    }
+)
+
+
+def normalize_repository_relative_path(path: str) -> str:
+    """Return one safe POSIX repository-relative path without broadening scope."""
+
+    if not isinstance(path, str) or not path.strip() or "\0" in path:
+        raise ValueError("unsafe repository path")
+    windows = PureWindowsPath(path)
+    posix = PurePosixPath(path)
+    if (
+        windows.is_absolute()
+        or bool(windows.drive)
+        or bool(windows.root)
+        or posix.is_absolute()
+    ):
+        raise ValueError("unsafe repository path")
+    normalized = path.replace("\\", "/")
+    normalized_path = PurePosixPath(normalized)
+    if (
+        any(part in {"", ".", ".."} for part in normalized.split("/"))
+        or any(part in {"", ".", ".."} for part in normalized_path.parts)
+        or str(normalized_path) != normalized
+    ):
+        raise ValueError("unsafe repository path")
+    return normalized
 
 
 def utc_now() -> str:
@@ -23,7 +62,8 @@ class AgentLimits:
     max_same_tool_calls: int = 3
     max_no_progress_steps: int = 2
     total_deadline_ms: int = 60_000
-    default_tool_timeout_ms: int = 15_000
+    default_tool_timeout_ms: int = 40_000
+    min_final_answer_budget_ms: int = 5_000
     max_search_results: int = 20
     max_observation_bytes: int = 65_536
     max_source_read_lines: int = 200
@@ -47,8 +87,114 @@ class AgentLimits:
     max_learning_context_bytes: int = 16_384
 
 
+BudgetFailureReason = Literal[
+    "deadline_exceeded",
+    "planner_budget_exhausted",
+    "final_answer_not_attempted",
+    "tool_timeout",
+]
+
+
+@dataclass(frozen=True)
+class StageDeadline:
+    deadline_monotonic: float
+    reason: BudgetFailureReason
+
+
+@dataclass(frozen=True)
+class RequestBudget:
+    """One request-owned absolute deadline and its derived work cutoff.
+
+    The final-answer reserve is a start gate, not a second request deadline and
+    not a guarantee that synchronous finalization will finish in time.
+    """
+
+    request_started_at: float
+    request_deadline_at: float
+    final_answer_reserve_ms: int
+
+    @classmethod
+    def create(cls, *, started_at: float, limits: AgentLimits) -> "RequestBudget":
+        return cls(
+            request_started_at=started_at,
+            request_deadline_at=started_at + max(0, limits.total_deadline_ms) / 1000,
+            final_answer_reserve_ms=max(0, limits.min_final_answer_budget_ms),
+        )
+
+    @classmethod
+    def from_deadline(
+        cls,
+        *,
+        started_at: float,
+        deadline_at: float,
+        final_answer_reserve_ms: int,
+    ) -> "RequestBudget":
+        return cls(
+            request_started_at=started_at,
+            request_deadline_at=deadline_at,
+            final_answer_reserve_ms=max(0, final_answer_reserve_ms),
+        )
+
+    @property
+    def work_cutoff_at(self) -> float:
+        return self.request_deadline_at - self.final_answer_reserve_ms / 1000
+
+    @property
+    def total_budget_ms(self) -> int:
+        return max(0, int((self.request_deadline_at - self.request_started_at) * 1000))
+
+    def request_remaining_ms(self, now: float) -> int:
+        return max(0, int((self.request_deadline_at - now) * 1000))
+
+    def work_remaining_ms(self, now: float) -> int:
+        return max(0, int((self.work_cutoff_at - now) * 1000))
+
+    def request_expired(self, now: float) -> bool:
+        return now >= self.request_deadline_at
+
+    def work_expired(self, now: float) -> bool:
+        return now >= self.work_cutoff_at
+
+    def work_failure_reason(self, now: float) -> BudgetFailureReason:
+        return (
+            "deadline_exceeded"
+            if self.request_expired(now)
+            else "planner_budget_exhausted"
+        )
+
+    def tool_deadline(self, *, started_at: float, timeout_ms: int) -> StageDeadline:
+        return self.derive_tool_deadline(
+            request_deadline_at=self.request_deadline_at,
+            work_cutoff_at=self.work_cutoff_at,
+            started_at=started_at,
+            timeout_ms=timeout_ms,
+        )
+
+    @staticmethod
+    def derive_tool_deadline(
+        *,
+        request_deadline_at: float,
+        work_cutoff_at: float,
+        started_at: float,
+        timeout_ms: int,
+    ) -> StageDeadline:
+        tool_timeout_at = started_at + max(0, timeout_ms) / 1000
+        earliest = min(
+            request_deadline_at,
+            work_cutoff_at,
+            tool_timeout_at,
+        )
+        if request_deadline_at <= earliest:
+            reason: BudgetFailureReason = "deadline_exceeded"
+        elif work_cutoff_at <= earliest:
+            reason = "final_answer_not_attempted"
+        else:
+            reason = "tool_timeout"
+        return StageDeadline(deadline_monotonic=earliest, reason=reason)
+
+
 class StrictModel(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
 
 class SearchCodeInput(StrictModel):
@@ -56,7 +202,12 @@ class SearchCodeInput(StrictModel):
     path: str | None = Field(default=None, max_length=500)
     language: str | None = Field(default=None, max_length=80)
     symbol: str | None = Field(default=None, max_length=500)
-    top_k: int = Field(default=5, ge=1, le=20)
+    top_k: int = Field(default=5, ge=1, le=20, strict=True)
+
+    @field_validator("path")
+    @classmethod
+    def normalize_path(cls, value: str | None) -> str | None:
+        return _normalize_optional_tool_path(value)
 
 
 class LookupSymbolInput(StrictModel):
@@ -64,13 +215,29 @@ class LookupSymbolInput(StrictModel):
     match_mode: Literal["exact", "prefix", "fuzzy"] = "exact"
     path: str | None = Field(default=None, max_length=500)
     language: str | None = Field(default=None, max_length=80)
-    top_k: int = Field(default=10, ge=1, le=20)
+    top_k: int = Field(default=10, ge=1, le=20, strict=True)
+
+    @field_validator("path")
+    @classmethod
+    def normalize_path(cls, value: str | None) -> str | None:
+        return _normalize_optional_tool_path(value)
 
 
 class ReadSourceInput(StrictModel):
     path: str = Field(min_length=1, max_length=500)
     start_line: int = Field(ge=1)
     end_line: int = Field(ge=1)
+
+    @field_validator("path")
+    @classmethod
+    def normalize_path(cls, value: str) -> str:
+        return normalize_repository_relative_path(value)
+
+
+def _normalize_optional_tool_path(value: str | None) -> str | None:
+    if value is None:
+        return None
+    return normalize_repository_relative_path(value)
 
 
 class ValidateEvidenceInput(StrictModel):
@@ -105,12 +272,79 @@ class PlannerDecision(StrictModel):
     decision_summary: str = Field(min_length=1, max_length=240)
 
 
+PlannerValidationStage = Literal["adapter", "parser", "schema", "semantic"]
+PlannerValidationCode = Literal[
+    "valid",
+    "invalid_json",
+    "wrong_top_level_type",
+    "schema_missing_field",
+    "schema_extra_field",
+    "schema_invalid_type",
+    "schema_invalid_literal",
+    "semantic_invalid_decision",
+    "semantic_invalid_tool_contract",
+    "provider_output_truncated",
+    "provider_empty_content",
+    "provider_invalid_response",
+    "provider_unavailable",
+    "provider_authentication_failed",
+    "provider_rate_limited",
+    "provider_request_rejected",
+    "deadline_exceeded",
+]
+
+
+@dataclass(frozen=True)
+class PlannerValidationFailure:
+    """Content-free, stable details for one rejected Planner response."""
+
+    stage: PlannerValidationStage
+    stable_code: PlannerValidationCode
+    field_path: tuple[str | int, ...] = ()
+    output_chars: int = 0
+    output_sha256: str | None = None
+    finish_reason_present: bool = False
+    finish_reason_value: str | None = None
+    content_present: bool = False
+    reasoning_content_present: bool = False
+    markdown_fence_detected: bool = False
+    repair_attempt: bool = False
+
+    def to_safe_dict(self) -> dict[str, Any]:
+        result: dict[str, Any] = {
+            "stage": self.stage,
+            "stable_code": self.stable_code,
+            "field_path": list(self.field_path),
+            "output_chars": max(0, self.output_chars),
+            "finish_reason_present": self.finish_reason_present,
+            "content_present": self.content_present,
+            "reasoning_content_present": self.reasoning_content_present,
+            "markdown_fence_detected": self.markdown_fence_detected,
+            "repair_attempt": self.repair_attempt,
+        }
+        if self.output_sha256 is not None:
+            result["output_sha256"] = self.output_sha256
+        if self.finish_reason_value is not None:
+            result["finish_reason_value"] = self.finish_reason_value
+        return result
+
+
+@dataclass(frozen=True)
+class PlannerValidationResult:
+    decision: PlannerDecision | None = None
+    failure: PlannerValidationFailure | None = None
+
+    @property
+    def valid(self) -> bool:
+        return self.decision is not None and self.failure is None
+
+
 @dataclass
 class ToolCall:
     call_id: str
     step_id: str
     tool_name: str
-    tool_version: str
+    tool_version: str | None
     parameters: dict[str, Any]
     timeout_ms: int
     budget: dict[str, int]
@@ -153,7 +387,7 @@ class AgentStep:
             calls.append(
                 {
                     "call_id": call.call_id,
-                    "tool_name": call.tool_name,
+                    "tool_name": _public_tool_name(call.tool_name),
                     "tool_version": call.tool_version,
                     "status": observation.status,
                     "result_count": observation.metrics.get("result_count", 0),
@@ -163,12 +397,16 @@ class AgentStep:
             )
         return {
             "step_id": self.step_id,
-            "action": self.action,
+            "action": _public_tool_name(self.action),
             "tool_calls": calls,
             "decision_summary": self.decision_summary[:240],
             "completion_status": self.completion_status,
             "remaining_budget": dict(self.remaining_budget),
         }
+
+
+def _public_tool_name(value: str) -> str:
+    return value if value in _PUBLIC_AGENT_ACTIONS else "unknown_tool"
 
 
 class CancellationToken:
