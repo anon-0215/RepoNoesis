@@ -5,8 +5,10 @@ import ipaddress
 import logging
 import math
 import os
+import re
 import shutil
 import socket
+import stat
 import subprocess
 import time
 import uuid
@@ -14,7 +16,7 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from urllib.parse import urlsplit, urlunsplit
 
-from app.config import RepositorySettings
+from app.config import RepositorySettings, validate_git_proxy
 from app.models import RepoFile, RepositorySnapshot
 from app.services.github_client import is_interesting_text_file
 
@@ -22,6 +24,15 @@ from app.services.github_client import is_interesting_text_file
 logger = logging.getLogger(__name__)
 _MAX_SAFE_ELAPSED_MS = 86_400_000
 _MAX_SAFE_EXIT_CODE = 2_147_483_647
+_IMPORT_DIRECTORY_PATTERN = re.compile(r"^\.import-[0-9a-f]{32}$")
+_PROXY_ENVIRONMENT_NAMES = (
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "all_proxy",
+)
 
 
 @dataclass(frozen=True)
@@ -51,6 +62,7 @@ class RepositoryImportError(RuntimeError):
     safe_stage: str | None = None
     exit_code: int | None = None
     elapsed_ms: int | None = None
+    cleanup_pending: bool = False
 
     def __str__(self) -> str:
         return self.message
@@ -60,6 +72,7 @@ class RepositoryImportError(RuntimeError):
             "code": self.code,
             "message": self.message,
             "retryable": self.retryable,
+            "cleanup_pending": self.cleanup_pending,
         }
         if request_id is not None:
             result["request_id"] = request_id
@@ -79,6 +92,12 @@ class ImportedRepository:
     snapshot: RepositorySnapshot
     source_identity: str
     checkout_path: Path
+
+
+@dataclass(frozen=True)
+class CheckoutCleanupResult:
+    cleanup_pending: bool
+    status: str
 
 
 def import_repository(
@@ -184,7 +203,7 @@ def import_public_git_repository(
     clone_root = settings.runtime_dir / "repositories"
     clone_root.mkdir(parents=True, exist_ok=True)
     temporary = clone_root / f".import-{uuid.uuid4().hex}"
-    env = _git_environment(isolated=True)
+    env = _git_environment(isolated=True, git_proxy=settings.git_proxy)
     env["GIT_LFS_SKIP_SMUDGE"] = "1"
     command = [
         "git",
@@ -216,39 +235,56 @@ def import_public_git_repository(
         revision = _git(temporary, "rev-parse", "HEAD").strip()
         stable = clone_root / f"{hashlib.sha256(url.encode()).hexdigest()[:16]}-{revision[:12]}"
         if stable.exists():
-            shutil.rmtree(temporary)
+            cleanup = _remove_new_checkout(temporary, clone_root)
+            if cleanup.cleanup_pending:
+                raise RepositoryImportError(
+                    "git_cleanup_failed",
+                    "The temporary Git checkout could not be safely removed.",
+                    500,
+                    True,
+                    "cleanup",
+                    None,
+                    _elapsed_ms(started),
+                    True,
+                )
         else:
             temporary.replace(stable)
         return _snapshot_checkout(stable, "git_url", url, settings)
     except subprocess.TimeoutExpired as exc:
-        _remove_new_checkout(temporary, clone_root)
         failure = classify_git_clone_failure(
             b"",
             exit_code=None,
             elapsed_ms=_elapsed_ms(started),
             timed_out=True,
         )
-        _log_git_clone_failure(failure, request_id)
-        raise _repository_error_for_git_failure(failure) from exc
+        cleanup = _remove_new_checkout(temporary, clone_root)
+        _log_git_clone_failure(failure, request_id, cleanup.cleanup_pending)
+        raise _repository_error_for_git_failure(
+            failure, cleanup_pending=cleanup.cleanup_pending
+        ) from exc
     except subprocess.CalledProcessError as exc:
-        _remove_new_checkout(temporary, clone_root)
         failure = classify_git_clone_failure(
             exc.stderr,
             exit_code=exc.returncode,
             elapsed_ms=_elapsed_ms(started),
         )
-        _log_git_clone_failure(failure, request_id)
-        raise _repository_error_for_git_failure(failure) from exc
+        cleanup = _remove_new_checkout(temporary, clone_root)
+        _log_git_clone_failure(failure, request_id, cleanup.cleanup_pending)
+        raise _repository_error_for_git_failure(
+            failure, cleanup_pending=cleanup.cleanup_pending
+        ) from exc
     except OSError as exc:
-        _remove_new_checkout(temporary, clone_root)
         failure = classify_git_clone_failure(
             b"",
             exit_code=None,
             elapsed_ms=_elapsed_ms(started),
             executable_unavailable=isinstance(exc, FileNotFoundError),
         )
-        _log_git_clone_failure(failure, request_id)
-        raise _repository_error_for_git_failure(failure) from exc
+        cleanup = _remove_new_checkout(temporary, clone_root)
+        _log_git_clone_failure(failure, request_id, cleanup.cleanup_pending)
+        raise _repository_error_for_git_failure(
+            failure, cleanup_pending=cleanup.cleanup_pending
+        ) from exc
 
 
 def classify_git_clone_failure(
@@ -366,7 +402,9 @@ def _elapsed_ms(started: float) -> int:
     return _bounded_elapsed_ms((time.monotonic() - started) * 1000)
 
 
-def _repository_error_for_git_failure(failure: GitCloneFailure) -> RepositoryImportError:
+def _repository_error_for_git_failure(
+    failure: GitCloneFailure, *, cleanup_pending: bool = False
+) -> RepositoryImportError:
     status_and_message = {
         "git_executable_unavailable": (
             503,
@@ -392,11 +430,17 @@ def _repository_error_for_git_failure(failure: GitCloneFailure) -> RepositoryImp
         failure.safe_stage,
         failure.exit_code,
         failure.elapsed_ms,
+        cleanup_pending,
     )
 
 
-def _log_git_clone_failure(failure: GitCloneFailure, request_id: str | None) -> None:
+def _log_git_clone_failure(
+    failure: GitCloneFailure,
+    request_id: str | None,
+    cleanup_pending: bool = False,
+) -> None:
     safe = failure.to_safe_dict()
+    safe["cleanup_pending"] = cleanup_pending
     if request_id is not None:
         safe["request_id"] = request_id
     logger.warning("Public Git clone failed.", extra={"repository_import": safe})
@@ -495,23 +539,141 @@ def _git_bytes(root: Path, *arguments: str) -> bytes:
     ).stdout
 
 
-def _git_environment(*, isolated: bool = False) -> dict[str, str]:
+def _git_environment(
+    *, isolated: bool = False, git_proxy: str | None = None
+) -> dict[str, str]:
     env = os.environ.copy()
     env.update({"GIT_TERMINAL_PROMPT": "0", "GCM_INTERACTIVE": "Never"})
     if isolated:
+        for name in _PROXY_ENVIRONMENT_NAMES:
+            env.pop(name, None)
         env.update(
             {
                 "GIT_CONFIG_NOSYSTEM": "1",
                 "GIT_CONFIG_GLOBAL": "NUL" if os.name == "nt" else "/dev/null",
             }
         )
+        validated_proxy = validate_git_proxy(git_proxy)
+        if validated_proxy is not None:
+            env["HTTP_PROXY"] = validated_proxy
+            env["HTTPS_PROXY"] = validated_proxy
     return env
 
 
-def _remove_new_checkout(target: Path, clone_root: Path) -> None:
+def _remove_new_checkout(target: Path, clone_root: Path) -> CheckoutCleanupResult:
+    status = _validate_cleanup_target(target, clone_root)
+    if status == "target_absent":
+        return CheckoutCleanupResult(False, status)
+    if status != "eligible":
+        logger.warning(
+            "Temporary checkout cleanup rejected.",
+            extra={"repository_cleanup": {"status": status, "cleanup_pending": True}},
+        )
+        return CheckoutCleanupResult(True, status)
     try:
-        target.resolve(strict=False).relative_to(clone_root.resolve(strict=True))
-    except (OSError, ValueError):
-        return
-    if target.name.startswith(".import-") and target.exists():
         shutil.rmtree(target)
+        return CheckoutCleanupResult(False, "removed")
+    except FileNotFoundError:
+        return CheckoutCleanupResult(False, "target_absent")
+    except OSError:
+        pass
+
+    retry_status = _validate_cleanup_target(target, clone_root)
+    if retry_status == "target_absent":
+        return CheckoutCleanupResult(False, retry_status)
+    if retry_status != "eligible":
+        logger.warning(
+            "Temporary checkout cleanup retry rejected.",
+            extra={
+                "repository_cleanup": {
+                    "status": retry_status,
+                    "cleanup_pending": True,
+                }
+            },
+        )
+        return CheckoutCleanupResult(True, retry_status)
+    try:
+        shutil.rmtree(target, onerror=_readonly_cleanup_handler(target))
+        return CheckoutCleanupResult(False, "removed_after_retry")
+    except FileNotFoundError:
+        return CheckoutCleanupResult(False, "target_absent")
+    except Exception:
+        logger.warning(
+            "Temporary checkout cleanup remains pending.",
+            extra={
+                "repository_cleanup": {
+                    "status": "delete_failed",
+                    "cleanup_pending": True,
+                }
+            },
+        )
+        return CheckoutCleanupResult(True, "delete_failed")
+
+
+def _validate_cleanup_target(target: Path, clone_root: Path) -> str:
+    if not _IMPORT_DIRECTORY_PATTERN.fullmatch(target.name):
+        return "name_rejected"
+    try:
+        lexical_target = Path(os.path.abspath(os.fspath(target)))
+        lexical_root = Path(os.path.abspath(os.fspath(clone_root)))
+        if not _strictly_within(lexical_target, lexical_root):
+            return "lexical_boundary_rejected"
+        resolved_root = clone_root.resolve(strict=True)
+        resolved_target = target.resolve(strict=False)
+        if not _strictly_within(resolved_target, resolved_root):
+            return "resolved_boundary_rejected"
+        metadata = target.lstat()
+    except FileNotFoundError:
+        return "target_absent"
+    except OSError:
+        return "metadata_unavailable"
+    if stat.S_ISLNK(metadata.st_mode):
+        return "link_rejected"
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    if getattr(metadata, "st_file_attributes", 0) & reparse_flag:
+        return "reparse_point_rejected"
+    if not stat.S_ISDIR(metadata.st_mode):
+        return "not_directory"
+    return "eligible"
+
+
+def _strictly_within(target: Path, root: Path) -> bool:
+    normalized_target = os.path.normcase(os.path.abspath(os.fspath(target)))
+    normalized_root = os.path.normcase(os.path.abspath(os.fspath(root)))
+    try:
+        return (
+            normalized_target != normalized_root
+            and os.path.commonpath((normalized_target, normalized_root)) == normalized_root
+        )
+    except ValueError:
+        return False
+
+
+def _readonly_cleanup_handler(root: Path):
+    def handle(function, path: str, exc_info) -> None:
+        error = exc_info[1]
+        candidate = Path(path)
+        if not isinstance(error, PermissionError) or not _within_or_equal(candidate, root):
+            raise error
+        try:
+            metadata = candidate.lstat()
+        except OSError:
+            raise error
+        reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+        if stat.S_ISLNK(metadata.st_mode) or (
+            getattr(metadata, "st_file_attributes", 0) & reparse_flag
+        ):
+            raise error
+        candidate.chmod(metadata.st_mode | stat.S_IWRITE)
+        function(path)
+
+    return handle
+
+
+def _within_or_equal(target: Path, root: Path) -> bool:
+    normalized_target = os.path.normcase(os.path.abspath(os.fspath(target)))
+    normalized_root = os.path.normcase(os.path.abspath(os.fspath(root)))
+    try:
+        return os.path.commonpath((normalized_target, normalized_root)) == normalized_root
+    except ValueError:
+        return False

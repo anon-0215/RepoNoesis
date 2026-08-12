@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import os
 from pathlib import Path
 from typing import Any, Literal, cast
@@ -18,6 +18,14 @@ ThinkingMode = Literal["enabled", "disabled"]
 
 class EnvironmentLoadError(RuntimeError):
     """Raised when the explicit bootstrap cannot safely load `.env`."""
+
+
+class RepositoryConfigurationError(RuntimeError):
+    """Raised with a fixed message when repository configuration is unsafe."""
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
 
 
 def load_environment() -> None:
@@ -100,6 +108,42 @@ class RepositorySettings:
     max_files: int = 2000
     max_file_bytes: int = 1_000_000
     max_total_bytes: int = 50_000_000
+    git_proxy: str | None = field(default=None, repr=False)
+
+
+_MAX_GIT_PROXY_LENGTH = 2048
+
+
+def validate_git_proxy(value: str | None) -> str | None:
+    """Validate the explicit clone-only proxy without retaining it in errors."""
+    if value is None or value == "":
+        return None
+    invalid = RepositoryConfigurationError(
+        "git_proxy_invalid", "RepoNoesis Git proxy configuration is invalid."
+    )
+    if (
+        not isinstance(value, str)
+        or len(value) > _MAX_GIT_PROXY_LENGTH
+        or any(ord(character) < 32 or ord(character) == 127 for character in value)
+        or any(character.isspace() for character in value)
+        or "\\" in value
+    ):
+        raise invalid
+    try:
+        parsed = urlsplit(value)
+        host = parsed.hostname
+        port = parsed.port
+    except (TypeError, ValueError) as exc:
+        raise invalid from None
+    if (
+        parsed.scheme.lower() not in {"http", "https"}
+        or not parsed.netloc
+        or not host
+        or parsed.fragment
+        or port is not None and not 1 <= port <= 65535
+    ):
+        raise invalid
+    return value
 
 
 def get_embedding_settings() -> EmbeddingSettings:
@@ -151,6 +195,7 @@ def get_repository_settings() -> RepositorySettings:
         max_total_bytes=_bounded_env_int(
             "REPOSITORY_MAX_TOTAL_BYTES", 50_000_000, 1024, 500_000_000
         ),
+        git_proxy=validate_git_proxy(get_env_value("REPONOESIS_GIT_PROXY", "")),
     )
 
 
@@ -182,6 +227,7 @@ def get_product_config_status() -> dict[str, Any]:
     if configured_embedding_offline not in {"1", "true", "yes", "on"}:
         embedding_missing.append("EMBEDDING_OFFLINE")
     return {
+        "git_proxy_configured": repository.git_proxy is not None,
         "configuration_file": str(PROJECT_ROOT / ".env"),
         "llm": {
             "provider": llm.provider or None,

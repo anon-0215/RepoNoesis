@@ -468,7 +468,11 @@ export default function App() {
       if (!requestGate.current.isActive(token)) return;
       settleConnectionProbe(probe, error);
       requestGate.current.restoreContext(token);
-      setMessage(error instanceof Error ? error.message : '分析失败');
+      if (error instanceof ApiError && error.status === 0) {
+        setMessage('');
+      } else {
+        setMessage(error instanceof Error ? error.message : '分析失败');
+      }
     } finally {
       if (requestGate.current.finish(token)) setAnalysisLoading(false);
     }

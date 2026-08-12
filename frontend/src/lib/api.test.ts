@@ -741,6 +741,8 @@ describe('repository import safe error contract', () => {
     ['git_authentication_required', false, '当前仅支持无需凭据的公开 HTTPS 仓库'],
     ['git_clone_timeout', true, '公开 Git 仓库克隆超时'],
     ['git_clone_failed', true, '公开 Git 仓库克隆失败'],
+    ['git_cleanup_failed', true, '临时文件清理未完成'],
+    ['repository_analysis_failed', false, '未保留部分项目或索引'],
     ['local_repository_dirty', false, '未提交、已暂存或未跟踪文件'],
     ['local_repository_root_required', false, '请选择 Git 仓库的根目录'],
     ['local_path_not_found', false, '所选本地仓库目录不存在'],
@@ -803,6 +805,37 @@ describe('repository import safe error contract', () => {
     expect(error.message).toBe(
       '请求失败（HTTP 502），服务端未返回可安全展示的错误详情。'
     );
+    expect(JSON.stringify(error)).not.toContain(marker);
+  });
+
+  it('shows only the fixed cleanup-pending hint', async () => {
+    const marker = 'PRIVATE-CLEANUP-EXCEPTION';
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockResolvedValue(
+        new Response(
+          JSON.stringify({
+            detail: {
+              code: 'git_connection_failed',
+              message: marker,
+              retryable: true,
+              cleanup_pending: true,
+              request_id: 'request-cleanup-1',
+              cleanup_error: marker,
+              local_path: marker
+            }
+          }),
+          { status: 502 }
+        )
+      )
+    );
+
+    const error = await captureApiError(
+      analyzeProject('git_url', 'https://public.example/repository.git')
+    );
+    expect(error.status).toBe(502);
+    expect(error.message).toContain('导入失败；部分临时文件将在稍后清理。');
+    expect(error.message).toContain('请求 ID：request-cleanup-1');
     expect(JSON.stringify(error)).not.toContain(marker);
   });
 });

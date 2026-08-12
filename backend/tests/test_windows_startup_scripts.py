@@ -104,6 +104,22 @@ class WindowsStartupScriptTests(unittest.TestCase):
                 self.assertNotIn("timeout ", content)
                 self.assertIn("exit /b", content)
 
+    def test_startup_inherits_explicit_git_proxy_without_echo_or_system_mutation(self):
+        scripts = (
+            ROOT / "start_all.bat",
+            ROOT / "backend" / "run_backend.bat",
+            ROOT / "backend" / "run_backend.ps1",
+            ROOT / "scripts" / "start_local.ps1",
+        )
+        for script in scripts:
+            content = script.read_text(encoding="utf-8").casefold()
+            with self.subTest(script=script.name):
+                self.assertNotIn("usenewenvironment", content)
+                self.assertNotIn("setx ", content)
+                self.assertNotIn("environmentvariabletarget", content)
+                self.assertNotIn("echo %reponoesis_git_proxy%", content)
+                self.assertNotIn("write-output $env:reponoesis_git_proxy", content)
+
     def test_failed_backend_never_reports_overall_ready(self):
         env = os.environ.copy()
         env.update(

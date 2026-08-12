@@ -26,6 +26,7 @@ describe('local product presentation', () => {
 
   it('shows missing provider settings without credentials', () => {
     const text = providerSummary({
+      git_proxy_configured: false,
       llm: {
         provider: null,
         model: null,

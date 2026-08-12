@@ -828,6 +828,28 @@ class Database:
                 (message[:2000], project_id),
             )
 
+    def delete_product_import(self, project_id: str) -> None:
+        """Atomically remove one unactivated product import and all of its rows."""
+        with self.connect() as conn:
+            project = conn.execute(
+                "SELECT source_type FROM projects WHERE id = ?", (project_id,)
+            ).fetchone()
+            if project is None:
+                return
+            if project["source_type"] not in {"local", "git_url"}:
+                raise ValueError("Only product imports may be rolled back.")
+            conn.execute(
+                "DELETE FROM repository_workspaces WHERE active_project_id = ?",
+                (project_id,),
+            )
+            for table in ("chat_answers", "repo_files", "modules", "learning_steps"):
+                conn.execute(f"DELETE FROM {table} WHERE project_id = ?", (project_id,))
+            deleted = conn.execute(
+                "DELETE FROM projects WHERE id = ?", (project_id,)
+            ).rowcount
+            if deleted != 1:
+                raise RuntimeError("Product import rollback did not remove one project.")
+
     def begin_reanalysis(self, project_id: str) -> None:
         with self.connect() as conn:
             conn.execute(

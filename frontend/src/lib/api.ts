@@ -92,6 +92,8 @@ const SAFE_LEGACY_ERROR_MESSAGES: Readonly<Record<string, string>> = Object.free
   git_authentication_required: '该 Git 仓库需要认证；当前仅支持无需凭据的公开 HTTPS 仓库。',
   git_clone_timeout: '公开 Git 仓库克隆超时，请检查网络后重试。',
   git_clone_failed: '公开 Git 仓库克隆失败，请检查网络和仓库地址后重试。',
+  git_cleanup_failed: '公开 Git 仓库已下载，但临时文件清理未完成。',
+  repository_analysis_failed: '仓库分析未完成，未保留部分项目或索引。',
   local_repository_dirty: '本地仓库包含未提交、已暂存或未跟踪文件；请由用户自行提交、移出仓库或按需加入 .gitignore 后重试。',
   local_repository_root_required: '请选择 Git 仓库的根目录。',
   local_path_not_found: '所选本地仓库目录不存在，请重新选择。',
@@ -118,6 +120,8 @@ const IMPORT_ERROR_CODES = new Set([
   'git_authentication_required',
   'git_clone_timeout',
   'git_clone_failed',
+  'git_cleanup_failed',
+  'repository_analysis_failed',
   'local_repository_dirty',
   'local_repository_root_required',
   'local_path_not_found',
@@ -306,6 +310,7 @@ function projectLegacyError(value: unknown): {
 } | null {
   if (!isRecord(value) || !hasSafeLegacyErrorCode(value.code)) return null;
   if (value.retryable !== undefined && typeof value.retryable !== 'boolean') return null;
+  if (value.cleanup_pending !== undefined && typeof value.cleanup_pending !== 'boolean') return null;
   if (
     value.request_id !== undefined &&
     (typeof value.request_id !== 'string' || !/^[A-Za-z0-9-]{1,64}$/.test(value.request_id))
@@ -315,9 +320,13 @@ function projectLegacyError(value: unknown): {
   const retryable = value.retryable === true;
   const requestId = typeof value.request_id === 'string' ? value.request_id : null;
   const retryHint = IMPORT_ERROR_CODES.has(value.code) && retryable ? ' 可以重试此操作。' : '';
+  const cleanupHint =
+    IMPORT_ERROR_CODES.has(value.code) && value.cleanup_pending === true
+      ? ' 导入失败；部分临时文件将在稍后清理。'
+      : '';
   const requestHint = requestId ? ` 请求 ID：${requestId}` : '';
   return {
-    message: `${SAFE_LEGACY_ERROR_MESSAGES[value.code]}${retryHint}${requestHint}`,
+    message: `${SAFE_LEGACY_ERROR_MESSAGES[value.code]}${retryHint}${cleanupHint}${requestHint}`,
     metadata: { code: value.code, retryable, requestId }
   };
 }

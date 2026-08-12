@@ -832,9 +832,26 @@ def analyze_project(request: AnalyzeRequest) -> dict[str, Any]:
                     "warnings": [f"Embedding indexing failed after analysis was saved: {exc}"],
                 }
     except HTTPException:
-        db.mark_failed(project_id, "Product analysis failed; see the API diagnostic.")
+        if product_import:
+            _rollback_product_import(project_id)
+        else:
+            db.mark_failed(project_id, "Product analysis failed; see the API diagnostic.")
         raise
     except Exception as exc:
+        if product_import:
+            rollback_complete = _rollback_product_import(project_id)
+            raise HTTPException(
+                status_code=500,
+                detail={
+                    "code": "repository_analysis_failed",
+                    "message": "Repository analysis failed before the import could be committed.",
+                    "retryable": False,
+                    "request_id": request_id,
+                    "safe_stage": "analysis",
+                    "cleanup_pending": False,
+                    "rollback_pending": not rollback_complete,
+                },
+            ) from exc
         db.mark_failed(project_id, str(exc))
         raise HTTPException(status_code=500, detail=f"分析失败：{exc}") from exc
 
@@ -849,6 +866,18 @@ def analyze_project(request: AnalyzeRequest) -> dict[str, Any]:
     if relation_index is not None:
         response["relation_index"] = relation_index
     return response
+
+
+def _rollback_product_import(project_id: str) -> bool:
+    try:
+        db.delete_product_import(project_id)
+        return True
+    except Exception:
+        logger.error(
+            "Product import database rollback failed.",
+            extra={"repository_import": {"status": "database_rollback_failed"}},
+        )
+        return False
 
 
 @app.get("/api/projects/{project_id}")

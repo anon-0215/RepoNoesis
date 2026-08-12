@@ -118,6 +118,7 @@ export interface AskFailure {
 }
 
 export interface ConfigStatus {
+  git_proxy_configured: boolean;
   llm: {
     provider: string | null;
     model: string | null;

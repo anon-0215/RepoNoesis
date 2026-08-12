@@ -110,8 +110,96 @@ class ProductApiTests(unittest.TestCase):
         self.assertEqual(detail["safe_stage"], "clone")
         self.assertEqual(detail["exit_code"], 128)
         self.assertEqual(detail["elapsed_ms"], 321)
+        self.assertFalse(detail["cleanup_pending"])
         self.assertRegex(detail["request_id"], r"^[a-f0-9-]{36}$")
         self.assertNotIn("source", detail)
+
+    def test_repository_cleanup_failure_cannot_escape_or_replace_primary_error(self):
+        from app.services.repository_import import RepositoryImportError
+
+        failure = RepositoryImportError(
+            "git_connection_failed",
+            "The public Git connection was interrupted.",
+            502,
+            True,
+            "clone",
+            128,
+            500,
+            True,
+        )
+        with (
+            patch.object(
+                self.main,
+                "get_product_config_status",
+                return_value={"embedding": {"ready": True}},
+            ),
+            patch.object(self.main, "import_repository", side_effect=failure),
+            self.assertRaises(HTTPException) as raised,
+        ):
+            self.main.analyze_project(
+                self.main.AnalyzeRequest(
+                    source_type="git_url", source="https://example.invalid/repo.git"
+                )
+            )
+        self.assertEqual(raised.exception.status_code, 502)
+        self.assertEqual(raised.exception.detail["code"], "git_connection_failed")
+        self.assertTrue(raised.exception.detail["retryable"])
+        self.assertTrue(raised.exception.detail["cleanup_pending"])
+
+    def test_product_analysis_failure_rolls_back_project_workspace_and_indexes(self):
+        from app.models import RepoFile, RepositorySnapshot
+        from app.services.repository_import import ImportedRepository
+
+        isolated = Database(Path(self.temporary.name) / "rollback.sqlite")
+        checkout = Path(self.temporary.name) / "stable-checkout"
+        checkout.mkdir()
+        content = "def answer():\n    return 42\n"
+        snapshot = RepositorySnapshot(
+            repo_url="https://public.example.invalid/repository.git",
+            owner="public.example.invalid",
+            repo="repository",
+            default_branch="main",
+            files=[RepoFile(path="app.py", size=len(content), content=content)],
+            repository_revision="c" * 40,
+            source_type="git_url",
+            source_location="https://public.example.invalid/repository.git",
+            source_identity="source-sha256:" + "d" * 64,
+        )
+        imported = ImportedRepository(snapshot, snapshot.source_identity, checkout)
+        marker = "PRIVATE-ANALYSIS-FAILURE"
+        with (
+            patch.object(self.main, "db", isolated),
+            patch.object(
+                self.main,
+                "get_product_config_status",
+                return_value={"embedding": {"ready": True}},
+            ),
+            patch.object(self.main, "import_repository", return_value=imported),
+            patch.object(self.main, "analyze_snapshot", side_effect=RuntimeError(marker)),
+            self.assertRaises(HTTPException) as raised,
+        ):
+            self.main.analyze_project(
+                self.main.AnalyzeRequest(source_type="git_url", source="ignored")
+            )
+        self.assertEqual(raised.exception.status_code, 500)
+        self.assertEqual(raised.exception.detail["code"], "repository_analysis_failed")
+        self.assertFalse(raised.exception.detail["rollback_pending"])
+        self.assertNotIn(marker, repr(raised.exception.detail))
+        with isolated.connect() as conn:
+            for table in (
+                "projects",
+                "repository_workspaces",
+                "workspace_revisions",
+                "repo_files",
+                "code_chunks",
+                "code_chunk_embeddings",
+                "relation_nodes",
+                "code_relations",
+                "relation_index_runs",
+            ):
+                with self.subTest(table=table):
+                    self.assertEqual(conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0], 0)
+        self.assertTrue(checkout.is_dir())
 
     def test_local_product_import_persists_and_reuses_same_revision(self):
         repository = Path(self.temporary.name) / "import-source"
