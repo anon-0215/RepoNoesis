@@ -34,6 +34,10 @@ import {
 } from './lib/api';
 import { createRequestGate, type RequestToken } from './lib/requestGate';
 import {
+  createConnectionStatusGate,
+  type ConnectionProbeToken
+} from './lib/connectionStatusGate';
+import {
   citationLabel,
   learningContinuityState,
   nextWorkspaceSearch,
@@ -101,15 +105,24 @@ export default function App() {
   const [askLoading, setAskLoading] = useState(false);
   const [askError, setAskError] = useState<AskFailure | null>(null);
   const requestGate = useRef(createRequestGate());
+  const connectionGate = useRef(createConnectionStatusGate());
   const [message, setMessage] = useState('');
+  const [connectionError, setConnectionError] = useState('');
 
   const hasProject = Boolean(project && projectId);
   const updateState = workspaceUpdateState(revisionCheck, updateRun);
   const continuityState = learningContinuityState(continuity);
 
   useEffect(() => {
-    getConfigStatus().then(setConfigStatus).catch((error) => {
-      setMessage(error instanceof Error ? error.message : '无法读取配置状态');
+    const probe = beginConnectionProbe();
+    getConfigStatus().then((result) => {
+      settleConnectionProbe(probe);
+      setConfigStatus(result);
+    }).catch((error) => {
+      settleConnectionProbe(probe, error);
+      if (!(error instanceof ApiError && error.status === 0)) {
+        setMessage(error instanceof Error ? error.message : '无法读取配置状态');
+      }
     });
     void initializeWorkspace();
   }, []);
@@ -147,15 +160,33 @@ export default function App() {
   async function loadWorkspaceLibrary(token?: RequestToken) {
     if (token && !requestGate.current.isActive(token)) return;
     setLibraryStatus(workspaceLibraryStatus('loading'));
+    const probe = beginConnectionProbe();
     try {
       const result = await listWorkspaces();
       if (token && !requestGate.current.isActive(token)) return;
+      settleConnectionProbe(probe);
       setWorkspaces(result.items);
       setLibraryStatus(workspaceLibraryStatus('success', result.items.length));
     } catch (error) {
       if (token && !requestGate.current.isActive(token)) return;
+      settleConnectionProbe(probe, error);
       setLibraryStatus(workspaceLibraryStatus('error'));
-      setMessage(error instanceof Error ? error.message : '无法读取项目库');
+      if (!(error instanceof ApiError && error.status === 0)) {
+        setMessage(error instanceof Error ? error.message : '无法读取项目库');
+      }
+    }
+  }
+
+  function beginConnectionProbe(): ConnectionProbeToken {
+    return connectionGate.current.begin(requestGate.current.getContext().generation);
+  }
+
+  function settleConnectionProbe(probe: ConnectionProbeToken, error?: unknown) {
+    if (!connectionGate.current.settle(probe)) return;
+    if (error instanceof ApiError && error.status === 0) {
+      setConnectionError(error.message);
+    } else {
+      setConnectionError('');
     }
   }
 
@@ -198,6 +229,8 @@ export default function App() {
 
   function beginContextChange(operation: string, targetWorkspaceId: string) {
     const token = requestGate.current.beginContextChange(operation, targetWorkspaceId);
+    connectionGate.current.changeContext(token.context.generation);
+    setConnectionError('');
     setAnalysisLoading(false);
     setWorkspaceLoading(false);
     setAskLoading(false);
@@ -215,6 +248,7 @@ export default function App() {
     const token = beginContextChange('context', nextWorkspaceId);
     setWorkspaceLoading(true);
     setMessage('正在从项目库重新打开持久化项目…');
+    const probe = beginConnectionProbe();
     try {
       const workspace = await getWorkspace(nextWorkspaceId);
       const loaded = await loadAll(workspace.active_snapshot.project_id);
@@ -228,11 +262,13 @@ export default function App() {
         return false;
       }
       applyWorkspace(workspace, loaded);
+      settleConnectionProbe(probe);
       if (resetActiveTab) setActiveTab('dashboard');
       setMessage(successMessage);
       return true;
     } catch (error) {
       if (!requestGate.current.isActive(token)) return false;
+      settleConnectionProbe(probe, error);
       if (window.localStorage.getItem(RECENT_WORKSPACE_KEY) === nextWorkspaceId) {
         window.localStorage.removeItem(RECENT_WORKSPACE_KEY);
       }
@@ -406,6 +442,7 @@ export default function App() {
     setMessage('正在抓取仓库并生成学习导读...');
     setAnswers([]);
     setAskError(null);
+    const probe = beginConnectionProbe();
     try {
       const result = await analyzeProject(sourceType, source);
       if (!requestGate.current.retargetContext(token, result.workspace_id)) return;
@@ -421,6 +458,7 @@ export default function App() {
         return;
       }
       applyWorkspace(workspace, loaded);
+      settleConnectionProbe(probe);
       setActiveTab('dashboard');
       await loadWorkspaceLibrary(token);
       if (requestGate.current.isActive(token)) {
@@ -428,6 +466,7 @@ export default function App() {
       }
     } catch (error) {
       if (!requestGate.current.isActive(token)) return;
+      settleConnectionProbe(probe, error);
       requestGate.current.restoreContext(token);
       setMessage(error instanceof Error ? error.message : '分析失败');
     } finally {
@@ -499,7 +538,7 @@ export default function App() {
             <span>源码证据驱动的项目学习工作台</span>
           </div>
         </div>
-        <div className="status-line">{message || providerSummary(configStatus)}</div>
+        <div className="status-line">{connectionError || message || providerSummary(configStatus)}</div>
       </header>
 
       <main className="workspace">

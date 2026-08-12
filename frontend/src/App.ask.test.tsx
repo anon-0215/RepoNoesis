@@ -30,6 +30,7 @@ vi.mock('./lib/api', async () => {
 import App, { AskView } from './App';
 import {
   ApiError,
+  analyzeProject,
   askProject,
   getConfigStatus,
   getLearningPath,
@@ -326,6 +327,97 @@ describe('App ask request gate integration', () => {
       window.history.replaceState(null, '', originalUrl || '/');
       consoleError.mockRestore();
       vi.unstubAllGlobals();
+    }
+  });
+});
+
+describe('App connection and import status integration', () => {
+  it('clears an older initialization connection error after a newer successful response', async () => {
+    vi.stubGlobal('IS_REACT_ACT_ENVIRONMENT', true);
+    let rejectConfig!: (reason: unknown) => void;
+    let resolveLibrary!: (value: never) => void;
+    vi.mocked(getConfigStatus).mockImplementation(
+      () => new Promise((_resolve, reject) => { rejectConfig = reject; })
+    );
+    vi.mocked(listWorkspaces).mockImplementation(
+      () => new Promise((resolve) => { resolveLibrary = resolve; })
+    );
+
+    const container = document.createElement('div');
+    document.body.appendChild(container);
+    let root: Root | null = createRoot(container);
+    try {
+      await act(async () => {
+        root!.render(<App />);
+        await flushPromises();
+      });
+      await act(async () => {
+        rejectConfig(new ApiError('无法连接后端服务。请确认后端已启动后重试。', 0));
+        await flushPromises();
+      });
+      expect(container.querySelector('.status-line')?.textContent).toContain('无法连接后端服务');
+
+      await act(async () => {
+        resolveLibrary({ items: [], total: 0, limit: 20, offset: 0 } as never);
+        await flushPromises();
+      });
+      expect(container.querySelector('.status-line')?.textContent).not.toContain('无法连接后端服务');
+    } finally {
+      if (root) await act(async () => root?.unmount());
+      container.remove();
+    }
+  });
+
+  it('keeps an import error across an unrelated library success and releases submit for retry', async () => {
+    vi.stubGlobal('IS_REACT_ACT_ENVIRONMENT', true);
+    vi.mocked(getConfigStatus).mockResolvedValue({
+      llm: { ready: true, provider: 'fake', model: 'fake-model', missing: [] },
+      embedding: { ready: true, model: 'fake-embedding', device: 'cpu', offline: true, missing: [] }
+    } as never);
+    vi.mocked(listWorkspaces).mockResolvedValue({ items: [], total: 0, limit: 20, offset: 0 } as never);
+    vi.mocked(analyzeProject).mockRejectedValue(
+      new ApiError('公开 Git 仓库克隆失败。 可以重试此操作。 请求 ID：request-import-1', 502)
+    );
+
+    const container = document.createElement('div');
+    document.body.appendChild(container);
+    let root: Root | null = createRoot(container);
+    try {
+      await act(async () => {
+        root!.render(<App />);
+        await flushPromises();
+      });
+      await act(async () => {
+        buttonWithText(container, '公开 HTTPS Git').click();
+        await Promise.resolve();
+      });
+      const input = container.querySelector<HTMLInputElement>('#repo-source')!;
+      await act(async () => {
+        setInputValue(input, 'https://public.example/repository.git');
+        await Promise.resolve();
+      });
+      const form = container.querySelector<HTMLFormElement>('form.analyze-form')!;
+      await act(async () => {
+        form.requestSubmit();
+        await flushPromises();
+      });
+      expect(container.querySelector('.status-line')?.textContent).toContain('request-import-1');
+      expect(form.querySelector<HTMLButtonElement>('button[type="submit"]')?.disabled).toBe(false);
+
+      await act(async () => {
+        buttonWithText(container, '刷新列表').click();
+        await flushPromises();
+      });
+      expect(container.querySelector('.status-line')?.textContent).toContain('request-import-1');
+
+      await act(async () => {
+        form.requestSubmit();
+        await flushPromises();
+      });
+      expect(analyzeProject).toHaveBeenCalledTimes(2);
+    } finally {
+      if (root) await act(async () => root?.unmount());
+      container.remove();
     }
   });
 });

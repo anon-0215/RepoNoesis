@@ -191,7 +191,13 @@ print(json.dumps(payload, sort_keys=True))
 
         self.assertEqual(
             events,
-            ["load", "get:BACKEND_HOST", "get:BACKEND_PORT", "run:app.main:app"],
+            [
+                "load",
+                "get:BACKEND_HOST",
+                "get:BACKEND_PORT",
+                "get:BACKEND_RELOAD",
+                "run:app.main:app",
+            ],
         )
 
     def test_run_server_bootstrap_loads_temporary_dotenv_before_app_import(self) -> None:

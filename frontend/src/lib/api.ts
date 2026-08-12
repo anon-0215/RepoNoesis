@@ -84,6 +84,19 @@ const ASK_CITATION_FAILURE_REASONS = new Set(
 );
 const ASK_RELATION_FAILURE_REASONS = new Set(['relation_validation_failed']);
 const SAFE_LEGACY_ERROR_MESSAGES: Readonly<Record<string, string>> = Object.freeze({
+  git_executable_unavailable: '后端未找到 Git 客户端，请安装或配置 Git 后重试。',
+  git_dns_failed: '无法解析公开 Git 主机，请检查 DNS 或网络设置。',
+  git_tls_failed: '公开 Git 仓库的 TLS 或证书校验失败，请检查系统证书链或网络代理。',
+  git_connection_failed: '连接公开 Git 仓库时中断，请检查网络或代理。',
+  git_remote_not_found: '未找到指定的公开 Git 仓库，请检查仓库地址。',
+  git_authentication_required: '该 Git 仓库需要认证；当前仅支持无需凭据的公开 HTTPS 仓库。',
+  git_clone_timeout: '公开 Git 仓库克隆超时，请检查网络后重试。',
+  git_clone_failed: '公开 Git 仓库克隆失败，请检查网络和仓库地址后重试。',
+  local_repository_dirty: '本地仓库包含未提交、已暂存或未跟踪文件；请由用户自行提交、移出仓库或按需加入 .gitignore 后重试。',
+  local_repository_root_required: '请选择 Git 仓库的根目录。',
+  local_path_not_found: '所选本地仓库目录不存在，请重新选择。',
+  git_url_invalid: '公开 Git 地址无效，请输入有效的 HTTPS 仓库地址。',
+  git_url_private_host: '不支持私有或本机 Git 主机，请使用公开 HTTPS 仓库。',
   embedding_not_configured: '本地 Embedding 服务尚未配置，请完成配置后重试。',
   provider_not_configured: '生成服务尚未配置，请完成配置后重试。',
   unsupported_provider: '当前生成服务配置不受支持，请检查配置后重试。',
@@ -96,6 +109,21 @@ const SAFE_LEGACY_ERROR_MESSAGES: Readonly<Record<string, string>> = Object.free
   provider_request_rejected: '生成服务拒绝了当前请求，请检查配置或请求后重试。',
   provider_grounding_failed: '生成结果未通过源码证据校验，未展示未经验证的答案。'
 });
+const IMPORT_ERROR_CODES = new Set([
+  'git_executable_unavailable',
+  'git_dns_failed',
+  'git_tls_failed',
+  'git_connection_failed',
+  'git_remote_not_found',
+  'git_authentication_required',
+  'git_clone_timeout',
+  'git_clone_failed',
+  'local_repository_dirty',
+  'local_repository_root_required',
+  'local_path_not_found',
+  'git_url_invalid',
+  'git_url_private_host'
+]);
 
 function safeHttpErrorMessage(status: number): string {
   return `请求失败（HTTP ${status}），服务端未返回可安全展示的错误详情。`;
@@ -140,7 +168,8 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
       if (structured) {
         safeMessage = SAFE_STRUCTURED_ASK_MESSAGE;
       } else {
-        safeMessage = getLegacyErrorMessage(detail);
+        const projected = projectLegacyError(detail);
+        safeMessage = projected?.message ?? null;
       }
     } catch {}
     throw new ApiError(
@@ -271,10 +300,26 @@ function getErrorDetail(value: unknown): unknown {
   return (value as Record<string, unknown>).detail;
 }
 
-function getLegacyErrorMessage(value: unknown): string | null {
+function projectLegacyError(value: unknown): {
+  message: string;
+  metadata: { code: string; retryable: boolean; requestId: string | null };
+} | null {
   if (!isRecord(value) || !hasSafeLegacyErrorCode(value.code)) return null;
   if (value.retryable !== undefined && typeof value.retryable !== 'boolean') return null;
-  return SAFE_LEGACY_ERROR_MESSAGES[value.code];
+  if (
+    value.request_id !== undefined &&
+    (typeof value.request_id !== 'string' || !/^[A-Za-z0-9-]{1,64}$/.test(value.request_id))
+  ) {
+    return null;
+  }
+  const retryable = value.retryable === true;
+  const requestId = typeof value.request_id === 'string' ? value.request_id : null;
+  const retryHint = IMPORT_ERROR_CODES.has(value.code) && retryable ? ' 可以重试此操作。' : '';
+  const requestHint = requestId ? ` 请求 ID：${requestId}` : '';
+  return {
+    message: `${SAFE_LEGACY_ERROR_MESSAGES[value.code]}${retryHint}${requestHint}`,
+    metadata: { code: value.code, retryable, requestId }
+  };
 }
 
 export async function listWorkspaces(limit = 20, offset = 0): Promise<WorkspaceListResponse> {

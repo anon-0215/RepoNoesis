@@ -77,6 +77,42 @@ class ProductApiTests(unittest.TestCase):
         self.assertNotIn("api_key", status["llm"])
         self.assertIn("api_key_configured", status["llm"])
 
+    def test_repository_import_error_preserves_only_safe_contract(self):
+        from app.services.repository_import import RepositoryImportError
+
+        failure = RepositoryImportError(
+            "git_tls_failed",
+            "The public Git TLS connection could not be verified.",
+            502,
+            False,
+            "clone",
+            128,
+            321,
+        )
+        with (
+            patch.object(
+                self.main,
+                "get_product_config_status",
+                return_value={"embedding": {"ready": True}},
+            ),
+            patch.object(self.main, "import_repository", side_effect=failure),
+            self.assertRaises(HTTPException) as raised,
+        ):
+            self.main.analyze_project(
+                self.main.AnalyzeRequest(
+                    source_type="git_url", source="https://example.invalid/repo.git"
+                )
+            )
+        detail = raised.exception.detail
+        self.assertEqual(raised.exception.status_code, 502)
+        self.assertEqual(detail["code"], "git_tls_failed")
+        self.assertEqual(detail["retryable"], False)
+        self.assertEqual(detail["safe_stage"], "clone")
+        self.assertEqual(detail["exit_code"], 128)
+        self.assertEqual(detail["elapsed_ms"], 321)
+        self.assertRegex(detail["request_id"], r"^[a-f0-9-]{36}$")
+        self.assertNotIn("source", detail)
+
     def test_local_product_import_persists_and_reuses_same_revision(self):
         repository = Path(self.temporary.name) / "import-source"
         repository.mkdir()

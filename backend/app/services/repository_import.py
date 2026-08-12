@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import hashlib
 import ipaddress
+import logging
+import math
 import os
 import shutil
 import socket
 import subprocess
+import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
@@ -16,18 +19,59 @@ from app.models import RepoFile, RepositorySnapshot
 from app.services.github_client import is_interesting_text_file
 
 
+logger = logging.getLogger(__name__)
+_MAX_SAFE_ELAPSED_MS = 86_400_000
+_MAX_SAFE_EXIT_CODE = 2_147_483_647
+
+
+@dataclass(frozen=True)
+class GitCloneFailure:
+    stable_code: str
+    retryable: bool
+    safe_stage: str
+    exit_code: int | None
+    elapsed_ms: int
+
+    def to_safe_dict(self) -> dict[str, object]:
+        return {
+            "stable_code": self.stable_code,
+            "retryable": self.retryable,
+            "safe_stage": self.safe_stage,
+            "exit_code": self.exit_code,
+            "elapsed_ms": self.elapsed_ms,
+        }
+
+
 @dataclass(frozen=True)
 class RepositoryImportError(RuntimeError):
     code: str
     message: str
     status_code: int = 400
     retryable: bool = False
+    safe_stage: str | None = None
+    exit_code: int | None = None
+    elapsed_ms: int | None = None
 
     def __str__(self) -> str:
         return self.message
 
-    def to_safe_dict(self) -> dict[str, object]:
-        return {"code": self.code, "message": self.message, "retryable": self.retryable}
+    def to_safe_dict(self, *, request_id: str | None = None) -> dict[str, object]:
+        result: dict[str, object] = {
+            "code": self.code,
+            "message": self.message,
+            "retryable": self.retryable,
+        }
+        if request_id is not None:
+            result["request_id"] = request_id
+        if self.safe_stage is not None:
+            result.update(
+                {
+                    "safe_stage": self.safe_stage,
+                    "exit_code": self.exit_code,
+                    "elapsed_ms": self.elapsed_ms,
+                }
+            )
+        return result
 
 
 @dataclass(frozen=True)
@@ -38,12 +82,16 @@ class ImportedRepository:
 
 
 def import_repository(
-    source_type: str, source: str, settings: RepositorySettings
+    source_type: str,
+    source: str,
+    settings: RepositorySettings,
+    *,
+    request_id: str | None = None,
 ) -> ImportedRepository:
     if source_type == "local":
         return import_local_repository(source, settings)
     if source_type == "git_url":
-        return import_public_git_repository(source, settings)
+        return import_public_git_repository(source, settings, request_id=request_id)
     raise RepositoryImportError(
         "unsupported_source_type", "source_type must be local or git_url."
     )
@@ -127,7 +175,10 @@ def validate_public_https_git_url(url: str) -> str:
 
 
 def import_public_git_repository(
-    source: str, settings: RepositorySettings
+    source: str,
+    settings: RepositorySettings,
+    *,
+    request_id: str | None = None,
 ) -> ImportedRepository:
     url = validate_public_https_git_url(source)
     clone_root = settings.runtime_dir / "repositories"
@@ -153,6 +204,7 @@ def import_public_git_repository(
         url,
         str(temporary),
     ]
+    started = time.monotonic()
     try:
         subprocess.run(
             command,
@@ -170,14 +222,184 @@ def import_public_git_repository(
         return _snapshot_checkout(stable, "git_url", url, settings)
     except subprocess.TimeoutExpired as exc:
         _remove_new_checkout(temporary, clone_root)
-        raise RepositoryImportError(
-            "git_clone_timeout", "The public Git repository clone timed out.", 504, True
-        ) from exc
-    except (subprocess.CalledProcessError, OSError) as exc:
+        failure = classify_git_clone_failure(
+            b"",
+            exit_code=None,
+            elapsed_ms=_elapsed_ms(started),
+            timed_out=True,
+        )
+        _log_git_clone_failure(failure, request_id)
+        raise _repository_error_for_git_failure(failure) from exc
+    except subprocess.CalledProcessError as exc:
         _remove_new_checkout(temporary, clone_root)
-        raise RepositoryImportError(
-            "git_clone_failed", "The public Git repository could not be cloned.", 502, True
-        ) from exc
+        failure = classify_git_clone_failure(
+            exc.stderr,
+            exit_code=exc.returncode,
+            elapsed_ms=_elapsed_ms(started),
+        )
+        _log_git_clone_failure(failure, request_id)
+        raise _repository_error_for_git_failure(failure) from exc
+    except OSError as exc:
+        _remove_new_checkout(temporary, clone_root)
+        failure = classify_git_clone_failure(
+            b"",
+            exit_code=None,
+            elapsed_ms=_elapsed_ms(started),
+            executable_unavailable=isinstance(exc, FileNotFoundError),
+        )
+        _log_git_clone_failure(failure, request_id)
+        raise _repository_error_for_git_failure(failure) from exc
+
+
+def classify_git_clone_failure(
+    stderr: bytes | str | None,
+    *,
+    exit_code: object,
+    elapsed_ms: object,
+    timed_out: bool = False,
+    executable_unavailable: bool = False,
+) -> GitCloneFailure:
+    """Project one clone failure into a bounded contract; raw output is never retained."""
+    safe_exit = (
+        exit_code
+        if isinstance(exit_code, int)
+        and not isinstance(exit_code, bool)
+        and -_MAX_SAFE_EXIT_CODE <= exit_code <= _MAX_SAFE_EXIT_CODE
+        else None
+    )
+    safe_elapsed = _bounded_elapsed_ms(elapsed_ms)
+    if executable_unavailable:
+        return GitCloneFailure(
+            "git_executable_unavailable", False, "clone", safe_exit, safe_elapsed
+        )
+    if timed_out:
+        return GitCloneFailure("git_clone_timeout", True, "clone", safe_exit, safe_elapsed)
+
+    if isinstance(stderr, bytes):
+        text = stderr.decode("utf-8", errors="replace")
+    elif isinstance(stderr, str):
+        text = stderr
+    else:
+        text = ""
+    lowered = text.casefold()
+    patterns: tuple[tuple[str, tuple[str, ...], bool], ...] = (
+        (
+            "git_dns_failed",
+            (
+                "could not resolve host",
+                "unable to resolve host",
+                "name or service not known",
+                "temporary failure in name resolution",
+                "no such host is known",
+            ),
+            True,
+        ),
+        (
+            "git_tls_failed",
+            (
+                "ssl certificate problem",
+                "certificate verify failed",
+                "tls handshake",
+                "unable to get local issuer certificate",
+                "schannel: next initializesecuritycontext failed",
+            ),
+            False,
+        ),
+        (
+            "git_connection_failed",
+            (
+                "connection was reset",
+                "connection reset by peer",
+                "failed to connect",
+                "could not connect",
+                "connection refused",
+                "connection timed out",
+                "remote end hung up unexpectedly",
+                "unexpected disconnect",
+                "early eof",
+                "http/2 stream 0 was not closed cleanly",
+                "rpc failed; curl 56",
+                "rpc failed; curl 92",
+            ),
+            True,
+        ),
+        (
+            "git_remote_not_found",
+            (
+                "repository not found",
+                "remote: not found",
+                "does not appear to be a git repository",
+            ),
+            False,
+        ),
+        (
+            "git_authentication_required",
+            (
+                "authentication failed",
+                "could not read username",
+                "terminal prompts disabled",
+                "authentication required",
+                "http basic: access denied",
+            ),
+            False,
+        ),
+    )
+    for stable_code, needles, retryable in patterns:
+        if any(needle in lowered for needle in needles):
+            return GitCloneFailure(stable_code, retryable, "clone", safe_exit, safe_elapsed)
+    if "http/2 stream " in lowered and " was not closed cleanly" in lowered:
+        return GitCloneFailure(
+            "git_connection_failed", True, "clone", safe_exit, safe_elapsed
+        )
+    return GitCloneFailure("git_clone_failed", True, "clone", safe_exit, safe_elapsed)
+
+
+def _bounded_elapsed_ms(value: object) -> int:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return 0
+    if not math.isfinite(value):
+        return 0
+    return max(0, min(int(value), _MAX_SAFE_ELAPSED_MS))
+
+
+def _elapsed_ms(started: float) -> int:
+    return _bounded_elapsed_ms((time.monotonic() - started) * 1000)
+
+
+def _repository_error_for_git_failure(failure: GitCloneFailure) -> RepositoryImportError:
+    status_and_message = {
+        "git_executable_unavailable": (
+            503,
+            "The Git executable is unavailable on the backend host.",
+        ),
+        "git_dns_failed": (502, "The public Git host could not be resolved."),
+        "git_tls_failed": (502, "The public Git TLS connection could not be verified."),
+        "git_connection_failed": (502, "The public Git connection was interrupted."),
+        "git_remote_not_found": (404, "The public Git repository was not found."),
+        "git_authentication_required": (
+            401,
+            "The Git repository requires authentication and cannot be imported as public.",
+        ),
+        "git_clone_timeout": (504, "The public Git repository clone timed out."),
+        "git_clone_failed": (502, "The public Git repository could not be cloned."),
+    }
+    status_code, message = status_and_message[failure.stable_code]
+    return RepositoryImportError(
+        failure.stable_code,
+        message,
+        status_code,
+        failure.retryable,
+        failure.safe_stage,
+        failure.exit_code,
+        failure.elapsed_ms,
+    )
+
+
+def _log_git_clone_failure(failure: GitCloneFailure, request_id: str | None) -> None:
+    safe = failure.to_safe_dict()
+    if request_id is not None:
+        safe["request_id"] = request_id
+    logger.warning("Public Git clone failed.", extra={"repository_import": safe})
 
 
 def _snapshot_checkout(

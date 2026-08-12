@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { ApiError, askProject } from './api';
+import { ApiError, analyzeProject, askProject } from './api';
 
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -728,5 +728,81 @@ describe('safe API error fallback', () => {
     expect(error.status).toBe(0);
     expect(error.message).toBe('无法连接后端服务。请确认后端已启动后重试。');
     expect(error.message).not.toContain('PRIVATE-NETWORK-DETAIL');
+  });
+});
+
+describe('repository import safe error contract', () => {
+  it.each([
+    ['git_executable_unavailable', false, '后端未找到 Git 客户端'],
+    ['git_dns_failed', true, '无法解析公开 Git 主机'],
+    ['git_tls_failed', false, 'TLS 或证书校验失败'],
+    ['git_connection_failed', true, '连接公开 Git 仓库时中断'],
+    ['git_remote_not_found', false, '未找到指定的公开 Git 仓库'],
+    ['git_authentication_required', false, '当前仅支持无需凭据的公开 HTTPS 仓库'],
+    ['git_clone_timeout', true, '公开 Git 仓库克隆超时'],
+    ['git_clone_failed', true, '公开 Git 仓库克隆失败'],
+    ['local_repository_dirty', false, '未提交、已暂存或未跟踪文件'],
+    ['local_repository_root_required', false, '请选择 Git 仓库的根目录'],
+    ['local_path_not_found', false, '所选本地仓库目录不存在'],
+    ['git_url_invalid', false, '公开 Git 地址无效'],
+    ['git_url_private_host', false, '不支持私有或本机 Git 主机']
+  ])('uses a fixed message for %s', async (code, retryable, expected) => {
+    const marker = 'PRIVATE_SERVER_GIT_OUTPUT';
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockResolvedValue(
+        new Response(
+          JSON.stringify({
+            detail: {
+              code,
+              message: marker,
+              retryable,
+              request_id: 'request-import-123',
+              stderr: marker,
+              url: marker,
+              local_path: marker
+            }
+          }),
+          { status: code === 'git_clone_timeout' ? 504 : 502 }
+        )
+      )
+    );
+
+    const error = await captureApiError(
+      analyzeProject('git_url', 'https://public.example/repository.git')
+    );
+    expect(error.message).toContain(expected);
+    expect(error.message).toContain('请求 ID：request-import-123');
+    expect(error.message.includes('可以重试此操作。')).toBe(retryable);
+    expect(JSON.stringify(error)).not.toContain(marker);
+    expect(error.detail).toBeNull();
+  });
+
+  it('rejects an invalid request_id instead of displaying server text', async () => {
+    const marker = 'PRIVATE_INVALID_REQUEST_ID';
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockResolvedValue(
+        new Response(
+          JSON.stringify({
+            detail: {
+              code: 'git_clone_failed',
+              message: marker,
+              retryable: true,
+              request_id: '../bad id'
+            }
+          }),
+          { status: 502 }
+        )
+      )
+    );
+
+    const error = await captureApiError(
+      analyzeProject('git_url', 'https://public.example/repository.git')
+    );
+    expect(error.message).toBe(
+      '请求失败（HTTP 502），服务端未返回可安全展示的错误详情。'
+    );
+    expect(JSON.stringify(error)).not.toContain(marker);
   });
 });

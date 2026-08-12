@@ -712,6 +712,7 @@ def _workspace_id_or_409(project_id: str) -> str:
 def analyze_project(request: AnalyzeRequest) -> dict[str, Any]:
     product_import = request.source_type is not None
     if product_import:
+        request_id = str(uuid.uuid4())
         embedding_status = get_product_config_status()["embedding"]
         if not embedding_status["ready"]:
             raise HTTPException(
@@ -724,11 +725,20 @@ def analyze_project(request: AnalyzeRequest) -> dict[str, Any]:
             )
         try:
             imported = import_repository(
-                request.source_type or "", request.source or "", repository_settings
+                request.source_type or "",
+                request.source or "",
+                repository_settings,
+                request_id=request_id,
             )
             snapshot = imported.snapshot
         except RepositoryImportError as exc:
-            raise HTTPException(status_code=exc.status_code, detail=exc.to_safe_dict()) from exc
+            detail = exc.to_safe_dict(request_id=request_id)
+            if exc.safe_stage is None:
+                logger.warning(
+                    "Repository import rejected.",
+                    extra={"repository_import": detail},
+                )
+            raise HTTPException(status_code=exc.status_code, detail=detail) from exc
         existing = db.get_project_by_source_identity(imported.source_identity)
         if existing and existing["status"] in {"done", "analyzing"}:
             return {
