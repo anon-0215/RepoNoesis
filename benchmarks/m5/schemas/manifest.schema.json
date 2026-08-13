@@ -1,0 +1,103 @@
+{
+  "additionalProperties": false,
+  "properties": {
+    "benchmark_schema_version": {
+      "const": 2,
+      "default": 2,
+      "title": "Benchmark Schema Version",
+      "type": "integer"
+    },
+    "metric_schema_version": {
+      "const": 1,
+      "default": 1,
+      "title": "Metric Schema Version",
+      "type": "integer"
+    },
+    "dataset_version": {
+      "maxLength": 80,
+      "minLength": 1,
+      "title": "Dataset Version",
+      "type": "string"
+    },
+    "title": {
+      "maxLength": 200,
+      "minLength": 1,
+      "title": "Title",
+      "type": "string"
+    },
+    "repositories_file": {
+      "const": "repositories.json",
+      "default": "repositories.json",
+      "title": "Repositories File",
+      "type": "string"
+    },
+    "scenarios_file": {
+      "const": "scenarios.jsonl",
+      "default": "scenarios.jsonl",
+      "title": "Scenarios File",
+      "type": "string"
+    },
+    "sequences_file": {
+      "const": "sequences.jsonl",
+      "default": "sequences.jsonl",
+      "title": "Sequences File",
+      "type": "string"
+    },
+    "annotation_provenance": {
+      "enum": [
+        "agent_assisted_developer_curation",
+        "user_confirmed"
+      ],
+      "title": "Annotation Provenance",
+      "type": "string"
+    },
+    "annotation_status": {
+      "enum": [
+        "agent_curated_pending_human_review",
+        "human_reviewed"
+      ],
+      "title": "Annotation Status",
+      "type": "string"
+    },
+    "annotation_reviewed_at": {
+      "anyOf": [
+        {
+          "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Annotation Reviewed At"
+    },
+    "annotation_review_method": {
+      "anyOf": [
+        {
+          "const": "codex_conversation",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Annotation Review Method"
+    },
+    "minimum_scenarios": {
+      "default": 36,
+      "minimum": 36,
+      "title": "Minimum Scenarios",
+      "type": "integer"
+    }
+  },
+  "required": [
+    "dataset_version",
+    "title",
+    "annotation_provenance",
+    "annotation_status"
+  ],
+  "title": "DatasetManifest",
+  "type": "object"
+}

@@ -1,0 +1,320 @@
+{
+  "$defs": {
+    "AllowedEvidenceScope": {
+      "additionalProperties": false,
+      "properties": {
+        "paths": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 50,
+          "title": "Paths",
+          "type": "array"
+        },
+        "repository_only": {
+          "default": true,
+          "title": "Repository Only",
+          "type": "boolean"
+        }
+      },
+      "title": "AllowedEvidenceScope",
+      "type": "object"
+    },
+    "RelationIdentity": {
+      "additionalProperties": false,
+      "properties": {
+        "relation_type": {
+          "enum": [
+            "imports",
+            "calls",
+            "references",
+            "defines"
+          ],
+          "title": "Relation Type",
+          "type": "string"
+        },
+        "source_path": {
+          "maxLength": 500,
+          "minLength": 1,
+          "title": "Source Path",
+          "type": "string"
+        },
+        "source_symbol": {
+          "maxLength": 500,
+          "minLength": 1,
+          "title": "Source Symbol",
+          "type": "string"
+        },
+        "target_path": {
+          "anyOf": [
+            {
+              "maxLength": 500,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Target Path"
+        },
+        "target_symbol": {
+          "maxLength": 500,
+          "minLength": 1,
+          "title": "Target Symbol",
+          "type": "string"
+        }
+      },
+      "required": [
+        "relation_type",
+        "source_path",
+        "source_symbol",
+        "target_symbol"
+      ],
+      "title": "RelationIdentity",
+      "type": "object"
+    },
+    "SourceSpan": {
+      "additionalProperties": false,
+      "properties": {
+        "path": {
+          "maxLength": 500,
+          "minLength": 1,
+          "title": "Path",
+          "type": "string"
+        },
+        "qualified_symbol": {
+          "maxLength": 500,
+          "minLength": 1,
+          "title": "Qualified Symbol",
+          "type": "string"
+        },
+        "start_line": {
+          "minimum": 1,
+          "title": "Start Line",
+          "type": "integer"
+        },
+        "end_line": {
+          "minimum": 1,
+          "title": "End Line",
+          "type": "integer"
+        },
+        "content_hash": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Content Hash",
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "qualified_symbol",
+        "start_line",
+        "end_line",
+        "content_hash"
+      ],
+      "title": "SourceSpan",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "scenario_id": {
+      "pattern": "^[a-z0-9][a-z0-9_-]{2,95}$",
+      "title": "Scenario Id",
+      "type": "string"
+    },
+    "dataset_version": {
+      "maxLength": 80,
+      "minLength": 1,
+      "title": "Dataset Version",
+      "type": "string"
+    },
+    "repo_id": {
+      "pattern": "^[a-z0-9][a-z0-9_-]{1,63}$",
+      "title": "Repo Id",
+      "type": "string"
+    },
+    "repository_revision": {
+      "pattern": "^[0-9a-f]{40}$",
+      "title": "Repository Revision",
+      "type": "string"
+    },
+    "language": {
+      "const": "python",
+      "title": "Language",
+      "type": "string"
+    },
+    "question": {
+      "maxLength": 2000,
+      "minLength": 1,
+      "title": "Question",
+      "type": "string"
+    },
+    "category": {
+      "enum": [
+        "locate",
+        "explain",
+        "relation",
+        "impact",
+        "unanswerable"
+      ],
+      "title": "Category",
+      "type": "string"
+    },
+    "difficulty": {
+      "enum": [
+        "easy",
+        "medium",
+        "hard"
+      ],
+      "title": "Difficulty",
+      "type": "string"
+    },
+    "expected_target_type": {
+      "enum": [
+        "file",
+        "symbol",
+        "span",
+        "relation",
+        "none"
+      ],
+      "title": "Expected Target Type",
+      "type": "string"
+    },
+    "expected_files": {
+      "items": {
+        "type": "string"
+      },
+      "maxItems": 30,
+      "title": "Expected Files",
+      "type": "array"
+    },
+    "expected_symbols": {
+      "items": {
+        "type": "string"
+      },
+      "maxItems": 30,
+      "title": "Expected Symbols",
+      "type": "array"
+    },
+    "expected_source_spans": {
+      "items": {
+        "$ref": "#/$defs/SourceSpan"
+      },
+      "maxItems": 30,
+      "title": "Expected Source Spans",
+      "type": "array"
+    },
+    "expected_content_hashes": {
+      "items": {
+        "type": "string"
+      },
+      "maxItems": 30,
+      "title": "Expected Content Hashes",
+      "type": "array"
+    },
+    "expected_relation_edges": {
+      "items": {
+        "$ref": "#/$defs/RelationIdentity"
+      },
+      "maxItems": 30,
+      "title": "Expected Relation Edges",
+      "type": "array"
+    },
+    "expected_key_points": {
+      "items": {
+        "type": "string"
+      },
+      "maxItems": 20,
+      "title": "Expected Key Points",
+      "type": "array"
+    },
+    "unanswerable": {
+      "title": "Unanswerable",
+      "type": "boolean"
+    },
+    "allowed_evidence_scope": {
+      "$ref": "#/$defs/AllowedEvidenceScope"
+    },
+    "maximum_steps": {
+      "maximum": 8,
+      "minimum": 1,
+      "title": "Maximum Steps",
+      "type": "integer"
+    },
+    "maximum_tool_calls": {
+      "maximum": 12,
+      "minimum": 1,
+      "title": "Maximum Tool Calls",
+      "type": "integer"
+    },
+    "annotation_provenance": {
+      "enum": [
+        "agent_assisted_developer_curation",
+        "user_confirmed"
+      ],
+      "title": "Annotation Provenance",
+      "type": "string"
+    },
+    "annotation_status": {
+      "enum": [
+        "agent_curated_pending_human_review",
+        "human_reviewed"
+      ],
+      "title": "Annotation Status",
+      "type": "string"
+    },
+    "annotation_reviewed_at": {
+      "anyOf": [
+        {
+          "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Annotation Reviewed At"
+    },
+    "annotation_review_method": {
+      "anyOf": [
+        {
+          "const": "codex_conversation",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Annotation Review Method"
+    },
+    "annotation_note": {
+      "maxLength": 500,
+      "minLength": 1,
+      "title": "Annotation Note",
+      "type": "string"
+    }
+  },
+  "required": [
+    "scenario_id",
+    "dataset_version",
+    "repo_id",
+    "repository_revision",
+    "language",
+    "question",
+    "category",
+    "difficulty",
+    "expected_target_type",
+    "unanswerable",
+    "allowed_evidence_scope",
+    "maximum_steps",
+    "maximum_tool_calls",
+    "annotation_provenance",
+    "annotation_status",
+    "annotation_note"
+  ],
+  "title": "Scenario",
+  "type": "object"
+}

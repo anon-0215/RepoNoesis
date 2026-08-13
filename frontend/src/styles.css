@@ -135,6 +135,183 @@ button:disabled {
   height: 18px;
 }
 
+.workspace-library {
+  display: grid;
+  gap: 10px;
+  margin-bottom: 18px;
+  padding-bottom: 18px;
+  border-bottom: 1px solid #d7dee8;
+}
+
+.workspace-library-title {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.workspace-library-title button {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  border: 0;
+  background: transparent;
+  color: #216869;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.workspace-library-title svg,
+.workspace-list svg {
+  width: 16px;
+  height: 16px;
+  flex: 0 0 auto;
+}
+
+.workspace-library p {
+  margin: 0;
+  color: #607080;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.workspace-library .library-error {
+  color: #a33a31;
+}
+
+.workspace-update-card {
+  display: grid;
+  gap: 0.45rem;
+  padding: 0.9rem;
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.workspace-update-card span {
+  color: var(--muted);
+  font-size: 0.78rem;
+  overflow-wrap: anywhere;
+}
+
+.workspace-update-card.update-available {
+  border-color: #d9a441;
+}
+
+.workspace-update-card.failed {
+  border-color: #d66b6b;
+}
+
+.workspace-update-card.continuity-failed {
+  border-color: #d97706;
+  background: #fffbeb;
+}
+
+.workspace-update-card.continuity-succeeded {
+  border-color: #0f766e;
+  background: #f0fdfa;
+}
+
+.continuity-summary strong {
+  color: #b45309;
+}
+
+.workspace-update-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.45rem;
+}
+
+.workspace-update-actions button {
+  flex: 1;
+  min-width: 6.5rem;
+}
+
+.workspace-list {
+  display: grid;
+  gap: 6px;
+  max-height: 220px;
+  overflow-y: auto;
+}
+
+.workspace-list button {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 9px;
+  border: 1px solid #d7dee8;
+  border-radius: 8px;
+  background: #fff;
+  color: #263746;
+  text-align: left;
+}
+
+.workspace-list button.active {
+  border-color: #216869;
+  background: #e8f3f1;
+}
+
+.workspace-list button > span {
+  display: grid;
+  min-width: 0;
+}
+
+.workspace-list strong,
+.workspace-list small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.workspace-list small {
+  color: #6b7b88;
+}
+
+.source-toggle {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 6px;
+}
+
+.source-toggle button {
+  min-height: 36px;
+  border: 1px solid #cbd5df;
+  border-radius: 8px;
+  background: #fff;
+  color: #405466;
+}
+
+.source-toggle button.active {
+  background: #dfeaf2;
+  border-color: #215a88;
+  color: #16354f;
+  font-weight: 800;
+}
+
+.provider-card {
+  display: grid;
+  gap: 6px;
+  margin: 0 0 18px;
+  padding: 10px;
+  border: 1px solid #d7dee8;
+  border-radius: 8px;
+  background: #fff;
+  overflow-wrap: anywhere;
+}
+
+.provider-card strong,
+.provider-card span,
+.provider-card small {
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.provider-card span,
+.provider-card small {
+  color: #667789;
+}
+
 .tabs {
   display: grid;
   gap: 8px;
@@ -439,6 +616,16 @@ button:disabled {
 
 .answer {
   padding: 18px;
+}
+
+.ask-error {
+  border-color: #b45309;
+  background: #fff7ed;
+}
+
+.ask-error h2,
+.ask-error p {
+  color: #7c2d12;
 }
 
 .citation-grid {

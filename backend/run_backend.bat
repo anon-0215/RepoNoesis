@@ -4,22 +4,19 @@ setlocal
 cd /d "%~dp0"
 set "PYTHONUTF8=1"
 set "PYTHON_EXE="
-
-if exist "D:\Programme\Anaconda\envs\gitlearnagent\python.exe" (
-  set "PYTHON_EXE=D:\Programme\Anaconda\envs\gitlearnagent\python.exe"
-) else (
-  for /f "delims=" %%P in ('where python 2^>nul') do (
-    if not defined PYTHON_EXE set "PYTHON_EXE=%%P"
-  )
+set "POWERSHELL_EXE=%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe"
+if not exist "%POWERSHELL_EXE%" (
+  echo Cannot find Windows PowerShell for runtime discovery.
+  exit /b 1
 )
+for /f "usebackq delims=" %%P in (`"%POWERSHELL_EXE%" -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%~dp0..\scripts\resolve_runtime.ps1" -Kind Python`) do if not defined PYTHON_EXE set "PYTHON_EXE=%%P"
 
 if not defined PYTHON_EXE (
   echo Cannot find Python.
   echo.
-  echo Install Python 3.12 or create a conda environment, then run:
-  echo pip install -r requirements.txt
-  pause
+  echo Activate the intended Conda environment or set REPONOESIS_PYTHON.
   exit /b 1
 )
 
-"%PYTHON_EXE%" -m uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
+"%PYTHON_EXE%" -m app.run_server
+exit /b %ERRORLEVEL%

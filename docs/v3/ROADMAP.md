@@ -1,0 +1,152 @@
+# 源鉴 RepoNoesis V3 路线图
+
+共同约束：前一阶段验收后才开始下一阶段；保持旧 API/数据库可用；不执行或修改目标仓库。规划阈值不等于已通过。
+
+## M1：证据问答纵向闭环
+
+**目标与 I/O**：输入 project、问题、revision、代码块和可用向量；输出回答、验证 Evidence、独立 lexical/semantic/fusion scores、策略/模型/降级状态。
+
+```text
+问题 -> 代码块词法 -> BGE-M3 语义 -> 混合融合
+     -> Evidence -> 引用校验 -> /ask -> 路径/符号/行号回答
+```
+
+**允许修改**：`qa_agent.py`、`semantic_retriever.py`、新增词法/融合/evidence 服务、`database.py`、`main.py`、类型模型、后端测试；仅在必要时改前端 API 类型和问答页。
+
+**不属于 M1**：完整 Agent、调用图、多跳、长期状态、动态路线、前端大改。
+
+**测试**：词法排名、分数融合、去重、Evidence Schema、路径/行号/哈希/revision 校验、各类降级；冻结 SQLite fixture 上 `/ask` 集成及旧字段兼容。
+
+**量化验收**：M1 使用 16 条确定性工程回归标注；answerable Hit@5 = 100%、mock hybrid MRR@10 >= 0.80；最终引用有效率 100%；无依据问题错误引用率 0%；Embedding 不可用用例 100% 明确降级；完整确定性后端测试通过。50 条以上真实仓库/真实模型扩展与正式科研评测留到 M5。
+
+**兼容/回滚/出口**：保留 `answer`、`citations`，新增字段可选；schema 仅增量；配置开关可回旧 `qa_agent`。达标且失败/降级可观察后进入 M2。
+
+## M2：工具层与有限 Agent Core
+
+**完成状态（2026-07-24）**：已在 `v3-agent-development` 实现静态 Tool
+Registry、`search_code`/`lookup_symbol`/`read_source`/`validate_evidence`、
+结构化 Planner 决策、请求级有限循环、预算/重复/no-progress/协作式
+timeout/cancellation、防 Prompt Injection、最终强制引用校验和正式 `/ask`
+默认接入。schema 保持 v4；没有实现 M3 关系或多跳能力。详细冻结决策见
+`M2_DECISIONS.md`。
+
+**目标与 I/O**：输入用户目标与 M1 Evidence 服务；输出受预算限制的 Agent run、ToolCall、Observation、Step 和验证回答/partial。
+
+**允许修改**：tool registry、只读工具、Agent Core、预算/取消/日志、Pydantic 契约、必要 API/表及状态 UI。
+
+**不属于 M2**：调用图、多跳关系、长期状态、多智能体、代码修改。
+
+**测试**：工具白名单、Schema、预算、超时/取消、重复调用、有限 replan、脱敏、Prompt injection；模拟模型 1—8 步、无 LLM 与部分失败集成。
+
+**量化验收**：100% 在硬上限内终止；重复同参逃逸率 0%；超时/取消 100% 明确状态；冻结任务完成率 >= 80%；引用有效率 100%。
+
+**兼容/回滚/出口**：M1 固定闭环保留为无 LLM/Planner 失败降级；正式 `/ask`
+默认经过 Agent Core；trace 仅为请求级 API 摘要，不新增数据库表；旧请求、旧
+citation 和 M1 Evidence 字段保持。完成并提交 M2 后停止，M3 必须另行开始。
+
+## M3：关系扩展与多跳仓库分析
+
+**完成状态（2026-07-24）**：已在 `v3-agent-development` 实现 Python-only
+revision-bound imports/calls/references/defines、数据库 schema v5、稳定 node/edge
+身份、幂等关系索引、有界双向 BFS、`expand_relations@1`、请求级 Evidence chain、
+关系与 Citation 双重最终校验、正式 `/ask` 兼容字段及 20 条冻结工程场景。默认
+depth 1、硬上限 2；没有实现运行时调用图、完整类型/数据流、M4 或 M5。详细冻结
+决策见 `M3_DECISIONS.md`。
+
+**目标与 I/O**：输入 AST、import、代码块、符号、revision 和 Evidence；输出版本化调用/import/定义—引用关系及有限多跳 Evidence 图。
+
+**允许修改**：`analyzer.py`、`code_chunker.py` 的增量扩展或新关系服务、关系表/迁移、查询工具与必要 API。
+
+**不属于 M3**：运行时代码执行、完整动态 dispatch、全语言、无限图遍历、长期状态。
+
+**测试**：同/跨文件调用、alias import、方法、未解析/多候选目标、循环、深度/节点预算、revision 隔离和跨文件 Evidence。
+
+**量化验收**：按 M3 开发指令冻结的 20 条确定性场景，exact/resolvable call edge
+precision/recall 均为 100%，bounded gold path 找回率 100%，预算和引用校验 100%
+生效；这些结果不外推到真实 Python 生态或真实模型。
+
+**兼容/回滚/出口**：关系表新增并绑定 revision；M1 不依赖关系表；开关关闭回 M2/M1。误差分类和图预算通过后进 M4。
+
+## M4：长期学习状态与自适应引导
+
+**完成状态（2026-07-26）**：已在 `v3-agent-development` 实现 database schema v6、
+local-single-user identity、结构化 goal、versioned plan/DAG step、revision-bound task 与
+rubric、bounded attempt、validated evaluation、immutable event、deterministic projection、
+路线适配、revision 重验证、跨进程恢复、`get_learning_context@1` 和 `/ask` M4 兼容字段。
+24 条冻结工程场景全部通过；没有实现完整前端、多租户、真实用户实验或 M5。详细决策见
+`M4_DECISIONS.md`。
+
+**目标与 I/O**：输入学习目标、验证阅读/问答/练习事件和 revision；输出 LearningState、掌握证据、问题和动态路线。
+
+**允许修改**：`learning_agent.py`、learning state/event 服务、数据库迁移、学习 API 和前端工作台。
+
+**不属于 M4**：模型训练、无证据心理画像、仓库自动修改、云端多租户。
+
+**测试**：事件幂等、掌握规则、证据绑定、revision 变化、隐私、路线更新；跨会话恢复和旧证据 stale/revalidate。
+
+**量化验收**：保存/恢复一致率 100%；mastery 变化 100% 有事件和方法/证据；重复事件不重复计分；陈旧证据识别率 100%；冻结场景路线符合规则 >= 90%。
+
+**兼容/回滚/出口**：旧 `learning_steps` 保留；新状态用新表；关闭动态路线回固定五阶段且不删事件。迁移与隐私通过后进 M5。
+
+## M5：真实集成、可复现实验与对照评测
+
+**实现状态（2026-07-26）**：已增量建立默认关闭的 provider/benchmark infrastructure、
+3 个固定真实 Python 仓库、36 场景 pilot-v1、6 条 adaptive sequence、严格 validator、
+7 种模式、原子 checkpoint/resume、确定性指标和 24 条离线冻结场景。生产数据库保持 v6，
+前端未修改。真实 BGE-M3/LLM/evaluator/live pilot 必须通过显式 gate；未完成时只称
+infrastructure complete、live validation incomplete。详见 `M5_DECISIONS.md` 和
+`M5_EVALUATION_PROTOCOL.md`。
+
+**目标与 I/O**：输入 M1—M4、固定真实 revision、provider 和对照配置；输出可恢复结构化结果、质量/检索/Agent/学习指标与诚实的消融报告。
+
+**允许修改**：provider adapter、评测 harness/fixtures、隔离存储、报告、配置示例和文档；本轮不修改前端。
+
+**不属于 M5**：新核心方向、完整多语言、仓库执行、云多用户、模型训练。
+
+**测试**：指标计算、数据校验、前端状态；分析—索引—问答—Agent—状态—报告 E2E，覆盖加载、失败、降级、取消、revision。
+
+**量化验收**：M1—M4 门槛保持；24 条冻结工程场景 100%；真实 gate 结果与 fake 严格区分；失败样本、调用、token、unknown cost 和置信区间可追溯。真实 gate 未完成不得宣称完整 M5。
+
+**兼容/回滚/完成**：UI 兼容旧响应；feature flag 可回旧五标签页；迁移有恢复说明。全部门槛、演示、限制和可复现报告通过后才称 V3 完整验收。
+
+M1 是第一个代码开发里程碑。本设计阶段提交后停止，不提前实现 M1，更不把 Agent、调用图或 Learning State 塞入 M1。
+
+## Local Product 路线（独立于 M5 评测路线）
+
+### Local Product Phase 1：真实本地端到端闭环
+
+**完成状态（2026-08-02）：FULL PASS。** 代码验收基线为
+`e07bfd16e16ecbb827ab002fb9f11274013b92e3`。Gate A、B、C 均通过；Gate C
+以真实本地 BGE-M3 CUDA、`openai_compatible`/`deepseek-v4-pro`、bounded Agent
+和通过验证的 grounded answer 退出 0。完整安全摘要、能力边界和代码/文档提交区分见
+[`LOCAL_PRODUCT_PHASE1.md`](LOCAL_PRODUCT_PHASE1.md)。
+
+该结果是受控 smoke 的真实集成验收，不是任意仓库、语言、规模、平台、Provider 或教学
+效果的生产级证明，也不表示 M5 live pilot 已完成。
+
+### Local Product Phase 2：持久化仓库工作区生命周期（P2.1/P2.2/LP2.3 已完成离线实现）
+
+仓库在 Phase 1 封存前没有正式 Phase 2 定义。当前建议的唯一主线是：把一次性导入升级为
+可重新打开、revision-aware、可恢复、可增量刷新并保持学习连续性的本地仓库工作区。
+
+当前状态：P2.1 已实现 schema v8→v9 additive migration、每个历史 project 独立 workspace、
+分页项目库、只读 workspace 详情/重新打开，以及前端 URL/最近 workspace 恢复。重新打开不
+执行分析、Embedding、relation 或 Provider，也不写学习事件。V3·LP2.2 进一步实现 schema
+v9→v10 additive migration、显式 revision check、持久化幂等 update run、内容哈希增量
+chunk/Embedding、snapshot 内 relation 重建、失败/中断恢复与原子 active snapshot 激活。
+V3·LP2.3 进一步实现 schema v10→v11 additive migration、与 activation 原子绑定的持久化
+continuity transition、确定性 target mapping、严格等价状态继承、modified `needs_review`、
+历史不可变与最小状态/摘要/retry UI。它不复制 attempt/evaluation/Evidence，也不调用 LLM
+替用户重新证明 mastery。契约见
+[`LOCAL_PRODUCT_P2_3_CONTRACT.md`](LOCAL_PRODUCT_P2_3_CONTRACT.md)。
+
+实施顺序：
+
+1. P2.1：项目库、稳定 workspace/snapshot 身份和重新打开；
+2. P2.2：revision 检测、幂等 update run、增量重建和原子激活；
+3. P2.3：跨 revision 学习重验证与最小持续学习 UI。
+
+完整范围、非目标、冻结身份契约、兼容性、安全边界、Gate 和风险见
+[`LOCAL_PRODUCT_PHASE2_PLAN.md`](LOCAL_PRODUCT_PHASE2_PLAN.md)。P2.1—LP2.3 已形成离线
+生命周期闭环；真实本地产品 Gate、仓库命名治理与后续阶段仍需单独授权。Phase 2 不包含
+M5/Phase 6 修改或 live benchmark。

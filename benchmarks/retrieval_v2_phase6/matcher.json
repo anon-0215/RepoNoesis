@@ -1,0 +1,15 @@
+{
+  "candidate_requirements": [
+    "validation_status=valid",
+    "repository_revision exact",
+    "path exact",
+    "qualified_symbol exact",
+    "start_line exact",
+    "end_line exact",
+    "content_hash exact"
+  ],
+  "containment": "diagnostic_only_never_a_strict_hit",
+  "multi_gold": "any strict identity is a query hit; recall uses distinct identities",
+  "name": "strict_source_span_identity",
+  "version": "strict_source_span_identity_v1@1"
+}

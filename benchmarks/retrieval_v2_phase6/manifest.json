@@ -1,0 +1,59 @@
+{
+  "benchmark_version": "cross-repo-v1",
+  "click": {
+    "answerable_query_count": 11,
+    "chunk_count": 663,
+    "dataset_hash": "1e658877c9b0aa9481700fa09868242b596b4a9c818db9e3159e192825155eb3",
+    "gold_hash": "3c0a48e5d97c263da7005092c99cf169e6a61397ad0fc6eefc1cb33d2b7ed999",
+    "query_count": 12,
+    "query_hash": "f75606d93bb4614c40d34423139f29e889bb6b19072a51981d06b07b26c47c79",
+    "repository_revision": "00e592cea702e0b2caa0dee42489fdb1c22cd845",
+    "unanswerable_query_count": 1
+  },
+  "dataset_hash": "44291240a1874899adfc4978be7fbdda3fd2bfd1ef1bc8fe31cc523777a7643a",
+  "evaluation_version": "retrieval-v2-phase6@1",
+  "file_hashes_before_manifest": {
+    "click_strata.json": "18150244217c03bb86af2832ad02694956a30c5de32c8271b8c34eb9e1cbe922",
+    "httpx_queries.jsonl": "ad1dd19d8113f05bbbe7ab28f86a322436330ff9b9dfe626cd536200554418e5",
+    "matcher.json": "d40d5a8dcaa28d2941687d5837a1b665d349fe3fa6a2956ff5497d3536a1a63b",
+    "protocol.json": "d885e8cedd678bd27234bf4d464db041d93930608ab565e82b27d7ce8db01a8c",
+    "repositories.json": "0955698f2bb131ff6127f9c5fcfb373b2d0e23a8a0921595c8f1e145baa03048",
+    "selection.json": "c3d10bb307e06c19f6d86f92eef8b3be420242d926201872f8f41b704f9af597",
+    "strata.json": "b8c3453470b3ab99ac253619d932c8ddae26d1ead1af4b1592de5468cff20f47"
+  },
+  "formal_top_k": 8,
+  "freeze_timestamp": "2026-08-01T08:44:16.6504719+00:00",
+  "frozen": true,
+  "gold_hash": "29b8ac2613bd33a644da09615e4d7a1f8a69e8e53314f7281137989fe4931181",
+  "httpx": {
+    "answerable_query_count": 20,
+    "chunk_count": 533,
+    "graph_identity": {
+      "edge_count": 6314,
+      "graph_hash": "f5e0455ebd934c71bf98b78116ab0920586e66d10251d9f10a3e2c8166bf363a",
+      "node_count": 564,
+      "repository_revision": "b5addb64f0161ff6bfe94c124ef76f6a1fba5254",
+      "status": "complete"
+    },
+    "query_count": 22,
+    "repository_revision": "b5addb64f0161ff6bfe94c124ef76f6a1fba5254",
+    "source_hash": "7f695b9bda128ffa96abd2cada5296e23419ef35ec0c26e91cb6c09a1c6af0e8",
+    "tree_hash": "31ba94512339180efacceacc0646b56ee15eba63",
+    "unanswerable_query_count": 2
+  },
+  "matcher_hash": "169b0515ffcdd889212f88cc51430ac8b706eb25817e7647e7b064b45a405cb6",
+  "new_repository_count": 1,
+  "no_httpx_production_retrieval_before_freeze": true,
+  "protocol_hash": "c47b3745eb96a069856b1d711cc55338268c1e0ca2db2f8672cb9eff5418aed1",
+  "query_hash": "ddf738c7dc5a6a5cb1666a65cb371d37d6bfb81e440ebf539627351f891e4b67",
+  "repository_count": 2,
+  "repository_hash": "1b64c648231ffd792fd05070b8599ac73d5c944eabcc1175272353bf44355d5d",
+  "source_database": {
+    "hash": "a09b6314782247a1de0f3156a562933cd1e5d01e6d6ca6b9847c69808204a4a0",
+    "provenance": "read-only Phase 5 validated M5 corpus snapshot; runtime path is supplied by configuration and is not committed"
+  },
+  "strata_hash": "d6c1c6bd31167c159ebc52b8f3d4fd65b0c7265a8537125f5f03fabe8c7ee097",
+  "total_answerable_query_count": 31,
+  "total_query_count": 34,
+  "total_unanswerable_query_count": 3
+}

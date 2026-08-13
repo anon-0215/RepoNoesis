@@ -1,0 +1,162 @@
+# 源鉴 RepoNoesis V3 Schema 与 API
+
+## 版本边界
+
+| 契约 | 当前版本 |
+| --- | ---: |
+| SQLite database schema | 6 |
+| Evidence schema | 1 |
+| Agent schema | 1 |
+| Relation API schema | 1 |
+| Learning API schema | 1 |
+
+版本互相独立。database v6 不代表 Evidence、Agent、relation 或 learning API 的版本。
+
+## SQLite v6
+
+v6 保留 v5 的全部 M1/M2/M3 表和数据，新增 `learner_profiles`、`learning_goals`、
+`learning_targets`、`learning_plans`、`learning_plan_steps`、
+`learning_step_prerequisites`、`learning_tasks`、`learning_task_evidence`、
+`learning_rubric_criteria`、`learning_attempts`、`learning_evaluations`、
+`learning_events` 和 `learner_target_states`。正式字段、索引、触发器和状态规则见
+`M4_DECISIONS.md`。
+
+## `/api/projects/{project_id}/ask`
+
+旧请求保持兼容：
+
+```json
+{"question": "函数 a 跨文件调用了什么？"}
+```
+
+M1 filter `path`、`language`、`symbol`、`evidence_count` 仍是可选字段。Retrieval v2 Phase 2
+新增可选 `retrieval_version`，只接受精确的 `v1` 或 `v2`；省略时默认 `v1`。Retrieval v2
+Phase 3 新增可选 `hierarchy_mode`，只接受精确的 `off` 或 `normalize_v1`，省略时默认
+`off`。Phase 4 新增可选 `relation_mode`，只接受精确的 `off` 或 `expand_v1`，省略时默认
+`off`。未知值、空白、大小写变体、`retrieval_version=v1 + hierarchy_mode=normalize_v1`
+和 `retrieval_version=v1 + relation_mode=expand_v1` 均由请求校验明确拒绝。三个值由服务器
+绑定到单次 Agent/tool context，Planner 不能改写；
+不接受 learner、project、repository、revision、hierarchy/图预算或学习预算。
+
+五条兼容路径为：
+
+```text
+retrieval_version omitted/v1 + hierarchy_mode omitted/off
+  -> 原 v1
+retrieval_version=v2 + hierarchy_mode omitted/off + relation_mode omitted/off
+  -> Phase 2 weighted_rrf_v2@1 plain v2
+retrieval_version=v2 + hierarchy_mode=normalize_v1 + relation_mode=off
+  -> weighted_rrf_v2@1 后执行 hierarchy_normalization_v1@1，再做 final top-k
+retrieval_version=v2 + hierarchy_mode=off + relation_mode=expand_v1
+  -> weighted_rrf_v2@1 后执行一跳 relation expansion/selection
+retrieval_version=v2 + hierarchy_mode=normalize_v1 + relation_mode=expand_v1
+  -> hierarchy_normalization_v1@1 后执行一跳 relation expansion/selection
+```
+
+Phase 3 复用现有 `code_chunks` ID、project/revision/path、`parent_symbol`、kind、inclusive
+span、content hash 和完整 chunk 内容；没有数据库 migration，也没有修改 chunk identity、
+boundary、embedding cache 或 relation graph。resolver 只对 direct candidate 涉及的
+`project + revision + path` 执行带硬上限的查询。纯 hierarchy-derived candidate 不伪造
+dense/lexical/symbol rank、raw score 或 RRF contribution，并继续通过原 EvidenceBuilder、
+CitationValidator 和 RelationValidator。
+
+normalization 的详细 group/member/provenance/selection/suppression/budget trace 保留在内部
+`search_code@1` observation 的 retrieval audit；公共回答 schema 不增加大型 audit 字段。
+受控截断、metadata 不足或 ambiguous hierarchy 通过既有 `warnings[]` 降级，并保留 direct
+Phase 2 candidates。
+
+Phase 4 使用 `relation_expansion_v1@1`、`relation_selection_v1@1`、
+`relation_whitelist_v1@1` 和 `relation_priority_v1@1`。whitelist 仅包含 M3 真实持久化的
+`imports/calls/references/defines`；incoming view 仍引用同一真实 edge，不交换或伪造
+source/target。所有查询绑定 `project_id + repository_revision` 并带硬 LIMIT；默认预算为
+12 seeds、8 edges/seed、96 total rows、24 unique targets、depth 1、8 paths/target 和 16
+warnings。relation target 只有通过 `code_chunk_id + path/span/hash/qualified name` 唯一映射
+到当前 revision 的完整 chunk 才能进入 Evidence。external、unresolved、ambiguous、stale、
+scope conflict 和受控不可用都保留 base candidates，并通过内部 audit 与 `warnings[]` 区分。
+
+relation priority 与 RRF/hierarchy priority 分层；relation-only Evidence 的公共
+`fusion_score=0.0/fusion_rank=0` 仍只是既有 schema 的兼容占位，不作为排序信号。
+selection 保证 direct Evidence 下限、relation slot 上限、每 seed/family 占用上限和 direct
+backfill，并以稳定 identity 完成 tie-break。选中路径在 EvidenceStore 分配 ID 后写入请求级
+EvidenceChainStore，CitationValidator 和 RelationValidator 在生成前后验证真实 chunk、edge、
+type、direction、scope 与 Evidence 绑定。详细 expansion/selection trace 只存在于内部
+`search_code@1` retrieval audit，不扩大公共 response schema。
+
+本阶段没有数据库 migration、公共 Evidence schema 变化、chunk identity/boundary 变化、
+embedding/cache/index 变化或 relation graph 重建。测试使用内存数据库、fake provider 和
+`EMBEDDING_ENABLED=false`；这些测试只证明契约、版本隔离、有界性、provenance、selection、
+validator 与兼容性，不代表真实 BGE-M3、Click Hit@K/MRR 或真实仓库质量提升。
+
+响应继续保留 M1/M2/M3 字段，并新增：
+
+```text
+learning_schema_version = 1
+learning_mode = disabled | profiled | adaptive | degraded
+learning_context_summary {
+  goal_id, plan_version, current_step, explanation_depth,
+  demonstrated_target_count, mastered_target_count, needs_review_count
+}
+learning_plan_summary {
+  plan_id, version, status, current_step_id,
+  completed_step_count, remaining_step_count, adapted, adaptation_reason
+}
+recommended_next_action
+learning_warnings[]
+```
+
+学习摘要不是源码 Evidence。最终源码事实仍必须通过 RelationValidator 和
+CitationValidator；旧 revision Evidence 不能进入当前 response citation。
+
+## Learning API
+
+所有 learner identity 均由服务器绑定为 local single user。mutation request 使用
+`extra=forbid`，并带 8—120 字符的 client idempotency key。
+
+| 方法 | 路径 | 能力 |
+| --- | --- | --- |
+| POST/GET | `/api/projects/{project_id}/learning/goals` | 创建或列出 goal |
+| PATCH | `/api/projects/{project_id}/learning/goals/{goal_id}` | active/completed/cancelled |
+| POST | `/api/projects/{project_id}/learning/plans` | 按 expected version 创建 plan |
+| GET | `/api/projects/{project_id}/learning/plans/current` | 当前 plan/version/steps |
+| GET | `/api/projects/{project_id}/learning/state` | 受限 target state |
+| POST | `/api/projects/{project_id}/learning/tasks` | 创建 Evidence/rubric 绑定 task |
+| GET | `/api/projects/{project_id}/learning/tasks/{task_id}` | 读取受限 task |
+| POST | `/api/projects/{project_id}/learning/tasks/{task_id}/attempts` | 提交 bounded attempt |
+| POST | `/api/projects/{project_id}/learning/self-reports` | explicit self-report |
+| POST | `/api/projects/{project_id}/learning/events/{event_id}/corrections` | append correction event |
+| GET | `/api/projects/{project_id}/learning/next-action` | 推荐下一动作 |
+| POST | `/api/projects/{project_id}/learning/revalidate` | 当前 revision 重验证 |
+
+API 不返回 learner ID、完整 event log、全部答案、raw evaluator/Planner output、聊天、
+私有思维、SQL 行主键、绝对路径、完整源码、其他 learner 数据或无效 Evidence。
+
+## M5 benchmark schema（非生产 API）
+
+M5 没有新增生产 HTTP 字段。`benchmarks/m5/schemas` 发布 manifest、repository、scenario 和
+adaptive sequence 的 JSON Schema；全部 `extra=forbid`。稳定 gold identity 是 repository
+revision、POSIX path、qualified symbol、source span、content hash 和 relation identity，不能
+使用运行时 Evidence ID。
+
+run artifacts 使用独立版本：
+
+```text
+benchmark_schema_version = 1
+metric_schema_version = 1
+checkpoint_schema_version = 1
+```
+
+run ID 绑定 dataset/revision/config/provider/model/prompt/metric/evaluator/source tree。checkpoint
+记录 checksum 并原子替换；safe config 对 secret 和本机根路径脱敏。以上文件不写入 SQLite
+v6，不由 `/ask` 用户输入控制，也不提交到 Git。
+
+## `get_learning_context@1`
+
+输入为空 JSON `{}`，未知字段拒绝。输出最多 16 states、8 recent verified outcomes、
+12 plan steps 和 16,384 bytes；每次 Agent run 最多调用一次并计入原 step/call/time/
+observation budget。输出只用于教学深度和下一步建议。
+
+## analyze 与 health
+
+`POST /api/projects/analyze` 的 M3 relation index 行为不变。`GET /api/health` 的
+`database_schema_version=6` 只表示 SQLite schema，不表示 relation coverage、learning
+profile 完整、真实 evaluator 质量或用户教学效果。

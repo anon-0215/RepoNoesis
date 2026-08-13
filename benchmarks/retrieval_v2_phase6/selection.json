@@ -1,0 +1,58 @@
+{
+  "candidate_repositories": [
+    {
+      "estimated_ast_classes": 107,
+      "estimated_ast_functions": 1134,
+      "estimated_python_files": 60,
+      "estimated_python_lines": 17753,
+      "license": "BSD-3-Clause",
+      "repository_id": "httpx",
+      "repository_name": "encode/httpx",
+      "repository_url": "https://github.com/encode/httpx.git",
+      "selection_status": "selected"
+    },
+    {
+      "estimated_ast_classes": 29,
+      "estimated_ast_functions": 115,
+      "estimated_python_files": 15,
+      "estimated_python_lines": 1712,
+      "license": "BSD-3-Clause",
+      "repository_id": "itsdangerous",
+      "repository_name": "pallets/itsdangerous",
+      "repository_url": "https://github.com/pallets/itsdangerous.git",
+      "selection_status": "excluded",
+      "exclusion_reason": "The fixed checkout produced only 79 historical extractor chunks and too little independent structure for the preregistered relation and hierarchy strata."
+    }
+  ],
+  "estimated_size": {
+    "historical_extractor_chunk_count": 533,
+    "python_files": 60,
+    "python_lines": 17753
+  },
+  "exclusion_criteria": [
+    "primarily generated source",
+    "requires executing or installing the repository",
+    "outside the expected 300 to 3000 code-chunk range",
+    "insufficient module, class, function, call, or import structure",
+    "license unsuitable for local research evaluation"
+  ],
+  "inclusion_criteria": [
+    "independent of Click",
+    "primarily Python",
+    "compatible with the existing static extractor, hierarchy resolver, and relation graph",
+    "non-trivial modules, functions, classes, calls, and imports",
+    "fixed commit and clean checkout",
+    "safe single-machine evaluation size",
+    "permissive license",
+    "no dependency installation or repository code execution required"
+  ],
+  "language": "Python",
+  "license": "BSD-3-Clause",
+  "network_used_for_selection_or_acquisition": false,
+  "repository_id": "httpx",
+  "repository_name": "encode/httpx",
+  "repository_url": "https://github.com/encode/httpx.git",
+  "selection_reason": "HTTPX is an independent, permissively licensed Python repository whose fixed revision has 533 existing extractor chunks and substantial sync/async client, transport, URL, authentication, nested-function, call, and import structure. It fits the frozen local GPU budget without executing third-party code.",
+  "selection_timestamp": "2026-08-01T08:33:48.300587+00:00",
+  "source_review_boundary": "Selection used Git metadata, file counts, Python AST parsing, and the pre-existing M5 static corpus only. No Phase 6 production retrieval ranking was run or viewed."
+}

@@ -1,0 +1,38 @@
+[
+  {
+    "checkout_status": "clean fixed checkout",
+    "chunk_count": 663,
+    "license": "BSD-3-Clause",
+    "project_id": "09e15055-fbfe-4d29-b872-208448c30aff",
+    "python_source_file_count": 78,
+    "repository_id": "click",
+    "repository_name": "pallets/click",
+    "repository_url": "https://github.com/pallets/click.git",
+    "resolved_commit": "00e592cea702e0b2caa0dee42489fdb1c22cd845",
+    "source_file_count": 165,
+    "source_hash": "43ae7864f4cee607a1e4eb041f10cd637568ca21f23503df055211fc44861b56",
+    "source_hash_contract": "sha256(canonical JSON of sorted tracked path+file sha256 entries)",
+    "source_provenance": "Phase 5 frozen Click corpus; benchmark, gold, matcher, and artifact remain unchanged",
+    "submodule_status": [],
+    "tree_hash": "c6aa87f15f2e44a6fcab33714e1eb91e2552d816"
+  },
+  {
+    "checkout_status": "clean fixed checkout on local master at the resolved commit",
+    "chunk_count": 533,
+    "license": "BSD-3-Clause",
+    "license_hash": "eb237e056a490d1f290e4dfa3cc342a04c64a89701385f86a847cdbe4d21957d",
+    "license_path": "LICENSE.md",
+    "project_id": "f5b1d312-9337-41a1-97c0-d294c3ac38d0",
+    "python_source_file_count": 60,
+    "repository_id": "httpx",
+    "repository_name": "encode/httpx",
+    "repository_url": "https://github.com/encode/httpx.git",
+    "resolved_commit": "b5addb64f0161ff6bfe94c124ef76f6a1fba5254",
+    "source_file_count": 125,
+    "source_hash": "7f695b9bda128ffa96abd2cada5296e23419ef35ec0c26e91cb6c09a1c6af0e8",
+    "source_hash_contract": "sha256(canonical JSON of sorted tracked path+file sha256 entries)",
+    "source_provenance": "Local pre-existing checkout fixed before Phase 6 retrieval; no clone or network acquisition was needed",
+    "submodule_status": [],
+    "tree_hash": "31ba94512339180efacceacc0646b56ee15eba63"
+  }
+]

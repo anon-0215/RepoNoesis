@@ -1,8 +1,26 @@
-# GitLearnAgent
+# 源鉴 RepoNoesis
+
+> 《源鉴（RepoNoesis）——面向真实代码仓库的证据驱动型持续学习智能体》
+> “让每一次代码解释，都源于真实源码。”
+
+> **Local Product Phase 1: FULL PASS (2026-08-02).** The accepted code baseline
+> is `e07bfd16e16ecbb827ab002fb9f11274013b92e3`; Gate A/B/C and the 514-test
+> offline backend regression passed. Setup, safe acceptance evidence, and
+> limitations are recorded in
+> [`docs/v3/LOCAL_PRODUCT_PHASE1.md`](docs/v3/LOCAL_PRODUCT_PHASE1.md).
+> Local Product Phase 2 P2.1 provides the persistent project library and
+> restart-safe workspace reopening. V3·LP2.2 now adds explicit revision checks,
+> persistent idempotent update runs, content-based incremental rebuilds and
+> atomic snapshot activation. V3·LP2.3 now adds persistent cross-revision
+> learning continuity, deterministic target mapping, conservative mastery
+> carry-forward, `needs_review`, and explicit retry. The plan and exact contracts are in
+> [`docs/v3/LOCAL_PRODUCT_PHASE2_PLAN.md`](docs/v3/LOCAL_PRODUCT_PHASE2_PLAN.md).
+> Repository and product naming governance is recorded in
+> [`docs/v3/OPS_NAME1.md`](docs/v3/OPS_NAME1.md).
 
 面向编程初学者的 GitHub 开源项目学习 Agent。
 
-GitLearnAgent 可以输入一个公开 GitHub 仓库地址，自动抓取仓库结构与关键源码，进行静态分析、模块划分、核心文件排序，并生成适合初学者阅读的项目地图、学习路线、源码问答和 Markdown 报告。
+源鉴 RepoNoesis 可以输入本地 Git 仓库或公开 HTTPS Git 地址，读取仓库结构与关键源码，进行静态分析、模块划分、核心文件排序，并生成适合初学者阅读的项目地图、学习路线、源码问答和 Markdown 报告。
 
 它不是简单地把 GitHub 链接丢给大模型做摘要，而是先用确定性的工程分析建立可靠上下文，再按教学逻辑组织输出。
 
@@ -35,7 +53,7 @@ GitLearnAgent 可以输入一个公开 GitHub 仓库地址，自动抓取仓库�
 - 直接问通用 AI 时，回答可能缺少源码依据。
 - 大模型一次性总结仓库时容易遗漏入口文件、配置文件和真实模块边界。
 
-GitLearnAgent 的目标是把一个 GitHub 开源仓库转化为一套适合初学者的学习材料：
+源鉴 RepoNoesis 的目标是把一个 GitHub 开源仓库转化为一套适合初学者的学习材料：
 
 - 先建立项目全局印象。
 - 再理解依赖和启动方式。
@@ -52,9 +70,11 @@ GitLearnAgent 的目标是把一个 GitHub 开源仓库转化为一套适合初�
 | 文件重要性排序 | 根据 README、依赖文件、入口文件、源码目录、导入关系等线索计算核心文件。 |
 | 项目地图 | 展示目录树、核心文件、模块职责和模块关系。 |
 | 学习路线 | 生成面向初学者的分阶段阅读路径、任务和测验。 |
+| 自适应学习状态 | 本地单用户下持久化目标、版本化计划、Evidence 约束任务、学习事件与复习状态。 |
 | 源码问答 | 根据已抓取源码进行检索式问答，并返回引用文件和代码片段。 |
 | 报告导出 | 生成 Markdown 格式的项目学习报告。 |
-| 可选大模型增强 | 配置 `LLM_API_KEY` 后，可使用 OpenAI 兼容模型增强部分自然语言表达。未配置时仍可运行。 |
+| 产品生成模型 | 本地产品问答要求完整的 `openai_compatible` 配置；未配置时导入/离线测试可运行，但产品问答会明确拒绝而不会冒充模型回答。 |
+| 可复现实验 | M5 CLI 可在固定真实仓库 revision 上验证数据集并运行隔离的 fake/live provider 对照；默认关闭。 |
 
 ## 技术栈
 
@@ -83,18 +103,16 @@ GitLearnAgent 的目标是把一个 GitHub 开源仓库转化为一套适合初�
 
 ```mermaid
 flowchart TD
-    A["用户输入 GitHub 仓库 URL"] --> B["后端解析 owner/repo"]
-    B --> C["GitHub API 获取仓库元信息和文件树"]
-    C --> D["按重要性筛选候选文件"]
-    D --> E["并发抓取 GitHub blob 文件内容"]
-    E --> F["静态分析：语言、框架、入口、依赖、符号"]
-    F --> G["文件重要性排序与模块划分"]
-    G --> H["生成项目地图、学习路线、任务和测验"]
-    G --> I["建立源码问答检索上下文"]
-    H --> J["SQLite 保存分析结果"]
-    I --> J
-    J --> K["FastAPI 提供接口"]
-    K --> L["React 前端展示结果"]
+    A["本地 Git 目录或公开 HTTPS Git URL"] --> B["安全导入并解析固定 revision"]
+    B --> C["静态分析与 Python 函数/类代码块"]
+    C --> D["词法/本地 BGE-M3 索引与静态关系"]
+    D --> E["EvidenceStore 与 bounded Agent"]
+    E --> F["Citation/Relation/生成后复验"]
+    C --> G["项目地图与学习路线"]
+    F --> H["SQLite 持久化项目、索引和学习状态"]
+    G --> H
+    H --> I["FastAPI 提供接口"]
+    I --> J["React 本地工作台"]
 ```
 
 ## 快速开始
@@ -102,8 +120,8 @@ flowchart TD
 ### 1. 克隆项目
 
 ```powershell
-git clone https://github.com/anon-0215/GitLearnAgent.git
-cd GitLearnAgent
+git clone https://github.com/anon-0215/RepoNoesis.git
+cd RepoNoesis
 ```
 
 ### 2. 创建环境
@@ -155,33 +173,86 @@ start_all.bat
 http://127.0.0.1:5173
 ```
 
-输入一个公开 GitHub 仓库地址，例如：
+选择“本地目录”并输入干净 Git 工作树的绝对路径，或选择“公开 HTTPS Git”并输入仓库 URL。
 
 ```text
-https://github.com/tiangolo/fastapi
+D:\Project\my-python-repository
 ```
 
 ## 环境变量
 
-项目会读取根目录下的 `.env` 文件。
+正式后端启动入口会读取根目录下的 `.env` 文件。普通导入 `app.main`
+或其他后端模块不会搜索或读取 `.env`，也不会把其中的值写入
+`os.environ`。进程环境变量仍优先于 `.env`；测试通过 fixture、显式环境变量
+或临时目录中的哨兵 `.env` 提供配置，不依赖工作区真实 `.env`。
 
 | 变量 | 必填 | 说明 |
 | --- | --- | --- |
-| `GITHUB_TOKEN` | 推荐 | GitHub Personal Access Token，用于提高 GitHub API 请求额度。 |
-| `LLM_BASE_URL` | 否 | OpenAI 兼容接口地址，例如 DeepSeek、通义、智谱等服务的 base URL。 |
-| `LLM_API_KEY` | 否 | 大模型 API Key。未配置时，系统使用本地规则生成学习路线和问答结果。 |
-| `LLM_MODEL` | 否 | 模型名称，默认可使用 `deepseek-chat` 一类 OpenAI 兼容模型名。 |
+| `LLM_PROVIDER` | 产品必填 | 固定为内部名称 `openai_compatible`。 |
+| `LLM_BASE_URL` | 产品必填 | 服务商当前官方文档给出的兼容 API 根地址；代码不写死服务商。 |
+| `LLM_API_KEY` | 产品必填 | 只保存在后端 `.env`，不得进入浏览器、数据库、日志或 Git。 |
+| `LLM_MODEL` | 产品必填 | 从服务商当前官方文档/控制台确认，不在仓库中硬编码。 |
+| `LLM_TIMEOUT_SECONDS` / `LLM_MAX_TOKENS` / `LLM_TEMPERATURE` / `LLM_MAX_RETRIES` | 否 | 产品请求边界；重试次数受服务端上限约束。 |
+| `LLM_PLANNER_THINKING` / `LLM_ANSWER_THINKING` | 否 | 可选且相互独立；留空时不发送 `thinking`，仅在服务商明确支持时填写 `enabled` 或 `disabled`。 |
+| `EMBEDDING_ENABLED` | 产品必填 | 产品路径设置为 `true`。 |
+| `EMBEDDING_PROVIDER` | 产品必填 | 固定为 `local_bge_m3`。 |
+| `EMBEDDING_MODEL` | 产品必填 | 本地 BGE-M3 快照绝对路径，或已完整缓存的模型 ID。旧变量 `EMBEDDING_MODEL_NAME_OR_PATH` 只作为兼容别名。 |
+| `EMBEDDING_MODEL_REVISION` | 否 | Hugging Face 模型 revision 或 commit。建议生产环境填写固定 commit；本地目录模型不会扫描模型文件内容做指纹。 |
+| `EMBEDDING_DEVICE` | 否 | `auto`、`cpu`、`cuda` 或 `cuda:N`。CUDA 不可用时会明确报错。 |
+| `EMBEDDING_OFFLINE` | 产品必填 | 设置为 `true`，缺少模型时明确失败且不静默下载。 |
+| `EMBEDDING_BATCH_SIZE` | 否 | Embedding 批量编码大小，默认 `8`。 |
+| `EMBEDDING_MAX_LENGTH` | 否 | 模型最大文本长度，默认 `8192`，运行时限制在 `16` 到 `8192`。 |
+| `EMBEDDING_NORMALIZE` | 否 | 是否保存 L2 归一化向量，默认 `true`。 |
+| `EMBEDDING_CACHE_DIR` | 否 | Sentence Transformers 模型缓存目录，默认 `embedding_cache`。 |
+| `EMBEDDING_QUERY_PREFIX` | 否 | 查询文本前缀，可为空。 |
+| `EMBEDDING_DOCUMENT_PREFIX` | 否 | 代码块文档文本前缀，可为空。 |
 | `VITE_API_BASE_URL` | 否 | 前端请求后端的地址，默认 `http://127.0.0.1:8000`。 |
 
 `.env.example` 示例：
 
 ```text
-GITHUB_TOKEN=
-LLM_BASE_URL=https://api.deepseek.com
+LLM_PROVIDER=openai_compatible
+LLM_BASE_URL=
 LLM_API_KEY=
-LLM_MODEL=deepseek-chat
+LLM_MODEL=
+EMBEDDING_ENABLED=true
+EMBEDDING_PROVIDER=local_bge_m3
+EMBEDDING_MODEL=
+EMBEDDING_MODEL_REVISION=
+EMBEDDING_DEVICE=auto
+EMBEDDING_OFFLINE=true
+EMBEDDING_BATCH_SIZE=8
+EMBEDDING_MAX_LENGTH=8192
+EMBEDDING_NORMALIZE=true
+EMBEDDING_CACHE_DIR=embedding_cache
+EMBEDDING_QUERY_PREFIX=
+EMBEDDING_DOCUMENT_PREFIX=
 VITE_API_BASE_URL=http://127.0.0.1:8000
 ```
+
+M5 评测默认不会联网、加载模型或调用付费接口。完整协议见
+`docs/v3/M5_EVALUATION_PROTOCOL.md`；从 `backend` 可先执行：
+
+```powershell
+python -B -m app.m5 list-modes
+python -B -m app.m5 validate --dataset ..\benchmarks\m5\datasets\pilot-v1 --repository-root <只读仓库根目录>
+```
+
+真实调用必须额外使用 `--live`，并在本地环境中显式设置相应 `M5_ALLOW_*` gate。不要在命令
+或聊天中粘贴 API key。正常 FastAPI 启动与旧 `/ask` 行为不受 M5 CLI 影响。
+
+启用 BGE-M3 前，请先在后端 Python 环境中安装 `sentence-transformers`
+和兼容的 PyTorch。系统不会在应用启动时自动加载模型；只有
+`EMBEDDING_ENABLED=true` 且分析代码块保存完成后，才会尝试建立
+SQLite 向量缓存。真实模型可来自 Hugging Face 名称 `BAAI/bge-m3`，
+也可以来自用户配置的本地模型目录。
+
+向量缓存命中会同时校验 code chunk、源码内容哈希、最终 embedding
+输入哈希、模型名称、模型 revision、文本格式版本、prefix/max length
+等配置身份和 normalized 设置。Hugging Face 模型会优先记录显式配置
+的 revision，并在真实加载后尽量读取 resolved commit；如果使用本地
+模型目录，当前只记录目录路径标识，不会为了启动速度去哈希数 GB 的
+模型文件。
 
 ## GitHub Token 说明
 
@@ -215,7 +286,7 @@ http://127.0.0.1:8000/api/health
   "ok": true,
   "llm_available": false,
   "github_token_configured": true,
-  "database": "D:\\Project\\GitLearnAgent\\backend\\data\\gitlearn.sqlite"
+  "database": "D:\\Project\\RepoNoesis\\backend\\data\\gitlearn.sqlite"
 }
 ```
 
@@ -245,8 +316,12 @@ frontend\run_frontend.bat
 
 ```powershell
 cd backend
-python -m uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
+python -m app.run_server
 ```
+
+`app.run_server` 是正式后端 bootstrap：先显式加载 `.env`，再读取主机、端口
+并让 Uvicorn 导入 `app.main:app`。不要用 `uvicorn app.main:app` 绕过该顺序。
+工程边界与证明范围见 [OPS ENV1 记录](docs/v3/OPS_ENV1.md)。
 
 ### 手动启动前端
 
@@ -267,11 +342,27 @@ http://127.0.0.1:8000
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | `GET` | `/api/health` | 健康检查，确认后端、LLM 配置和 GitHub token 状态。 |
-| `POST` | `/api/projects/analyze` | 提交 GitHub 仓库 URL，开始分析并返回 `project_id`。 |
+| `POST` | `/api/projects/analyze` | 提交本地 Git 目录或公开 HTTPS Git URL，完成产品导入/分析并返回 `project_id`；旧 `repo_url` 请求保持兼容。 |
+| `GET` | `/api/workspaces?limit=20&offset=0` | 分页读取不含源码、Evidence、Embedding 或本地路径的项目库摘要。 |
+| `GET` | `/api/workspaces/{workspace_id}` | 解析当前可重新打开的持久化 project snapshot；只读且不触发分析、索引或 Provider。 |
+| `POST` | `/api/workspaces/{workspace_id}/revision/check` | 用户显式检查当前与可用 revision；不自动启动更新。 |
+| `POST` | `/api/workspaces/{workspace_id}/refresh` | 用户确认后创建或复用幂等 update run；客户端不能指定内部 snapshot ID。 |
+| `GET` | `/api/workspaces/{workspace_id}/runs/{run_id}` | 读取持久化阶段、计数和安全失败信息。 |
+| `POST` | `/api/workspaces/{workspace_id}/runs/{run_id}/retry` | 显式重试可安全恢复的失败 run。 |
+| `GET` | `/api/workspaces/{workspace_id}/learning-continuity` | 读取当前 activation 的学习连续性状态与安全计数。 |
+| `GET` | `/api/workspaces/{workspace_id}/learning-continuity/{transition_id}` | 读取持久化 transition 详情，不触发模型或分析。 |
+| `GET` | `/api/workspaces/{workspace_id}/learning-continuity/{transition_id}/targets` | 读取不含源码/Evidence 正文的 target 影响摘要。 |
+| `POST` | `/api/workspaces/{workspace_id}/learning-continuity/{transition_id}/retry` | 显式重试失败的 continuity transition。 |
 | `GET` | `/api/projects/{project_id}` | 获取项目概览、技术栈、核心文件和模块摘要。 |
 | `GET` | `/api/projects/{project_id}/map` | 获取目录树、模块关系和核心文件列表。 |
 | `GET` | `/api/projects/{project_id}/learning-path` | 获取学习路线、任务和测验。 |
 | `POST` | `/api/projects/{project_id}/ask` | 对已分析项目进行源码问答，返回答案和引用片段。 |
+| `POST/GET` | `/api/projects/{project_id}/learning/goals` | 创建或读取结构化学习目标。 |
+| `POST` | `/api/projects/{project_id}/learning/plans` | 创建版本化学习计划。 |
+| `GET` | `/api/projects/{project_id}/learning/plans/current` | 读取当前计划和版本。 |
+| `GET` | `/api/projects/{project_id}/learning/state` | 读取受限、可重建的学习状态。 |
+| `POST` | `/api/projects/{project_id}/learning/tasks` | 创建绑定当前 revision Evidence 和 rubric 的任务。 |
+| `POST` | `/api/projects/{project_id}/learning/tasks/{task_id}/attempts` | 提交受限回答并进行结构化评价。 |
 | `GET` | `/api/projects/{project_id}/report` | 获取 Markdown 格式分析报告。 |
 
 分析请求示例：
@@ -281,7 +372,8 @@ POST /api/projects/analyze
 Content-Type: application/json
 
 {
-  "repo_url": "https://github.com/tiangolo/fastapi"
+  "source_type": "local",
+  "source": "D:\\Project\\my-python-repository"
 }
 ```
 
@@ -299,7 +391,7 @@ Content-Type: application/json
 ## 项目结构
 
 ```text
-GitLearnAgent/
+RepoNoesis/
   backend/
     app/
       main.py                 FastAPI 入口与 API 路由
@@ -343,7 +435,29 @@ GitLearnAgent/
 
 ## 工作原理
 
-### 1. 仓库抓取
+### 1. 仓库导入
+
+Local Product 路径支持读取干净本地 Git 工作树的 tracked files，或把无凭据公开 HTTPS
+Git 仓库克隆到受控、被 Git 忽略的运行目录。两种来源都解析固定 commit revision，且不
+执行仓库代码、不安装仓库依赖。旧 `repo_url` GitHub API 路径继续作为兼容入口。
+
+schema v10 在 P2.1 schema v9 的独立稳定 workspace 上保存多个不可变 revision snapshot、
+持久化 update run 和单一 active pointer。前端项目库可以在后端
+重启后按 URL 中的 `workspace` ID 或浏览器最近 workspace ID 重新打开原 project；该流程只
+读取 SQLite 和既有 project API，不重新分析、生成 chunk/Embedding、重建 relation、调用
+Provider 或写入学习事件。用户可另行显式检查 revision，并确认后启动 P2.2 refresh；更新在
+staging snapshot 中完成，验证前旧 active snapshot 始终可用，成功后单事务激活。
+
+P2.2 使用文件内容哈希而非 mtime 区分新增、修改、删除、重命名和未变化文件。chunker 版本
+一致时可复制未变化 chunk；Embedding 只有在最终输入、内容、模型/revision、维度、文本格式、
+prefix/max length 和 normalize 等完整身份一致且向量校验通过时才复用。relation 在新
+`project_id + revision` 内全量重建，避免跨 snapshot 污染。refresh 不复制、修改或重验证旧
+Evidence、attempt、evaluation、immutable event 或 mastery。LP2.3 在激活事务中创建持久化
+continuity transition，并只用确定性 identity/hash/AST 结构规则映射学习 target：严格
+unchanged/unique rename 可派生状态，modified 强制 `needs_review`，deleted/ambiguous/
+unmapped/incompatible 不继承。旧历史仍绑定原 project；新 revision 的 continuity event
+明确标为系统派生且没有 attempt/evaluation。完整契约见
+[`docs/v3/LOCAL_PRODUCT_P2_3_CONTRACT.md`](docs/v3/LOCAL_PRODUCT_P2_3_CONTRACT.md)。
 
 后端会解析 GitHub URL，提取 `owner/repo`，然后通过 GitHub REST API 获取：
 
@@ -401,7 +515,7 @@ GitLearnAgent/
 
 ### 5. 学习路线生成
 
-当前学习路线按五个阶段生成：
+兼容学习路线仍按五个阶段生成：
 
 1. 建立项目全局印象。
 2. 理解依赖和启动方式。
@@ -410,6 +524,10 @@ GitLearnAgent/
 5. 完成一个小修改任务。
 
 即使没有配置大模型 API，这部分也可以通过本地规则生成。
+
+M4 另提供正式的结构化学习闭环。它使用 local single-user profile、版本化 plan、
+不可变 event 和确定性状态投影；self-report 不会直接变成 mastered，无可用语义 evaluator
+时 attempt 明确返回 ungradable。学习记忆不保存完整聊天，也不执行目标仓库代码。
 
 ### 6. 源码问答
 
@@ -422,7 +540,9 @@ GitLearnAgent/
 → 生成带引用路径的回答
 ```
 
-如果配置了 `LLM_API_KEY`，系统会用大模型增强表达；如果没有配置，则使用本地规则回答。
+Local Product 的生成式问答要求完整的后端 `openai_compatible` 配置；配置缺失时会明确
+拒绝真实产品生成，不能把本地 deterministic fallback 冒充为 Provider 回答。离线测试和
+兼容路径仍可显式使用确定性回答。
 
 ### 7. 报告生成
 
@@ -458,6 +578,11 @@ node node_modules/typescript/bin/tsc
 cd frontend
 npm run build
 ```
+
+OPS·NAME1 在 2026-08-08 的最终离线回归记录为：后端 `Ran 568 tests / OK`；前端
+Vitest `9 passed`；TypeScript 与 Vite production build 通过。该记录只使用
+临时 fixture、fake repository/fake Embedding 与静态检查，没有运行真实网络、BGE-M3、
+Provider、Gate A/B/C、P2 live Gate 或 M5 live pilot。
 
 ## 上传 GitHub 注意事项
 
@@ -573,29 +698,34 @@ samples/demo_repositories.md
 
 ## 当前限制
 
-- 只支持公开 GitHub 仓库。
-- 首版重点支持 Python、JavaScript、TypeScript。
+- Local Product Phase 1 支持干净的本地 Git 工作树和无凭据公开 HTTPS Git 仓库；不支持
+  私有仓库认证、SSH、submodule 或任意远端地址。
+- 产品级代码块、关系扩展和真实 Gate 重点支持 Python；JavaScript/TypeScript 仍只是旧的
+  轻量结构分析，不具备同等 Evidence/关系保证。
 - JS/TS 分析目前是轻量规则，不是完整 TypeScript 编译器级分析。
-- Python 支持基础 AST 分析，但暂不构建完整跨文件调用图。
-- 问答检索目前是本地关键词和规则评分，不是完整向量数据库。
+- Python 支持保守的静态 import/call/reference/definition 关系扩展，但不代表运行时调用图。
+- 已支持本地 BGE-M3 与词法/符号/关系检索，但当前真实验收 fixture 很小，未证明任意仓库
+  规模和长期性能。
 - 大模型增强只支持 OpenAI 兼容接口。
-- 暂不支持私有仓库 OAuth 授权。
+- 项目数据和 M4 学习状态可持久化，前端可通过稳定 workspace ID 重新打开；新 revision
+  使用新的不可变 project snapshot，并在完整验证后原子激活。LP2.3 只为严格等价 target
+  派生状态，修改、歧义和不兼容目标不会继续宣称 mastered。
+- 初始分析仍同步执行；P2.2 update run 持久化阶段和安全失败状态，但没有自动轮询仓库、
+  文件监听、多用户调度或任意规模性能保证。
 - 暂不执行被分析仓库代码，避免安全风险。
 
 ## 后续计划
 
-- 支持更多语言，例如 Java、Go、Rust。
-- 引入 Tree-sitter 或 Language Server Protocol，提高结构分析能力。
-- 加入向量检索，提高源码问答召回率。
-- 增加后台任务队列和进度条，改善大仓库体验。
-- 支持上传 ZIP 仓库，减少 GitHub 网络依赖。
-- 增加用户学习进度记录。
-- 增加更系统的对比实验评测模块。
-- 生成适合大创答辩的可视化分析报告。
+- Local Product Phase 2 P2.1 项目库/重新打开、V3·LP2.2 revision-aware 增量刷新和
+  V3·LP2.3 跨版本学习连续性已完成离线实现；真实本地产品验收仍需单独授权。详见
+  [`docs/v3/LOCAL_PRODUCT_PHASE2_PLAN.md`](docs/v3/LOCAL_PRODUCT_PHASE2_PLAN.md)。
+- M5 继续作为独立的可复现实验和对照评测路线；其 live gate 未完成时不得宣称完整通过。
+- 完整学习工作台、更大仓库性能、多项目高级组织、更多语言、私有仓库认证和云多用户能力
+  均留作 Phase 2 之后的独立评审，不在当前建议中预先承诺。
 
 ## 项目价值
 
-GitLearnAgent 的重点不是替代通用 AI，而是探索一种更适合编程初学者的开源项目导读方式。
+源鉴 RepoNoesis 的重点不是替代通用 AI，而是探索一种更适合编程初学者的开源项目导读方式。
 
 相比直接问通用 AI，本项目强调：
 

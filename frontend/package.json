@@ -1,11 +1,12 @@
 {
-  "name": "gitlearnagent-frontend",
+  "name": "reponoesis-frontend",
   "version": "0.1.0",
   "private": true,
   "type": "module",
   "scripts": {
     "dev": "node node_modules/vite/bin/vite.js --configLoader native --host 127.0.0.1 --port 5173",
     "build": "node node_modules/typescript/bin/tsc && node node_modules/vite/bin/vite.js build --configLoader native",
+    "test": "node node_modules/vitest/vitest.mjs run",
     "preview": "node node_modules/vite/bin/vite.js preview --configLoader native --host 127.0.0.1 --port 4173"
   },
   "dependencies": {
@@ -18,6 +19,8 @@
   "devDependencies": {
     "typescript": "latest",
     "@types/react": "latest",
-    "@types/react-dom": "latest"
+    "@types/react-dom": "latest",
+    "jsdom": "29.1.1",
+    "vitest": "latest"
   }
 }
