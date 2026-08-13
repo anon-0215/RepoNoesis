@@ -234,6 +234,18 @@ button:disabled {
   overflow-y: auto;
 }
 
+.workspace-list-item {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 38px;
+  gap: 6px;
+}
+
+.workspace-list .workspace-delete {
+  justify-content: center;
+  padding: 8px;
+  color: #9f352f;
+}
+
 .workspace-list button {
   display: flex;
   align-items: center;

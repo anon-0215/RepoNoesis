@@ -145,6 +145,9 @@ export interface WorkspaceSummary {
   project_status: string;
   repository_revision: string;
   openable: boolean;
+  project_id?: string | null;
+  total_chunks?: number;
+  embedding_count?: number;
   created_at: string;
   updated_at: string;
 }

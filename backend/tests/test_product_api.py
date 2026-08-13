@@ -57,6 +57,7 @@ class ProductApiTests(unittest.TestCase):
             [file],
             [],
             [chunk],
+            finalize=False,
         )
 
     def test_product_ask_rejects_missing_provider_without_fallback(self):
@@ -76,6 +77,111 @@ class ProductApiTests(unittest.TestCase):
         status = self.main.configuration_status()
         self.assertNotIn("api_key", status["llm"])
         self.assertIn("api_key_configured", status["llm"])
+
+    def test_product_analysis_save_does_not_mark_project_done(self):
+        self.assertEqual(self.database.get_project(self.project_id)["status"], "analyzing")
+
+    def test_delete_project_removes_product_rows_and_workspace(self):
+        original_db = self.main.db
+        self.main.db = self.database
+        self.addCleanup(setattr, self.main, "db", original_db)
+
+        result = self.main.delete_project(self.project_id)
+
+        self.assertTrue(result["deleted"])
+        self.assertIsNone(self.database.get_project(self.project_id))
+        self.assertEqual(self.database.list_workspace_records(20, 0)["total"], 0)
+
+    def test_delete_project_rejects_active_import(self):
+        original_db = self.main.db
+        self.main.db = self.database
+        self.addCleanup(setattr, self.main, "db", original_db)
+        with self.main._active_import_lock:
+            self.main._active_import_project_ids.add(self.project_id)
+        self.addCleanup(self.main._active_import_project_ids.discard, self.project_id)
+
+        with self.assertRaises(HTTPException) as raised:
+            self.main.delete_project(self.project_id)
+
+        self.assertEqual(raised.exception.status_code, 409)
+        self.assertEqual(raised.exception.detail["code"], "project_import_active")
+
+    def test_delete_checkout_failure_is_retryable_and_does_not_expose_path(self):
+        git_project = self.database.create_project(
+            {
+                "repo_url": "https://example.invalid/repo.git",
+                "owner": "example.invalid",
+                "repo": "repo",
+                "default_branch": "main",
+                "repository_revision": "c" * 40,
+                "source_type": "git_url",
+                "source_location": "https://example.invalid/repo.git",
+                "source_identity": "source-sha256:" + "d" * 64,
+            }
+        )
+        original_db = self.main.db
+        self.main.db = self.database
+        self.addCleanup(setattr, self.main, "db", original_db)
+        pending = type("Cleanup", (), {"cleanup_pending": True})()
+        with patch.object(self.main, "remove_persisted_git_checkout", return_value=pending):
+            result = self.main.delete_project(git_project)
+
+        self.assertEqual(
+            result, {"deleted": False, "cleanup_pending": True, "retryable": True}
+        )
+        self.assertNotIn(self.temporary.name, repr(result))
+        self.assertEqual(self.database.get_project(git_project)["status"], "cleanup_pending")
+
+    def test_historical_done_project_with_missing_embeddings_is_not_reused(self):
+        from app.models import RepoFile, RepositorySnapshot
+        from app.services.repository_import import ImportedRepository
+
+        self.database.set_project_status(self.project_id, "done")
+        source = str(Path(self.temporary.name) / "repo")
+        content = "def answer():\n    return 42\n"
+        snapshot = RepositorySnapshot(
+            repo_url=source,
+            owner="local",
+            repo="repo",
+            default_branch="main",
+            files=[RepoFile(path="app.py", size=len(content), content=content)],
+            repository_revision="a" * 40,
+            source_type="local",
+            source_location=source,
+            source_identity="source-sha256:" + "b" * 64,
+        )
+        imported = ImportedRepository(snapshot, snapshot.source_identity, Path(source))
+        settings = EmbeddingSettings(
+            enabled=True,
+            model_name_or_path="fake-bge-m3",
+            device="cpu",
+            batch_size=2,
+            max_length=128,
+            normalize=True,
+            cache_dir=Path(self.temporary.name) / "cache",
+            query_prefix="",
+            document_prefix="",
+            model_revision="fake-revision",
+            provider="local_bge_m3",
+            offline=True,
+        )
+        service = EmbeddingService(
+            settings, backend_factory=_FakeEmbeddingBackend, cuda_available=lambda: False
+        )
+        with (
+            patch.object(self.main, "db", self.database),
+            patch.object(self.main, "embedding_service", service),
+            patch.object(self.main, "get_product_config_status", return_value={"embedding": {"ready": True}}),
+            patch.object(self.main, "import_repository", return_value=imported),
+            self.assertRaises(HTTPException) as raised,
+        ):
+            self.main.analyze_project(
+                self.main.AnalyzeRequest(source_type="local", source=source)
+            )
+
+        self.assertEqual(raised.exception.status_code, 409)
+        self.assertEqual(raised.exception.detail["code"], "existing_import_incomplete")
+        self.assertEqual(self.database.get_project(self.project_id)["status"], "incomplete")
 
     def test_repository_import_error_preserves_only_safe_contract(self):
         from app.services.repository_import import RepositoryImportError

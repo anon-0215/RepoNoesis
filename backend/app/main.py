@@ -47,7 +47,11 @@ from app.services.ask_diagnostics import (
 )
 from app.services.code_chunker import extract_python_code_chunks_from_files
 from app.services.embedding_indexer import EmbeddingIndexer
-from app.services.embedding_service import EmbeddingService
+from app.services.embedding_service import (
+    CODE_CHUNK_TEXT_FORMAT_VERSION,
+    EmbeddingService,
+    build_code_chunk_embedding_input_hash,
+)
 from app.services.github_client import fetch_repository
 from app.services.hierarchy_normalization import validate_hierarchy_mode
 from app.services.learning_agent import build_learning_path
@@ -67,7 +71,11 @@ from app.services.learning_contracts import (
 from app.services.learning_service import LearningError, LearningService
 from app.services.llm_client import LLMClient, ProviderError
 from app.services.smoke_diagnostics import SmokeDiagnosticsRecorder
-from app.services.repository_import import RepositoryImportError, import_repository
+from app.services.repository_import import (
+    RepositoryImportError,
+    import_repository,
+    remove_persisted_git_checkout,
+)
 from app.services.report import generate_report
 from app.services.relation_analysis import index_project_relations
 from app.services.relation_retrieval import validate_relation_mode
@@ -114,6 +122,65 @@ embedding_service = EmbeddingService(get_embedding_settings())
 agent_limits = get_agent_limits()
 repository_settings = get_repository_settings()
 logger = logging.getLogger(__name__)
+_active_import_lock = RLock()
+_active_import_project_ids: set[str] = set()
+
+
+def _project_integrity(project_id: str) -> dict[str, Any]:
+    identity = embedding_service.ensure_effective_embedding_identity()
+    integrity = db.get_project_index_integrity(
+        project_id,
+        model_name=identity.model_name,
+        backend_model_identity=identity.backend_model_identity,
+        model_identity=identity.model_identity,
+        identity_schema_version=identity.identity_schema_version,
+        resolved_revision=identity.resolved_revision or "",
+        text_format_version=identity.text_format_version,
+        embedding_config_hash=identity.embedding_config_hash,
+        embedding_dimension=identity.dimension,
+        normalized=identity.normalized,
+    )
+    if integrity is None:
+        raise LookupError("Project does not exist.")
+    chunks = db.get_code_chunks(project_id)
+    input_hashes = {
+        int(chunk["id"]): build_code_chunk_embedding_input_hash(
+            chunk, embedding_service.settings
+        )
+        for chunk in chunks
+    }
+    missing = db.get_code_chunks_missing_embeddings(
+        project_id,
+        identity.model_name,
+        identity.backend_model_identity,
+        CODE_CHUNK_TEXT_FORMAT_VERSION,
+        identity.embedding_config_hash,
+        identity.normalized,
+        input_hashes,
+        effective_identity=identity,
+    )
+    dimensions = db.get_fresh_embedding_dimensions_for_project(
+        project_id,
+        identity.model_name,
+        identity.backend_model_identity,
+        CODE_CHUNK_TEXT_FORMAT_VERSION,
+        identity.embedding_config_hash,
+        identity.normalized,
+        effective_identity=identity,
+    )
+    integrity["missing_embeddings"] = len(missing)
+    integrity["fresh_embeddings"] = max(0, len(chunks) - len(missing))
+    integrity["coverage"] = (
+        integrity["fresh_embeddings"] / len(chunks) if chunks else 0.0
+    )
+    integrity["ready"] = bool(
+        chunks
+        and not missing
+        and dimensions == [identity.dimension]
+        and integrity["relation_status"] == "complete"
+        and integrity["revision_consistent"]
+    )
+    return integrity
 
 
 def _log_ask_failure(detail: dict[str, Any]) -> None:
@@ -341,6 +408,9 @@ class WorkspaceSummaryResponse(BaseModel):
     project_status: str
     repository_revision: str
     openable: bool
+    project_id: str | None = None
+    total_chunks: int = 0
+    embedding_count: int = 0
     created_at: str
     updated_at: str
 
@@ -740,13 +810,44 @@ def analyze_project(request: AnalyzeRequest) -> dict[str, Any]:
                 )
             raise HTTPException(status_code=exc.status_code, detail=detail) from exc
         existing = db.get_project_by_source_identity(imported.source_identity)
-        if existing and existing["status"] in {"done", "analyzing"}:
-            return {
-                "project_id": existing["id"],
-                "workspace_id": _workspace_id_or_409(existing["id"]),
-                "status": existing["status"],
-                "import_action": "reused",
-            }
+        if existing and existing["status"] == "done":
+            integrity = _project_integrity(existing["id"])
+            if integrity["ready"]:
+                return {
+                    "project_id": existing["id"],
+                    "workspace_id": _workspace_id_or_409(existing["id"]),
+                    "status": "done",
+                    "import_action": "reused",
+                    "index_integrity": integrity,
+                }
+            db.set_project_status(existing["id"], "incomplete")
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "existing_import_incomplete",
+                    "message": "The existing import has an incomplete local index.",
+                    "retryable": False,
+                },
+            )
+        if existing and existing["status"] == "analyzing":
+            with _active_import_lock:
+                active = existing["id"] in _active_import_project_ids
+            if active:
+                return {
+                    "project_id": existing["id"],
+                    "workspace_id": _workspace_id_or_409(existing["id"]),
+                    "status": "analyzing",
+                    "import_action": "reused",
+                }
+            db.set_project_status(existing["id"], "interrupted")
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "existing_import_interrupted",
+                    "message": "The existing import was interrupted and must be rebuilt or deleted.",
+                    "retryable": False,
+                },
+            )
         if existing:
             project_id = existing["id"]
             db.begin_reanalysis(project_id)
@@ -760,6 +861,8 @@ def analyze_project(request: AnalyzeRequest) -> dict[str, Any]:
         project_id = db.create_project(snapshot.to_dict())
     embedding_index: dict[str, Any] | None = None
     relation_index: dict[str, Any] | None = None
+    with _active_import_lock:
+        _active_import_project_ids.add(project_id)
     try:
         analysis = analyze_snapshot(snapshot)
         chunk_result = extract_python_code_chunks_from_files(
@@ -790,7 +893,9 @@ def analyze_project(request: AnalyzeRequest) -> dict[str, Any]:
             list(enriched_by_path.values()),
             learning_steps,
             [chunk.to_dict() for chunk in chunk_result.chunks],
+            finalize=not product_import,
         )
+        db.set_project_status(project_id, "relation_indexing")
         try:
             relation_result = index_project_relations(db, project_id)
             relation_index = {
@@ -813,6 +918,7 @@ def analyze_project(request: AnalyzeRequest) -> dict[str, Any]:
                 ],
             }
         if embedding_service.settings.enabled:
+            db.set_project_status(project_id, "embedding_indexing")
             try:
                 embedding_index = EmbeddingIndexer(db, embedding_service).index_project(
                     project_id
@@ -831,8 +937,29 @@ def analyze_project(request: AnalyzeRequest) -> dict[str, Any]:
                     "status": "warning",
                     "warnings": [f"Embedding indexing failed after analysis was saved: {exc}"],
                 }
-    except HTTPException:
         if product_import:
+            db.set_project_status(project_id, "validating")
+            integrity = _project_integrity(project_id)
+            failed_chunks = int((embedding_index or {}).get("failed_chunks", 0))
+            if failed_chunks > 0 or not integrity["ready"]:
+                db.set_project_status(project_id, "incomplete")
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "embedding_index_incomplete",
+                        "message": "The local embedding index is incomplete.",
+                        "retryable": True,
+                        "total_chunks": integrity["total_chunks"],
+                        "fresh_embeddings": integrity["fresh_embeddings"],
+                        "missing_embeddings": integrity["missing_embeddings"],
+                    },
+                )
+            db.set_project_status(project_id, "done")
+        else:
+            db.set_project_status(project_id, "done")
+    except HTTPException as exc:
+        retained_incomplete = isinstance(exc.detail, dict) and exc.detail.get("code") == "embedding_index_incomplete"
+        if product_import and not retained_incomplete:
             _rollback_product_import(project_id)
         else:
             db.mark_failed(project_id, "Product analysis failed; see the API diagnostic.")
@@ -854,6 +981,9 @@ def analyze_project(request: AnalyzeRequest) -> dict[str, Any]:
             ) from exc
         db.mark_failed(project_id, str(exc))
         raise HTTPException(status_code=500, detail=f"分析失败：{exc}") from exc
+    finally:
+        with _active_import_lock:
+            _active_import_project_ids.discard(project_id)
 
     response: dict[str, Any] = {
         "project_id": project_id,
@@ -866,6 +996,40 @@ def analyze_project(request: AnalyzeRequest) -> dict[str, Any]:
     if relation_index is not None:
         response["relation_index"] = relation_index
     return response
+
+
+@app.delete("/api/projects/{project_id}")
+def delete_project(project_id: str) -> dict[str, Any]:
+    project = db.get_project(project_id)
+    if project is None:
+        raise HTTPException(
+            status_code=404,
+            detail={"code": "project_not_found", "message": "The project does not exist.", "retryable": False},
+        )
+    with _active_import_lock:
+        if project_id in _active_import_project_ids:
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "project_import_active", "message": "The project import is active.", "retryable": True},
+            )
+    if project.get("source_type") == "git_url":
+        cleanup = remove_persisted_git_checkout(
+            str(project.get("source_location") or ""),
+            str(project.get("repository_revision") or ""),
+            repository_settings,
+        )
+        if cleanup.cleanup_pending:
+            db.set_project_status(project_id, "cleanup_pending")
+            return {"deleted": False, "cleanup_pending": True, "retryable": True}
+    try:
+        db.delete_project(project_id)
+    except Exception as exc:
+        logger.error("Project database deletion failed.")
+        raise HTTPException(
+            status_code=500,
+            detail={"code": "project_delete_failed", "message": "The project could not be deleted.", "retryable": True},
+        ) from exc
+    return {"deleted": True, "cleanup_pending": False, "retryable": False}
 
 
 def _rollback_product_import(project_id: str) -> bool:

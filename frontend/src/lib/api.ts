@@ -100,6 +100,11 @@ const SAFE_LEGACY_ERROR_MESSAGES: Readonly<Record<string, string>> = Object.free
   git_url_invalid: '公开 Git 地址无效，请输入有效的 HTTPS 仓库地址。',
   git_url_private_host: '不支持私有或本机 Git 主机，请使用公开 HTTPS 仓库。',
   embedding_not_configured: '本地 Embedding 服务尚未配置，请完成配置后重试。',
+  embedding_index_incomplete: 'Embedding 索引未完整生成；项目尚未进入可用状态。',
+  existing_import_incomplete: '已存在的同版本项目索引不完整，请先删除该项目后重新导入。',
+  existing_import_interrupted: '已存在的同版本导入曾被中断，请先删除该项目后重新导入。',
+  project_import_active: '项目仍在导入中，暂时不能删除。',
+  project_delete_failed: '项目删除失败，请稍后重试。',
   provider_not_configured: '生成服务尚未配置，请完成配置后重试。',
   unsupported_provider: '当前生成服务配置不受支持，请检查配置后重试。',
   provider_unavailable: '生成服务暂时不可用，请稍后重试。',
@@ -127,6 +132,11 @@ const IMPORT_ERROR_CODES = new Set([
   'local_path_not_found',
   'git_url_invalid',
   'git_url_private_host'
+  , 'embedding_index_incomplete'
+  , 'existing_import_incomplete'
+  , 'existing_import_interrupted'
+  , 'project_import_active'
+  , 'project_delete_failed'
 ]);
 
 function safeHttpErrorMessage(status: number): string {
@@ -390,6 +400,12 @@ export async function getConfigStatus(): Promise<ConfigStatus> {
 
 export async function getProject(projectId: string): Promise<ProjectResponse> {
   return request(`/api/projects/${projectId}`);
+}
+
+export async function deleteProject(
+  projectId: string
+): Promise<{ deleted: boolean; cleanup_pending: boolean; retryable: boolean }> {
+  return request(`/api/projects/${encodeURIComponent(projectId)}`, { method: 'DELETE' });
 }
 
 export async function getProjectMap(projectId: string): Promise<ProjectMap> {
