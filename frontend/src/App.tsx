@@ -11,6 +11,7 @@ import {
   RefreshCw,
   Search,
   Send,
+  Trash2,
   Waypoints
 } from 'lucide-react';
 import { FormEvent, useEffect, useMemo, useRef, useState } from 'react';
@@ -19,6 +20,7 @@ import {
   analyzeProject,
   askProject,
   checkWorkspaceRevision,
+  deleteProject,
   getConfigStatus,
   getLearningPath,
   getLearningContinuity,
@@ -108,6 +110,7 @@ export default function App() {
   const connectionGate = useRef(createConnectionStatusGate());
   const [message, setMessage] = useState('');
   const [connectionError, setConnectionError] = useState('');
+  const [deletingProjectId, setDeletingProjectId] = useState('');
 
   const hasProject = Boolean(project && projectId);
   const updateState = workspaceUpdateState(revisionCheck, updateRun);
@@ -174,6 +177,38 @@ export default function App() {
       if (!(error instanceof ApiError && error.status === 0)) {
         setMessage(error instanceof Error ? error.message : '无法读取项目库');
       }
+    }
+  }
+
+  async function handleDeleteWorkspace(item: WorkspaceSummary) {
+    if (!item.project_id || deletingProjectId) return;
+    const confirmed = window.confirm(
+      '将删除该项目的本地分析、索引和学习记录。\n不会修改远程 Git 仓库。'
+    );
+    if (!confirmed) return;
+    setDeletingProjectId(item.project_id);
+    try {
+      const result = await deleteProject(item.project_id);
+      if (!result.deleted) {
+        setMessage('本地 checkout 清理尚未完成，可再次点击删除重试。');
+        return;
+      }
+      setWorkspaces((current) => current.filter((value) => value.workspace_id !== item.workspace_id));
+      if (workspaceId === item.workspace_id) {
+        setWorkspaceId('');
+        setProjectId('');
+        setProject(null);
+        setProjectMap(null);
+        setLearningSteps([]);
+        setReport('');
+        window.localStorage.removeItem(RECENT_WORKSPACE_KEY);
+        replaceWorkspaceUrl(null);
+      }
+      setMessage('项目已删除；远程 Git 仓库未被修改。');
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : '项目删除失败，请重试。');
+    } finally {
+      setDeletingProjectId('');
     }
   }
 
@@ -561,19 +596,30 @@ export default function App() {
             {libraryStatus === 'ready' && (
               <div className="workspace-list">
                 {workspaces.map((item) => (
-                  <button
-                    type="button"
-                    key={item.workspace_id}
-                    className={workspaceId === item.workspace_id ? 'active' : ''}
-                    disabled={!item.openable || workspaceLoading || analysisLoading}
-                    onClick={() => void openWorkspace(item.workspace_id)}
-                  >
-                    <FolderOpen aria-hidden="true" />
-                    <span>
-                      <strong>{item.display_name}</strong>
-                      <small>{item.openable ? `${item.project_status} · ${item.repository_revision.slice(0, 8) || 'no revision'}` : '关联不可用'}</small>
-                    </span>
-                  </button>
+                  <div className="workspace-list-item" key={item.workspace_id}>
+                    <button
+                      type="button"
+                      className={workspaceId === item.workspace_id ? 'active' : ''}
+                      disabled={!item.openable || workspaceLoading || analysisLoading}
+                      onClick={() => void openWorkspace(item.workspace_id)}
+                    >
+                      <FolderOpen aria-hidden="true" />
+                      <span>
+                        <strong>{item.display_name}</strong>
+                        <small>{item.project_status} · {item.repository_revision.slice(0, 8) || 'no revision'}</small>
+                        <small>Embedding：{item.embedding_count ?? 0} / {item.total_chunks ?? 0}</small>
+                      </span>
+                    </button>
+                    <button
+                      type="button"
+                      className="workspace-delete"
+                      aria-label={`删除 ${item.display_name}`}
+                      disabled={!item.project_id || deletingProjectId === item.project_id || analysisLoading}
+                      onClick={() => void handleDeleteWorkspace(item)}
+                    >
+                      <Trash2 aria-hidden="true" />
+                    </button>
+                  </div>
                 ))}
               </div>
             )}

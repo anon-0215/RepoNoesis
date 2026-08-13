@@ -48,6 +48,7 @@ class WorkspaceApiTests(unittest.TestCase):
             [],
             [],
         )
+        self.database.set_project_status(project_id, "done")
         workspace = self.database.get_workspace_for_project(project_id)
         return project_id, workspace["id"]
 

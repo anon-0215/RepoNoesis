@@ -828,6 +828,25 @@ class Database:
                 (message[:2000], project_id),
             )
 
+    def set_project_status(self, project_id: str, status: str, message: str = "") -> None:
+        allowed = {
+            "analyzing", "relation_indexing", "embedding_indexing", "validating",
+            "done", "failed", "incomplete", "interrupted", "cleanup_pending",
+        }
+        if status not in allowed:
+            raise ValueError("Unsupported project lifecycle status.")
+        with self.connect() as conn:
+            updated = conn.execute(
+                """
+                UPDATE projects
+                SET status = ?, error_message = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (status, message[:2000], project_id),
+            ).rowcount
+            if updated != 1:
+                raise LookupError("Project does not exist.")
+
     def delete_product_import(self, project_id: str) -> None:
         """Atomically remove one unactivated product import and all of its rows."""
         with self.connect() as conn:
@@ -868,6 +887,8 @@ class Database:
         files: list[dict[str, Any]],
         learning_steps: list[dict[str, Any]],
         code_chunks: list[dict[str, Any]] | None = None,
+        *,
+        finalize: bool = True,
     ) -> None:
         prepared_chunks = (
             self._prepare_code_chunk_replacement(project_id, code_chunks)
@@ -949,7 +970,7 @@ class Database:
             conn.execute(
                 """
                 UPDATE projects
-                SET status = 'done',
+                SET status = ?,
                     primary_language = ?,
                     frameworks_json = ?,
                     analysis_json = ?,
@@ -958,6 +979,7 @@ class Database:
                 WHERE id = ?
                 """,
                 (
+                    "done" if finalize else "analyzing",
                     analysis.get("primary_language", ""),
                     json.dumps(analysis.get("frameworks", []), ensure_ascii=False),
                     json.dumps(analysis, ensure_ascii=False),
@@ -1825,12 +1847,107 @@ class Database:
                     "DELETE FROM repository_workspaces WHERE id = ?",
                     (workspace_row["workspace_id"],),
                 )
-            conn.execute("DELETE FROM code_chunks WHERE project_id = ?", (project_id,))
-            conn.execute("DELETE FROM chat_answers WHERE project_id = ?", (project_id,))
-            conn.execute("DELETE FROM learning_steps WHERE project_id = ?", (project_id,))
-            conn.execute("DELETE FROM modules WHERE project_id = ?", (project_id,))
-            conn.execute("DELETE FROM repo_files WHERE project_id = ?", (project_id,))
+            tables = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+            ).fetchall()
+            for table_row in tables:
+                table = str(table_row["name"])
+                if table == "projects":
+                    continue
+                columns = {
+                    str(row["name"])
+                    for row in conn.execute(f'PRAGMA table_info("{table}")').fetchall()
+                }
+                if "project_id" in columns:
+                    quoted = table.replace('"', '""')
+                    conn.execute(
+                        f'DELETE FROM "{quoted}" WHERE project_id = ?', (project_id,)
+                    )
             conn.execute("DELETE FROM projects WHERE id = ?", (project_id,))
+
+    def get_project_index_integrity(
+        self,
+        project_id: str,
+        *,
+        model_name: str,
+        backend_model_identity: str,
+        model_identity: str,
+        identity_schema_version: str,
+        resolved_revision: str,
+        text_format_version: str,
+        embedding_config_hash: str,
+        embedding_dimension: int,
+        normalized: bool,
+    ) -> dict[str, Any] | None:
+        """Return a read-only, current-configuration readiness audit."""
+        with self.connect() as conn:
+            project = conn.execute(
+                "SELECT id, status, repository_revision FROM projects WHERE id = ?",
+                (project_id,),
+            ).fetchone()
+            if project is None:
+                return None
+            total = int(conn.execute(
+                "SELECT COUNT(*) FROM code_chunks WHERE project_id = ? AND repository_revision = ?",
+                (project_id, project["repository_revision"]),
+            ).fetchone()[0])
+            fresh = int(conn.execute(
+                """
+                SELECT COUNT(DISTINCT c.id)
+                FROM code_chunks AS c
+                JOIN code_chunk_embeddings AS e ON e.code_chunk_id = c.id
+                WHERE c.project_id = ? AND c.repository_revision = ?
+                  AND e.content_hash = c.content_hash
+                  AND e.model_name = ? AND e.model_revision = ?
+                  AND e.wrapper_model_identity = ? AND e.identity_schema_version = ?
+                  AND e.resolved_revision = ? AND e.identity_eligible = 1
+                  AND e.text_format_version = ? AND e.embedding_config_hash = ?
+                  AND e.embedding_dimension = ? AND e.normalized = ?
+                """,
+                (
+                    project_id, project["repository_revision"], model_name,
+                    backend_model_identity, model_identity, identity_schema_version,
+                    resolved_revision, text_format_version, embedding_config_hash,
+                    int(embedding_dimension), 1 if normalized else 0,
+                ),
+            ).fetchone()[0])
+            relation = conn.execute(
+                """
+                SELECT status, repository_revision FROM relation_index_runs
+                WHERE project_id = ? AND repository_revision = ?
+                """,
+                (project_id, project["repository_revision"]),
+            ).fetchone()
+            workspace = conn.execute(
+                """
+                SELECT wr.repository_revision, wr.activation_status
+                FROM workspace_revisions AS wr
+                WHERE wr.project_id = ?
+                """,
+                (project_id,),
+            ).fetchone()
+        missing = max(0, total - fresh)
+        relation_complete = bool(relation and relation["status"] == "complete")
+        revision_consistent = bool(
+            workspace and workspace["repository_revision"] == project["repository_revision"]
+        )
+        ready = total > 0 and missing == 0 and relation_complete and revision_consistent
+        return {
+            "project_id": project_id,
+            "project_status": project["status"],
+            "repository_revision": project["repository_revision"],
+            "total_chunks": total,
+            "fresh_embeddings": fresh,
+            "missing_embeddings": missing,
+            "coverage": (fresh / total) if total else 0.0,
+            "embedding_model": model_name,
+            "embedding_dimension": int(embedding_dimension),
+            "relation_status": relation["status"] if relation else "missing",
+            "relation_revision": relation["repository_revision"] if relation else "",
+            "workspace_revision": workspace["repository_revision"] if workspace else "",
+            "revision_consistent": revision_consistent,
+            "ready": ready,
+        }
 
     def get_project(self, project_id: str) -> dict[str, Any] | None:
         with self.connect() as conn:
@@ -1886,6 +2003,12 @@ class Database:
                     p.primary_language,
                     p.frameworks_json,
                     p.updated_at AS project_updated_at,
+                    (SELECT COUNT(*) FROM code_chunks AS cc
+                     WHERE cc.project_id = p.id AND cc.repository_revision = p.repository_revision) AS total_chunks,
+                    (SELECT COUNT(DISTINCT ce.code_chunk_id)
+                     FROM code_chunk_embeddings AS ce
+                     JOIN code_chunks AS cc2 ON cc2.id = ce.code_chunk_id
+                     WHERE cc2.project_id = p.id AND cc2.repository_revision = p.repository_revision) AS embedding_count,
                     wr.workspace_id AS revision_workspace_id,
                     wr.project_id AS revision_project_id,
                     wr.repository_revision AS linked_revision
@@ -1920,6 +2043,12 @@ class Database:
                     p.primary_language,
                     p.frameworks_json,
                     p.updated_at AS project_updated_at,
+                    (SELECT COUNT(*) FROM code_chunks AS cc
+                     WHERE cc.project_id = p.id AND cc.repository_revision = p.repository_revision) AS total_chunks,
+                    (SELECT COUNT(DISTINCT ce.code_chunk_id)
+                     FROM code_chunk_embeddings AS ce
+                     JOIN code_chunks AS cc2 ON cc2.id = ce.code_chunk_id
+                     WHERE cc2.project_id = p.id AND cc2.repository_revision = p.repository_revision) AS embedding_count,
                     wr.workspace_id AS revision_workspace_id,
                     wr.project_id AS revision_project_id,
                     wr.repository_revision AS linked_revision

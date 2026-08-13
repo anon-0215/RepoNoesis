@@ -66,6 +66,9 @@ class WorkspaceService:
             "project_status": row["project_status"] if valid else "unavailable",
             "repository_revision": row["repository_revision"] if valid else "",
             "openable": openable,
+            "project_id": row.get("active_project_id") if valid else None,
+            "total_chunks": int(row.get("total_chunks") or 0) if valid else 0,
+            "embedding_count": int(row.get("embedding_count") or 0) if valid else 0,
             "created_at": row["created_at"],
             "updated_at": row["project_updated_at"] or row["updated_at"] or row["created_at"],
         }

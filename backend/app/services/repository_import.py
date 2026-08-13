@@ -25,6 +25,7 @@ logger = logging.getLogger(__name__)
 _MAX_SAFE_ELAPSED_MS = 86_400_000
 _MAX_SAFE_EXIT_CODE = 2_147_483_647
 _IMPORT_DIRECTORY_PATTERN = re.compile(r"^\.import-[0-9a-f]{32}$")
+_STABLE_DIRECTORY_PATTERN = re.compile(r"^[0-9a-f]{16}-[0-9a-f]{12}$")
 _PROXY_ENVIRONMENT_NAMES = (
     "HTTP_PROXY",
     "HTTPS_PROXY",
@@ -608,6 +609,64 @@ def _remove_new_checkout(target: Path, clone_root: Path) -> CheckoutCleanupResul
             },
         )
         return CheckoutCleanupResult(True, "delete_failed")
+
+
+def remove_persisted_git_checkout(
+    source_location: str,
+    repository_revision: str,
+    settings: RepositorySettings,
+) -> CheckoutCleanupResult:
+    """Remove only the exact stable checkout derived by the public importer."""
+    normalized_url = validate_public_https_git_url(source_location)
+    if not re.fullmatch(r"[0-9a-f]{40}", repository_revision):
+        return CheckoutCleanupResult(True, "revision_rejected")
+    clone_root = settings.runtime_dir / "repositories"
+    expected_name = (
+        f"{hashlib.sha256(normalized_url.encode()).hexdigest()[:16]}-"
+        f"{repository_revision[:12]}"
+    )
+    target = clone_root / expected_name
+    status = _validate_persisted_cleanup_target(target, clone_root, expected_name)
+    if status == "target_absent":
+        return CheckoutCleanupResult(False, status)
+    if status != "eligible":
+        return CheckoutCleanupResult(True, status)
+    try:
+        shutil.rmtree(target, onerror=_readonly_cleanup_handler(target))
+        return CheckoutCleanupResult(False, "removed")
+    except FileNotFoundError:
+        return CheckoutCleanupResult(False, "target_absent")
+    except Exception:
+        return CheckoutCleanupResult(True, "delete_failed")
+
+
+def _validate_persisted_cleanup_target(
+    target: Path, clone_root: Path, expected_name: str
+) -> str:
+    if target.name != expected_name or not _STABLE_DIRECTORY_PATTERN.fullmatch(target.name):
+        return "name_rejected"
+    try:
+        lexical_target = Path(os.path.abspath(os.fspath(target)))
+        lexical_root = Path(os.path.abspath(os.fspath(clone_root)))
+        if not _strictly_within(lexical_target, lexical_root):
+            return "lexical_boundary_rejected"
+        resolved_root = clone_root.resolve(strict=True)
+        resolved_target = target.resolve(strict=False)
+        if not _strictly_within(resolved_target, resolved_root):
+            return "resolved_boundary_rejected"
+        metadata = target.lstat()
+    except FileNotFoundError:
+        return "target_absent"
+    except OSError:
+        return "metadata_unavailable"
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    if stat.S_ISLNK(metadata.st_mode):
+        return "link_rejected"
+    if getattr(metadata, "st_file_attributes", 0) & reparse_flag:
+        return "reparse_point_rejected"
+    if not stat.S_ISDIR(metadata.st_mode):
+        return "not_directory"
+    return "eligible"
 
 
 def _validate_cleanup_target(target: Path, clone_root: Path) -> str:

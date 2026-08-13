@@ -12,6 +12,7 @@ vi.mock('./lib/api', async () => {
     analyzeProject: vi.fn(),
     askProject: vi.fn(),
     checkWorkspaceRevision: vi.fn(),
+    deleteProject: vi.fn(),
     getConfigStatus: vi.fn(),
     getLearningContinuity: vi.fn(),
     getLearningPath: vi.fn(),
@@ -32,6 +33,7 @@ import {
   ApiError,
   analyzeProject,
   askProject,
+  deleteProject,
   getConfigStatus,
   getLearningPath,
   getProject,
@@ -332,6 +334,70 @@ describe('App ask request gate integration', () => {
 });
 
 describe('App connection and import status integration', () => {
+  it('shows incomplete embedding progress, confirms deletion, and removes the item', async () => {
+    vi.stubGlobal('IS_REACT_ACT_ENVIRONMENT', true);
+    vi.mocked(getConfigStatus).mockResolvedValue({
+      git_proxy_configured: false,
+      llm: { ready: true, provider: 'fake', model: 'fake-model', missing: [] },
+      embedding: { ready: true, model: 'fake-embedding', device: 'cpu', offline: true, missing: [] }
+    } as never);
+    vi.mocked(listWorkspaces).mockResolvedValue({
+      items: [{
+        workspace_id: 'workspace-incomplete', display_name: 'RepoNoesis', source_type: 'git_url',
+        project_status: 'incomplete', repository_revision: 'c'.repeat(40), openable: false,
+        project_id: 'project-incomplete', total_chunks: 2850, embedding_count: 24,
+        created_at: 'now', updated_at: 'now'
+      }], total: 1, limit: 20, offset: 0
+    });
+    vi.mocked(deleteProject).mockResolvedValue({ deleted: true, cleanup_pending: false, retryable: false });
+    vi.spyOn(window, 'confirm').mockReturnValue(true);
+    const container = document.createElement('div');
+    document.body.appendChild(container);
+    let root: Root | null = createRoot(container);
+    try {
+      await act(async () => { root!.render(<App />); await flushPromises(); });
+      expect(container.textContent).toContain('incomplete');
+      expect(container.textContent).toContain('Embedding：24 / 2850');
+      await act(async () => {
+        container.querySelector<HTMLButtonElement>('[aria-label="删除 RepoNoesis"]')!.click();
+        await flushPromises();
+      });
+      expect(window.confirm).toHaveBeenCalledWith(expect.stringContaining('不会修改远程 Git 仓库'));
+      expect(deleteProject).toHaveBeenCalledWith('project-incomplete');
+      expect(container.querySelector('[aria-label="删除 RepoNoesis"]')).toBeNull();
+    } finally {
+      if (root) await act(async () => root?.unmount());
+      container.remove();
+    }
+  });
+
+  it('keeps a project visible after delete failure so deletion can be retried', async () => {
+    vi.stubGlobal('IS_REACT_ACT_ENVIRONMENT', true);
+    vi.mocked(getConfigStatus).mockResolvedValue({ embedding: { ready: true }, llm: { ready: true } } as never);
+    vi.mocked(listWorkspaces).mockResolvedValue({
+      items: [{ workspace_id: 'w', display_name: 'Retry Repo', source_type: 'local', project_status: 'failed',
+        repository_revision: 'a'.repeat(40), openable: false, project_id: 'p', total_chunks: 1,
+        embedding_count: 0, created_at: 'now', updated_at: 'now' }], total: 1, limit: 20, offset: 0
+    });
+    vi.mocked(deleteProject).mockRejectedValueOnce(new ApiError('项目删除失败，请稍后重试。', 500))
+      .mockResolvedValueOnce({ deleted: true, cleanup_pending: false, retryable: false });
+    vi.spyOn(window, 'confirm').mockReturnValue(true);
+    const container = document.createElement('div'); document.body.appendChild(container);
+    let root: Root | null = createRoot(container);
+    try {
+      await act(async () => { root!.render(<App />); await flushPromises(); });
+      const selector = '[aria-label="删除 Retry Repo"]';
+      await act(async () => { container.querySelector<HTMLButtonElement>(selector)!.click(); await flushPromises(); });
+      expect(container.textContent).toContain('Retry Repo');
+      await act(async () => { container.querySelector<HTMLButtonElement>(selector)!.click(); await flushPromises(); });
+      expect(deleteProject).toHaveBeenCalledTimes(2);
+      expect(container.textContent).not.toContain('Retry Repo');
+    } finally {
+      if (root) await act(async () => root?.unmount());
+      container.remove();
+    }
+  });
+
   it('clears an older initialization connection error after a newer successful response', async () => {
     vi.stubGlobal('IS_REACT_ACT_ENVIRONMENT', true);
     let rejectConfig!: (reason: unknown) => void;
