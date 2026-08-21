@@ -946,11 +946,17 @@ export function AskView({
         )}
         {answers.map((item, index) => (
           <article className="answer" key={`${item.question}-${index}`}>
-            <h2>{item.question}</h2>
-            <p>{item.result.answer}</p>
-            <div className="citation-grid">
-              {item.result.citations.map((citation) => (
-                <details key={citation.path} open>
+             <h2>{item.question}</h2>
+             <p>{item.result.answer}</p>
+            <p className="citation-trust-note">
+              源码引用已校验；生成解释仍可能有误，请结合引用核对。
+            </p>
+             <div className="citation-grid">
+              {item.result.citations.map((citation, citationIndex) => (
+                <details
+                  key={`${citation.path}:${citation.start_line}-${citation.end_line}:${citation.qualified_name}:${citationIndex}`}
+                  open
+                >
                   <summary>{citationLabel(citation)}</summary>
                   <pre>{citation.snippet}</pre>
                 </details>

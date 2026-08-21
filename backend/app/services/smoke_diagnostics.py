@@ -155,6 +155,7 @@ _FINAL_ANSWER_PROTOCOL_CODES = frozenset(
     {
         "final_answer_invalid_json",
         "final_answer_schema_invalid",
+        "model_supplied_location_forbidden",
         "citation_alias_missing",
         "citation_alias_unknown",
         "citation_alias_invalid_type",
@@ -163,6 +164,9 @@ _FINAL_ANSWER_PROTOCOL_CODES = frozenset(
         "citation_format_invalid",
         "citation_binding_failed",
     }
+)
+_LOCATION_VIOLATION_KINDS = frozenset(
+    {"evidence_marker", "path", "revision", "content_hash", "chunk_identity"}
 )
 
 
@@ -221,6 +225,8 @@ class SmokeDiagnosticsRecorder:
         self._tool_executions: list[dict[str, Any]] = []
         self._planner_attempts: list[dict[str, Any]] = []
         self._final_answer_protocol_failure: dict[str, Any] | None = None
+        self._final_answer_initial_failure: dict[str, Any] | None = None
+        self._final_answer_repair_failure: dict[str, Any] | None = None
         self._truncated = False
 
     def begin_request(self, *, deadline_budget_ms: int, remaining_ms: int) -> None:
@@ -350,6 +356,9 @@ class SmokeDiagnosticsRecorder:
                 "tool_calls_failed": 0,
                 "final_answer_attempted": False,
                 "final_answer_response_received": False,
+                "final_answer_repair_attempted": False,
+                "final_answer_repair_protocol_succeeded": False,
+                "final_answer_repair_succeeded": False,
             }
         )
         if isinstance(request_id, str) and re.fullmatch(r"[A-Za-z0-9-]{1,64}", request_id):
@@ -505,6 +514,57 @@ class SmokeDiagnosticsRecorder:
             self._truncated = True
             return
         self._final_answer_protocol_failure = safe
+        if self._agent.get("final_answer_repair_attempted") is True:
+            self.record_final_answer_repair_failure(safe)
+        elif self._final_answer_initial_failure is None:
+            self._final_answer_initial_failure = _safe_repair_failure(safe)
+
+    def record_final_answer_initial_failure(self, value: dict[str, Any]) -> None:
+        safe = _safe_final_answer_protocol_failure(value)
+        repair_safe = _safe_repair_failure(value)
+        if not safe or not repair_safe:
+            self._truncated = True
+            return
+        self._final_answer_protocol_failure = safe
+        if self._final_answer_initial_failure is None:
+            self._final_answer_initial_failure = repair_safe
+
+    def record_final_answer_repair_attempt(self) -> None:
+        """Record the boundary immediately before the repair logical call."""
+
+        self._agent["final_answer_repair_attempted"] = True
+        self._agent["final_answer_repair_protocol_succeeded"] = False
+        self._agent["final_answer_repair_succeeded"] = False
+
+    def record_final_answer_repair_protocol_result(self, *, succeeded: bool) -> None:
+        if self._agent.get("final_answer_repair_attempted") is not True:
+            return
+        self._agent["final_answer_repair_protocol_succeeded"] = bool(succeeded)
+        if not succeeded:
+            self._agent["final_answer_repair_succeeded"] = False
+
+    def record_final_answer_repair_result(self, *, succeeded: bool) -> None:
+        """Record repaired-answer validity, independent of route persistence."""
+
+        if self._agent.get("final_answer_repair_attempted") is not True:
+            return
+        self._agent["final_answer_repair_succeeded"] = bool(succeeded) and (
+            self._agent.get("final_answer_repair_protocol_succeeded") is True
+        ) and self._final_answer_repair_failure is None
+
+    def record_final_answer_repair_failure(self, value: dict[str, Any] | str) -> None:
+        if self._final_answer_repair_failure is not None:
+            return
+        candidate = {"stable_code": value} if isinstance(value, str) else value
+        safe = _safe_repair_failure(candidate)
+        if not safe:
+            self._truncated = True
+            return
+        self._final_answer_repair_failure = safe
+        self._agent["final_answer_repair_succeeded"] = False
+        protocol = _safe_final_answer_protocol_failure(candidate)
+        if protocol:
+            self._final_answer_protocol_failure = protocol
 
     def record_final_answer_response(self) -> None:
         self._agent["final_answer_response_received"] = True
@@ -568,6 +628,9 @@ class SmokeDiagnosticsRecorder:
             self._agent["final_answer_failure_reason_code"] = reason
         if reason == "relation_validation_failed":
             self._agent["relation_failure_reason_code"] = reason
+        if self._agent.get("final_answer_repair_attempted") is True:
+            self._agent["final_answer_repair_succeeded"] = False
+            self.record_final_answer_repair_failure(reason)
 
     def record_agent_result(self, result: dict[str, Any]) -> None:
         for key, allowed in (
@@ -614,48 +677,171 @@ class SmokeDiagnosticsRecorder:
             payload["final_answer_protocol_failure"] = dict(
                 self._final_answer_protocol_failure
             )
+        if self._final_answer_initial_failure is not None:
+            payload["final_answer_initial_failure"] = dict(
+                self._final_answer_initial_failure
+            )
+        if self._final_answer_repair_failure is not None:
+            payload["final_answer_repair_failure"] = dict(
+                self._final_answer_repair_failure
+            )
         if self._truncated:
             payload["diagnostics_truncated"] = True
-        payload = _safe_smoke_diagnostics(payload)
-        while (
-            len(json.dumps(payload, sort_keys=True).encode("utf-8"))
-            > MAX_SMOKE_DIAGNOSTICS_BYTES
-            and payload.get("provider_calls")
-        ):
-            payload["provider_calls"].pop(0)
+        return _bounded_smoke_diagnostics(_safe_smoke_diagnostics(payload))
+
+
+def _bounded_smoke_diagnostics(value: dict[str, Any]) -> dict[str, Any]:
+    payload = dict(value)
+
+    def oversized() -> bool:
+        return _serialized_diagnostics_size(payload) > MAX_SMOKE_DIAGNOSTICS_BYTES
+
+    while oversized() and payload.get("provider_calls"):
+        payload["provider_calls"].pop(0)
+        payload["diagnostics_truncated"] = True
+    if oversized():
+        payload.pop("tool_calls", None)
+        payload["diagnostics_truncated"] = True
+    while oversized() and payload.get("tool_executions"):
+        payload["tool_executions"].pop(0)
+        payload["diagnostics_truncated"] = True
+    while oversized() and payload.get("provider_attempt_outcomes"):
+        payload["provider_attempt_outcomes"].pop(0)
+        if payload.get("provider_attempt_durations_ms"):
+            payload["provider_attempt_durations_ms"].pop(0)
+        if payload.get("provider_attempt_timeouts_ms"):
+            payload["provider_attempt_timeouts_ms"].pop(0)
+        payload["diagnostics_truncated"] = True
+    while (
+        oversized()
+        and isinstance(payload.get("planner_attempts"), list)
+        and len(payload["planner_attempts"]) > 2
+    ):
+        payload["planner_attempts"].pop(0)
+        payload["diagnostics_truncated"] = True
+
+    for key in (
+        "planner_attempts",
+        "final_answer_protocol_failure",
+        "final_answer_initial_failure",
+        "final_answer_repair_failure",
+    ):
+        items = payload.get(key)
+        details = items if isinstance(items, list) else [items]
+        for detail in details:
+            if not isinstance(detail, dict):
+                continue
+            field_path = detail.get("field_path")
+            while oversized() and isinstance(field_path, list) and field_path:
+                field_path.pop()
+                payload["diagnostics_truncated"] = True
+
+    if oversized() and isinstance(payload.get("planner_attempts"), list):
+        payload["planner_attempts"] = [
+            {
+                key: item[key]
+                for key in ("stage", "stable_code", "repair_attempt")
+                if isinstance(item, dict) and key in item
+            }
+            for item in payload["planner_attempts"]
+            if isinstance(item, dict)
+        ]
+        payload["diagnostics_truncated"] = True
+    for key in (
+        "final_answer_protocol_failure",
+        "final_answer_initial_failure",
+        "final_answer_repair_failure",
+    ):
+        if not oversized():
+            break
+        detail = payload.get(key)
+        if isinstance(detail, dict):
+            payload[key] = {
+                name: detail[name]
+                for name in ("stage", "stable_code", "violation_kind")
+                if name in detail
+            }
             payload["diagnostics_truncated"] = True
-        if (
-            len(json.dumps(payload, sort_keys=True).encode("utf-8"))
-            > MAX_SMOKE_DIAGNOSTICS_BYTES
-        ):
-            payload.pop("tool_calls", None)
-            payload["diagnostics_truncated"] = True
-        while (
-            len(json.dumps(payload, sort_keys=True).encode("utf-8"))
-            > MAX_SMOKE_DIAGNOSTICS_BYTES
-            and payload.get("tool_executions")
-        ):
-            payload["tool_executions"].pop(0)
-            payload["diagnostics_truncated"] = True
-        while (
-            len(json.dumps(payload, sort_keys=True).encode("utf-8"))
-            > MAX_SMOKE_DIAGNOSTICS_BYTES
-            and payload.get("provider_attempt_outcomes")
-        ):
-            payload["provider_attempt_outcomes"].pop(0)
-            if payload.get("provider_attempt_durations_ms"):
-                payload["provider_attempt_durations_ms"].pop(0)
-            if payload.get("provider_attempt_timeouts_ms"):
-                payload["provider_attempt_timeouts_ms"].pop(0)
-            payload["diagnostics_truncated"] = True
-        while (
-            len(json.dumps(payload, sort_keys=True).encode("utf-8"))
-            > MAX_SMOKE_DIAGNOSTICS_BYTES
-            and len(payload.get("planner_attempts", [])) > 2
-        ):
-            payload["planner_attempts"].pop(0)
-            payload["diagnostics_truncated"] = True
-        return payload
+
+    for key in (
+        "planner_attempts",
+        "final_answer_protocol_failure",
+        "final_answer_initial_failure",
+        "final_answer_repair_failure",
+    ):
+        if not oversized():
+            break
+        payload.pop(key, None)
+        payload["diagnostics_truncated"] = True
+
+    if oversized():
+        payload = _minimal_smoke_diagnostics(payload)
+    if oversized():
+        payload = {
+            key: payload[key]
+            for key in (
+                "request_id",
+                "agent_failure_reason_code",
+                "final_answer_failure_reason_code",
+                "final_answer_repair_attempted",
+                "final_answer_repair_protocol_succeeded",
+                "final_answer_repair_succeeded",
+            )
+            if key in payload
+        }
+        payload["diagnostics_truncated"] = True
+    return payload
+
+
+def _serialized_diagnostics_size(value: dict[str, Any]) -> int:
+    compact_size = len(
+        json.dumps(
+            value,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    )
+    compatibility_size = len(
+        json.dumps(value, ensure_ascii=True, sort_keys=True).encode("utf-8")
+    )
+    return max(compact_size, compatibility_size)
+
+
+def _minimal_smoke_diagnostics(value: dict[str, Any]) -> dict[str, Any]:
+    keys = (
+        "request_id",
+        "agent_mode",
+        "agent_status",
+        "answer_mode",
+        "fallback_reason_code",
+        "agent_failure_reason_code",
+        "final_answer_failure_reason_code",
+        "citation_failure_reason_code",
+        "relation_failure_reason_code",
+        "planner_requests_attempted",
+        "planner_repair_attempts",
+        "tool_calls_attempted",
+        "tool_calls_succeeded",
+        "tool_calls_failed",
+        "steps_used",
+        "tool_calls_used",
+        "final_answer_attempted",
+        "final_answer_repair_attempted",
+        "final_answer_repair_protocol_succeeded",
+        "final_answer_repair_succeeded",
+        "provider_logical_calls",
+        "provider_http_attempt_count",
+        "evidence_count",
+        "citation_count",
+        "citation_validation_passed",
+        "relation_validation_passed",
+        "post_generation_validation_passed",
+        "elapsed_ms",
+    )
+    result = {key: value[key] for key in keys if key in value}
+    result["diagnostics_truncated"] = True
+    return result
 
 
 def _safe_smoke_diagnostics(value: Any) -> dict[str, Any]:
@@ -708,6 +894,9 @@ def _safe_smoke_diagnostics(value: Any) -> dict[str, Any]:
         "request_deadline_reached",
         "model_load_attempted",
         "query_encode_attempted",
+        "final_answer_repair_attempted",
+        "final_answer_repair_protocol_succeeded",
+        "final_answer_repair_succeeded",
     }
     for key in integer_keys:
         item = value.get(key)
@@ -829,6 +1018,10 @@ def _safe_smoke_diagnostics(value: Any) -> dict[str, Any]:
     )
     if protocol_failure:
         result["final_answer_protocol_failure"] = protocol_failure
+    for key in ("final_answer_initial_failure", "final_answer_repair_failure"):
+        safe_failure = _safe_repair_failure(value.get(key))
+        if safe_failure:
+            result[key] = safe_failure
     return result
 
 
@@ -972,6 +1165,44 @@ def _safe_final_answer_protocol_failure(value: Any) -> dict[str, Any]:
         r"[0-9a-f]{64}", output_sha256
     ):
         result["output_sha256"] = output_sha256
+    violation_kind = value.get("violation_kind")
+    if violation_kind in _LOCATION_VIOLATION_KINDS:
+        result["violation_kind"] = violation_kind
+    return result
+
+
+def _safe_repair_failure(value: Any) -> dict[str, Any]:
+    """Keep only the allowlisted, non-recoverable repair failure shape."""
+
+    if not isinstance(value, dict):
+        return {}
+    code = value.get("stable_code")
+    if code not in _FINAL_ANSWER_PROTOCOL_CODES | FINAL_ANSWER_FAILURE_REASON_CODES:
+        return {}
+    result: dict[str, Any] = {"stable_code": code, "field_path": []}
+    path = value.get("field_path")
+    if isinstance(path, list):
+        result["field_path"] = [
+            item
+            for item in path[:16]
+            if (
+                isinstance(item, int)
+                and not isinstance(item, bool)
+                and item >= 0
+            )
+            or (
+                isinstance(item, str)
+                and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,63}", item)
+            )
+        ]
+    violation_kind = value.get("violation_kind")
+    if violation_kind in _LOCATION_VIOLATION_KINDS:
+        result["violation_kind"] = violation_kind
+    for key in ("part_count", "alias_count"):
+        if isinstance(value.get(key), int) and not isinstance(value.get(key), bool):
+            result[key] = _bounded_count(value[key])
+    if isinstance(value.get("markdown_fence_detected"), bool):
+        result["markdown_fence_detected"] = value["markdown_fence_detected"]
     return result
 
 

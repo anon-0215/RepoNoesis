@@ -130,6 +130,152 @@ describe('AskView safe server rendering', () => {
     expect(markup).not.toContain('safe projected message');
   });
 
+  it('renders Citation cards only from the server citations array', () => {
+    const ordinaryText =
+      '普通正文 [E999] backend/app/b.py:30-40 只是说明，不是服务器 Citation。';
+    const serverCitation = {
+      path: 'backend/app/a.py',
+      summary: 'authenticate_user',
+      snippet: 'def authenticate_user():',
+      qualified_name: 'authenticate_user',
+      start_line: 10,
+      end_line: 20
+    };
+    const markup = renderToStaticMarkup(
+      <AskView
+        question="where"
+        setQuestion={vi.fn()}
+        answers={[
+          {
+            question: 'where',
+            result: { ...answer, answer: ordinaryText, citations: [serverCitation] }
+          }
+        ]}
+        error={null}
+        onSubmit={vi.fn()}
+        loading={false}
+      />
+    );
+    const rendered = new DOMParser().parseFromString(markup, 'text/html');
+    const answerText = rendered.querySelector('.answer > p:not(.citation-trust-note)');
+    const citationCards = rendered.querySelectorAll('.citation-grid details');
+    const citationSummary = rendered.querySelector('.citation-grid details summary');
+    const citationSnippet = rendered.querySelector('.citation-grid details pre');
+
+    expect(rendered.querySelector('.citation-trust-note')?.textContent).toContain(
+      '源码引用已校验'
+    );
+    expect(answerText?.textContent).toContain('[E999] backend/app/b.py:30-40');
+    expect(citationCards).toHaveLength(1);
+    expect(citationSummary?.textContent).toBe(
+      'backend/app/a.py:10-20 · authenticate_user'
+    );
+    expect(citationSnippet?.textContent).toBe('def authenticate_user():');
+    expect(citationSummary?.textContent).not.toContain('backend/app/b.py');
+  });
+
+  it('keeps repeated Citation paths and ranges stable, ordered, and warning-free', () => {
+    const citations = [
+      {
+        path: 'backend/app/shared.py',
+        summary: 'first_range',
+        snippet: 'def first_range(): pass',
+        qualified_name: 'first_range',
+        start_line: 10,
+        end_line: 20
+      },
+      {
+        path: 'backend/app/shared.py',
+        summary: 'second_range',
+        snippet: 'def second_range(): pass',
+        qualified_name: 'second_range',
+        start_line: 30,
+        end_line: 40
+      },
+      {
+        path: 'backend/app/shared.py',
+        summary: 'second_range_duplicate_item',
+        snippet: 'def second_range_duplicate_item(): pass',
+        qualified_name: 'second_range',
+        start_line: 30,
+        end_line: 40
+      },
+      {
+        path: 'backend/app/other.py',
+        summary: 'other_path',
+        snippet: 'def other_path(): pass',
+        qualified_name: 'other_path',
+        start_line: 5,
+        end_line: 9
+      }
+    ];
+    const ordinaryText =
+      '普通正文 backend/app/shared.py:999-1000 不应生成额外 Citation 卡片。';
+    const originalConsoleError = console.error;
+    const consoleError = vi.spyOn(console, 'error').mockImplementation((...args) => {
+      if (!String(args[0]).includes('same key')) originalConsoleError(...args);
+    });
+    vi.stubGlobal('IS_REACT_ACT_ENVIRONMENT', true);
+    const container = document.createElement('div');
+    document.body.appendChild(container);
+    const root = createRoot(container);
+    let duplicateKeyErrors: unknown[][] = [];
+    let allConsoleErrors: unknown[][] = [];
+
+    try {
+      act(() => {
+        root.render(
+          <AskView
+            question="where"
+            setQuestion={vi.fn()}
+            answers={[
+              {
+                question: 'where',
+                result: { ...answer, answer: ordinaryText, citations }
+              }
+            ]}
+            error={null}
+            onSubmit={vi.fn()}
+            loading={false}
+          />
+        );
+      });
+      allConsoleErrors = [...consoleError.mock.calls];
+      duplicateKeyErrors = allConsoleErrors.filter((args) =>
+        String(args[0]).includes('same key')
+      );
+      const answerText = container.querySelector(
+        '.answer > p:not(.citation-trust-note)'
+      );
+      const citationCards = Array.from(
+        container.querySelectorAll('.citation-grid details')
+      );
+
+      expect(citationCards).toHaveLength(citations.length);
+      expect(
+        citationCards.map((card) => card.querySelector('summary')?.textContent)
+      ).toEqual([
+        'backend/app/shared.py:10-20 · first_range',
+        'backend/app/shared.py:30-40 · second_range',
+        'backend/app/shared.py:30-40 · second_range',
+        'backend/app/other.py:5-9 · other_path'
+      ]);
+      expect(citationCards.map((card) => card.querySelector('pre')?.textContent)).toEqual(
+        citations.map((citation) => citation.snippet)
+      );
+      expect(container.querySelector('.citation-trust-note')?.textContent).toContain(
+        '源码引用已校验'
+      );
+      expect(answerText?.textContent).toContain('backend/app/shared.py:999-1000');
+      expect(answerText?.querySelectorAll('a, details')).toHaveLength(0);
+      expect(duplicateKeyErrors).toHaveLength(0);
+      expect(allConsoleErrors).toHaveLength(0);
+    } finally {
+      act(() => root.unmount());
+      consoleError.mockRestore();
+    }
+  });
+
   it.each([
     ['provider_not_configured', 'provider', 'request-provider-1'],
     ['response_contract_invalid', 'response', 'request-response-1']

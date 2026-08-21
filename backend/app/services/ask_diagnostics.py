@@ -110,8 +110,13 @@ def build_ask_success_diagnostics(
     planner_repairs = _count(recorder_snapshot.get("planner_repair_attempts"))
     provider_calls = _count(recorder_snapshot.get("provider_logical_calls"))
     final_attempted = recorder_snapshot.get("final_answer_attempted") is True
+    final_repair_attempted = (
+        recorder_snapshot.get("final_answer_repair_attempted") is True
+    )
     if provider_calls == 0:
-        provider_calls = planner_requests + int(final_attempted)
+        provider_calls = (
+            planner_requests + int(final_attempted) + int(final_repair_attempted)
+        )
     diagnostics = {
         "request_id": _request_id(
             result.get("request_id") or recorder_snapshot.get("request_id")
@@ -143,6 +148,15 @@ def build_ask_success_diagnostics(
         "planner_logical_calls": max(0, planner_requests - planner_repairs),
         "planner_repair_calls": planner_repairs,
         "final_answer_attempted": final_attempted,
+        "final_answer_repair_attempted": final_repair_attempted,
+        "final_answer_repair_protocol_succeeded": recorder_snapshot.get(
+            "final_answer_repair_protocol_succeeded"
+        )
+        is True,
+        "final_answer_repair_succeeded": recorder_snapshot.get(
+            "final_answer_repair_succeeded"
+        )
+        is True,
         "provider_logical_calls": _count(provider_calls),
         "provider_http_attempt_count": _count(
             recorder_snapshot.get("provider_http_attempt_count")
@@ -204,6 +218,12 @@ def build_ask_success_diagnostics(
         "final_answer_protocol_failure": _safe_final_answer_protocol_failure(
             recorder_snapshot.get("final_answer_protocol_failure")
         ),
+        "final_answer_initial_failure": _safe_final_answer_repair_failure(
+            recorder_snapshot.get("final_answer_initial_failure")
+        ),
+        "final_answer_repair_failure": _safe_final_answer_repair_failure(
+            recorder_snapshot.get("final_answer_repair_failure")
+        ),
     }
     return _bounded_payload(diagnostics)
 
@@ -257,13 +277,18 @@ def build_ask_failure_detail(
     planner_requests = _count(recorder_snapshot.get("planner_requests_attempted"))
     planner_repairs = _count(recorder_snapshot.get("planner_repair_attempts"))
     final_attempted = recorder_snapshot.get("final_answer_attempted") is True
+    final_repair_attempted = (
+        recorder_snapshot.get("final_answer_repair_attempted") is True
+    )
     provider_call_count = _count(recorder_snapshot.get("provider_logical_calls"))
     if provider_call_count == 0:
         provider_call_count = provider_detail_count
     if provider_call_count == 0:
         # Fake LLMs do not know about the recorder. These logical call sites are
         # still exact and deliberately exclude provider transport retries.
-        provider_call_count = planner_requests + int(final_attempted)
+        provider_call_count = (
+            planner_requests + int(final_attempted) + int(final_repair_attempted)
+        )
 
     candidate_citations = recorder_snapshot.get("grounded_candidate_citation_count")
     citation_count = (
@@ -302,6 +327,15 @@ def build_ask_failure_detail(
         "planner_logical_calls": max(0, planner_requests - planner_repairs),
         "planner_repair_calls": planner_repairs,
         "final_answer_attempted": final_attempted,
+        "final_answer_repair_attempted": final_repair_attempted,
+        "final_answer_repair_protocol_succeeded": recorder_snapshot.get(
+            "final_answer_repair_protocol_succeeded"
+        )
+        is True,
+        "final_answer_repair_succeeded": recorder_snapshot.get(
+            "final_answer_repair_succeeded"
+        )
+        is True,
         "provider_logical_calls": _count(provider_call_count),
         "evidence_count": max(
             _bounded_list_count(result.get("evidence")),
@@ -360,6 +394,12 @@ def build_ask_failure_detail(
         ),
         "final_answer_protocol_failure": _safe_final_answer_protocol_failure(
             recorder_snapshot.get("final_answer_protocol_failure")
+        ),
+        "final_answer_initial_failure": _safe_final_answer_repair_failure(
+            recorder_snapshot.get("final_answer_initial_failure")
+        ),
+        "final_answer_repair_failure": _safe_final_answer_repair_failure(
+            recorder_snapshot.get("final_answer_repair_failure")
         ),
     }
     diagnostics = _bounded_payload(diagnostics)
@@ -643,6 +683,7 @@ def _safe_final_answer_protocol_failure(value: Any) -> dict[str, Any] | None:
         {
             "final_answer_invalid_json",
             "final_answer_schema_invalid",
+            "model_supplied_location_forbidden",
             "citation_alias_missing",
             "citation_alias_unknown",
             "citation_alias_invalid_type",
@@ -684,6 +725,83 @@ def _safe_final_answer_protocol_failure(value: Any) -> dict[str, Any] | None:
         r"[0-9a-f]{64}", output_sha256
     ):
         safe["output_sha256"] = output_sha256
+    violation_kind = value.get("violation_kind")
+    if violation_kind in {
+        "evidence_marker",
+        "path",
+        "revision",
+        "content_hash",
+        "chunk_identity",
+    }:
+        safe["violation_kind"] = violation_kind
+    return safe
+
+
+def _safe_final_answer_repair_failure(value: Any) -> dict[str, Any] | None:
+    codes = frozenset(
+        {
+            "final_answer_invalid_json",
+            "final_answer_schema_invalid",
+            "model_supplied_location_forbidden",
+            "citation_alias_missing",
+            "citation_alias_unknown",
+            "citation_alias_invalid_type",
+            "citation_alias_limit_exceeded",
+            "canonical_render_failed",
+            "citation_format_invalid",
+            "citation_binding_failed",
+            "response_empty",
+            "answer_token_budget_exceeded",
+            "citation_missing",
+            "citation_unknown",
+            "citation_validation_failed",
+            "citation_location_missing",
+            "citation_path_mismatch",
+            "citation_line_range_mismatch",
+            "citation_evidence_binding_failed",
+            "relation_validation_failed",
+            "post_generation_validation_failed",
+            "provider_failed",
+            "deadline_exhausted",
+            "unknown_safe_failure",
+        }
+    )
+    if not isinstance(value, dict) or value.get("stable_code") not in codes:
+        return None
+    path = value.get("field_path")
+    safe_path: list[str | int] = []
+    if isinstance(path, list):
+        safe_path = [
+            item
+            for item in path[:16]
+            if (
+                isinstance(item, int)
+                and not isinstance(item, bool)
+                and item >= 0
+            )
+            or (
+                isinstance(item, str)
+                and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,63}", item)
+            )
+        ]
+    safe: dict[str, Any] = {
+        "stable_code": value["stable_code"],
+        "field_path": safe_path,
+    }
+    violation_kind = value.get("violation_kind")
+    if violation_kind in {
+        "evidence_marker",
+        "path",
+        "revision",
+        "content_hash",
+        "chunk_identity",
+    }:
+        safe["violation_kind"] = violation_kind
+    for key in ("part_count", "alias_count"):
+        if isinstance(value.get(key), int) and not isinstance(value.get(key), bool):
+            safe[key] = _count(value[key])
+    if isinstance(value.get("markdown_fence_detected"), bool):
+        safe["markdown_fence_detected"] = value["markdown_fence_detected"]
     return safe
 
 
@@ -691,9 +809,7 @@ def _bounded_payload(value: dict[str, Any]) -> dict[str, Any]:
     result = dict(value)
 
     def oversized() -> bool:
-        return len(
-            json.dumps(result, sort_keys=True).encode("utf-8")
-        ) > MAX_ASK_DIAGNOSTICS_BYTES
+        return _serialized_diagnostics_size(result) > MAX_ASK_DIAGNOSTICS_BYTES
 
     for key in (
         "tool_executions",
@@ -726,6 +842,9 @@ def _bounded_payload(value: dict[str, Any]) -> dict[str, Any]:
         "planner_logical_calls",
         "planner_repair_calls",
         "final_answer_attempted",
+        "final_answer_repair_attempted",
+        "final_answer_repair_protocol_succeeded",
+        "final_answer_repair_succeeded",
         "provider_logical_calls",
         "evidence_count",
         "citation_count",
@@ -734,6 +853,8 @@ def _bounded_payload(value: dict[str, Any]) -> dict[str, Any]:
         "elapsed_ms",
         "planner_attempts",
         "final_answer_protocol_failure",
+        "final_answer_initial_failure",
+        "final_answer_repair_failure",
         "diagnostics_truncated",
     }
     for key in list(result):
@@ -742,7 +863,182 @@ def _bounded_payload(value: dict[str, Any]) -> dict[str, Any]:
         if key not in core:
             result.pop(key, None)
             result["diagnostics_truncated"] = True
+
+    for key in (
+        "planner_attempts",
+        "final_answer_protocol_failure",
+        "final_answer_initial_failure",
+        "final_answer_repair_failure",
+    ):
+        items = result.get(key)
+        details = items if isinstance(items, list) else [items]
+        for detail in details:
+            if not isinstance(detail, dict):
+                continue
+            field_path = detail.get("field_path")
+            while oversized() and isinstance(field_path, list) and field_path:
+                field_path.pop()
+                result["diagnostics_truncated"] = True
+
+    if oversized() and isinstance(result.get("planner_attempts"), list):
+        result["planner_attempts"] = [
+            {
+                key: item[key]
+                for key in ("stage", "stable_code", "repair_attempt")
+                if isinstance(item, dict) and key in item
+            }
+            for item in result["planner_attempts"]
+            if isinstance(item, dict)
+        ]
+        result["diagnostics_truncated"] = True
+    for key in (
+        "final_answer_protocol_failure",
+        "final_answer_initial_failure",
+        "final_answer_repair_failure",
+    ):
+        if not oversized():
+            break
+        detail = result.get(key)
+        if isinstance(detail, dict):
+            result[key] = {
+                name: detail[name]
+                for name in ("stage", "stable_code", "violation_kind")
+                if name in detail
+            }
+            result["diagnostics_truncated"] = True
+
+    for key in (
+        "planner_attempts",
+        "final_answer_protocol_failure",
+        "final_answer_initial_failure",
+        "final_answer_repair_failure",
+    ):
+        if not oversized():
+            break
+        result.pop(key, None)
+        result["diagnostics_truncated"] = True
+
+    if oversized():
+        result = _minimal_ask_payload(result)
+    if oversized():
+        result = _absolute_minimal_ask_payload(result)
     return result
+
+
+def _serialized_diagnostics_size(value: dict[str, Any]) -> int:
+    compact_size = len(
+        json.dumps(
+            value,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    )
+    compatibility_size = len(
+        json.dumps(value, ensure_ascii=True, sort_keys=True).encode("utf-8")
+    )
+    return max(compact_size, compatibility_size)
+
+
+def _minimal_ask_payload(value: dict[str, Any]) -> dict[str, Any]:
+    keys = (
+        "request_id",
+        "agent_mode",
+        "agent_status",
+        "answer_mode",
+        "failure_stage",
+        "failure_reason_code",
+        "retrieval_version",
+        "hierarchy_mode",
+        "relation_mode",
+        "steps_used",
+        "tool_calls_used",
+        "planner_logical_calls",
+        "planner_repair_calls",
+        "final_answer_attempted",
+        "final_answer_repair_attempted",
+        "final_answer_repair_protocol_succeeded",
+        "final_answer_repair_succeeded",
+        "provider_logical_calls",
+        "evidence_count",
+        "citation_count",
+        "citation_failure_reason_code",
+        "relation_failure_reason_code",
+        "citation_validation_passed",
+        "relation_validation_passed",
+        "post_generation_validation_passed",
+        "elapsed_ms",
+        "success_stage",
+        "core_validation_passed",
+        "observability_degraded",
+    )
+    result = {key: value[key] for key in keys if key in value}
+    result["diagnostics_truncated"] = True
+    return result
+
+
+def _absolute_minimal_ask_payload(value: dict[str, Any]) -> dict[str, Any]:
+    request_id = _request_id(value.get("request_id"))
+    if "failure_reason_code" not in value:
+        return {
+            "request_id": request_id,
+            "diagnostics_truncated": True,
+        }
+    return {
+        "request_id": request_id,
+        "agent_mode": _enum(value.get("agent_mode"), AGENT_MODES, "unknown"),
+        "agent_status": _enum(
+            value.get("agent_status"), AGENT_STATUSES, "unknown"
+        ),
+        "answer_mode": _enum(
+            value.get("answer_mode"), ANSWER_MODES, "not_available"
+        ),
+        "failure_stage": _enum(
+            value.get("failure_stage"), FAILURE_STAGES, "provider"
+        ),
+        "failure_reason_code": _enum(
+            value.get("failure_reason_code"), FAILURE_REASON_CODES, "provider_error"
+        ),
+        "retrieval_version": _enum(
+            value.get("retrieval_version"), RETRIEVAL_VERSIONS, "v1"
+        ),
+        "hierarchy_mode": _enum(
+            value.get("hierarchy_mode"), HIERARCHY_MODES, "off"
+        ),
+        "relation_mode": _enum(
+            value.get("relation_mode"), RELATION_MODES, "off"
+        ),
+        "steps_used": _count(value.get("steps_used")),
+        "tool_calls_used": _count(value.get("tool_calls_used")),
+        "planner_logical_calls": _count(value.get("planner_logical_calls")),
+        "planner_repair_calls": _count(value.get("planner_repair_calls")),
+        "final_answer_attempted": value.get("final_answer_attempted") is True,
+        "final_answer_repair_attempted": value.get(
+            "final_answer_repair_attempted"
+        )
+        is True,
+        "final_answer_repair_protocol_succeeded": value.get(
+            "final_answer_repair_protocol_succeeded"
+        )
+        is True,
+        "final_answer_repair_succeeded": value.get(
+            "final_answer_repair_succeeded"
+        )
+        is True,
+        "provider_logical_calls": _count(value.get("provider_logical_calls")),
+        "evidence_count": _count(value.get("evidence_count")),
+        "citation_count": _count(value.get("citation_count")),
+        "citation_failure_reason_code": _enum_or_none(
+            value.get("citation_failure_reason_code"),
+            CITATION_FAILURE_REASON_CODES,
+        ),
+        "relation_failure_reason_code": _enum_or_none(
+            value.get("relation_failure_reason_code"),
+            RELATION_FAILURE_REASON_CODES,
+        ),
+        "elapsed_ms": _elapsed(value.get("elapsed_ms")),
+        "diagnostics_truncated": True,
+    }
 
 
 def format_ask_failure_log(detail: dict[str, Any]) -> str:
