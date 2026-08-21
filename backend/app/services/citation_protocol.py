@@ -4,7 +4,7 @@ from dataclasses import dataclass
 import hashlib
 import json
 import re
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, StrictStr, ValidationError, model_validator
 
@@ -16,7 +16,12 @@ MAX_PART_TEXT_CHARS = 2_000
 MAX_ALIASES_PER_PART = 5
 MAX_FINAL_ANSWER_OUTPUT_CHARS = 16_000
 _ALIAS = re.compile(r"A[1-9][0-9]{0,2}")
-_EVIDENCE_MARKER = re.compile(r"\[E[1-9][0-9]*\]")
+# This is deliberately identical to the marker namespace consumed by
+# qa_agent._validate_grounded_answer_references(). Ordinary technical prose,
+# including paths, URLs, revisions, hashes, and line-like text, is not a
+# server Citation and must not be promoted into this namespace.
+_SERVER_CITATION_MARKER = re.compile(r"\[E\d+\]")
+CitationTextViolationKind = Literal["evidence_marker"]
 
 
 @dataclass(frozen=True)
@@ -115,6 +120,7 @@ class FinalAnswerProtocolFailure:
     markdown_fence_detected: bool = False
     part_count: int = 0
     alias_count: int = 0
+    violation_kind: CitationTextViolationKind | None = None
 
     def to_safe_dict(self) -> dict[str, Any]:
         value: dict[str, Any] = {
@@ -128,6 +134,8 @@ class FinalAnswerProtocolFailure:
         }
         if self.output_sha256 is not None:
             value["output_sha256"] = self.output_sha256
+        if self.violation_kind is not None:
+            value["violation_kind"] = self.violation_kind
         return value
 
 
@@ -173,7 +181,8 @@ def build_final_answer_json_schema(
     schema["x-citation-contract"] = {
         "aliases": aliases,
         "canonical_rendering": "server_only",
-        "model_location_fields_allowed": False,
+        "model_citation_fields_allowed": False,
+        "ordinary_text_location_mentions_allowed": True,
     }
     return schema
 
@@ -229,13 +238,15 @@ def render_structured_final_answer(
                     part_count=len(envelope.parts),
                     alias_count=alias_count,
                 )
-        if _contains_model_supplied_location(part.text, descriptors):
+        violation_kind = _model_supplied_citation_marker_violation(part.text)
+        if violation_kind is not None:
             return _failure(
-                "final_answer_schema_invalid",
+                "model_supplied_location_forbidden",
                 metadata,
                 field_path=("parts", index, "text"),
                 part_count=len(envelope.parts),
                 alias_count=alias_count,
+                violation_kind=violation_kind,
             )
         try:
             tokens = [
@@ -261,21 +272,12 @@ def render_structured_final_answer(
     )
 
 
-def _contains_model_supplied_location(
+def _model_supplied_citation_marker_violation(
     text: str,
-    descriptors: list[CanonicalCitationDescriptor],
-) -> bool:
-    if _EVIDENCE_MARKER.search(text):
-        return True
-    for item in descriptors:
-        if (
-            item.path in text
-            or (item.repository_revision and item.repository_revision in text)
-            or (item.content_hash and item.content_hash in text)
-            or (item.chunk_identity and item.chunk_identity in text)
-        ):
-            return True
-    return False
+) -> CitationTextViolationKind | None:
+    if _SERVER_CITATION_MARKER.search(text):
+        return "evidence_marker"
+    return None
 
 
 def _output_metadata(raw: Any) -> dict[str, Any]:
@@ -299,6 +301,7 @@ def _failure(
     field_path: tuple[str | int, ...] = (),
     part_count: int = 0,
     alias_count: int = 0,
+    violation_kind: CitationTextViolationKind | None = None,
 ) -> FinalAnswerProtocolResult:
     return FinalAnswerProtocolResult(
         failure=FinalAnswerProtocolFailure(
@@ -306,6 +309,7 @@ def _failure(
             field_path=field_path,
             part_count=part_count,
             alias_count=alias_count,
+            violation_kind=violation_kind,
             **metadata,
         )
     )

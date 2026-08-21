@@ -1085,6 +1085,15 @@ def run_bounded_agent(
     response = _attach_learning_fields(response, state.context.learning_context)
     _assert_evidence_capacity(state.context, response["evidence"])
     if diagnostics_recorder is not None:
+        # Repair success describes a fully validated repaired answer.  The
+        # route's response-contract, deadline, and persistence gates remain
+        # separate request-level outcomes and must not rewrite this result.
+        diagnostics_recorder.record_final_answer_repair_result(
+            succeeded=(
+                state.completion_status == "completed"
+                and final.get("answer_mode") == "llm_grounded"
+            )
+        )
         diagnostics_recorder.record_stage_duration(
             "finalization", int((time.monotonic() - finalization_started) * 1000)
         )

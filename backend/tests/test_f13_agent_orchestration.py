@@ -300,7 +300,13 @@ class F13AgentOrchestrationTests(unittest.TestCase):
         self.assertEqual(status, 502)
         self.assertEqual(body["detail"]["code"], "citation_unknown")
         self.assertEqual(validation_harness.planner_calls, 1)
-        self.assertEqual(validation_harness.final_calls, 1)
+        self.assertEqual(validation_harness.final_calls, 2)
+        self.assertTrue(
+            body["detail"]["diagnostics"]["final_answer_repair_attempted"]
+        )
+        self.assertFalse(
+            body["detail"]["diagnostics"]["final_answer_repair_succeeded"]
+        )
         self.assertEqual(self._chat_count(), 0)
 
     def test_top_k_uses_formal_defaults_and_request_cap_for_all_supported_tools(self):

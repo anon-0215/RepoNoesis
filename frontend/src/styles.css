@@ -630,6 +630,13 @@ button:disabled {
   padding: 18px;
 }
 
+.answer .citation-trust-note {
+  margin: 8px 0 12px;
+  color: #667789;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
 .ask-error {
   border-color: #b45309;
   background: #fff7ed;

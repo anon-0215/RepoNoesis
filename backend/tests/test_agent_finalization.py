@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 import io
 import json
 from pathlib import Path
 import tempfile
+import time
 import unittest
 import urllib.error
 from unittest.mock import patch
@@ -39,15 +41,28 @@ def _structured(text="Grounded answer", aliases=None):
 class _FinalAnswerLlm:
     available = True
 
-    def __init__(self, response: str | None, callback=None) -> None:
+    def __init__(
+        self,
+        response: str | None | list[str | None | Exception],
+        callback=None,
+    ) -> None:
         self.response = response
         self.calls = 0
         self.callback = callback
+        self.messages: list[list[dict[str, str]]] = []
+        self.kwargs: list[dict] = []
 
     def chat(self, _messages, **_kwargs):
         self.calls += 1
+        self.messages.append(_messages)
+        self.kwargs.append(_kwargs)
         if self.callback is not None:
             self.callback()
+        if isinstance(self.response, list):
+            value = self.response[self.calls - 1]
+            if isinstance(value, Exception):
+                raise value
+            return value
         return self.response
 
 
@@ -117,6 +132,250 @@ class AgentFinalizationTests(unittest.TestCase):
         self.assertEqual(diagnostics["grounded_candidate_citation_count"], 1)
         self.assertNotIn("final_answer_failure_reason_code", diagnostics)
         self.assertEqual(diagnostics["agent_status"], "completed")
+
+    def test_location_failure_repairs_once_without_original_candidate(self):
+        planner = ScriptedPlanner(
+            [decision("continue", "search_code", {"query": "authenticate_user"})]
+        )
+        original = _structured("PRIVATE_CANDIDATE [E1]", ["A1"])
+        llm = _FinalAnswerLlm([original, _structured("Grounded answer", ["A1"])])
+        recorder = SmokeDiagnosticsRecorder()
+
+        result = self._run(
+            planner,
+            llm,
+            limits=replace(AgentLimits(), max_tool_calls=1),
+            recorder=recorder,
+        )
+
+        diagnostics = recorder.snapshot()
+        self.assertEqual(result["agent_status"], "completed")
+        self.assertEqual(result["answer_mode"], "llm_grounded")
+        self.assertTrue(result["citations"])
+        self.assertEqual(llm.calls, 2)
+        self.assertTrue(diagnostics["final_answer_repair_attempted"])
+        self.assertTrue(diagnostics["final_answer_repair_succeeded"])
+        protocol = diagnostics["final_answer_protocol_failure"]
+        self.assertEqual(
+            protocol["stable_code"], "model_supplied_location_forbidden"
+        )
+        self.assertEqual(protocol["violation_kind"], "evidence_marker")
+        repair_messages = llm.messages[1]
+        self.assertEqual([item["role"] for item in repair_messages], ["system", "user"])
+        repair_payload = json.loads(repair_messages[1]["content"])
+        self.assertEqual(
+            repair_payload["failure"]["stable_code"],
+            "model_supplied_location_forbidden",
+        )
+        self.assertEqual(
+            repair_payload["failure"]["violation_kind"], "evidence_marker"
+        )
+        repair_serialized = json.dumps(repair_messages, sort_keys=True)
+        self.assertNotIn("PRIVATE_CANDIDATE", repair_serialized)
+        self.assertNotIn(original, repair_serialized)
+        self.assertNotIn("src/auth.py", repair_serialized)
+
+    def test_failed_location_repair_remains_non_grounded(self):
+        planner = ScriptedPlanner(
+            [decision("continue", "search_code", {"query": "authenticate_user"})]
+        )
+        invalid = _structured("Fact [E1]", ["A1"])
+        llm = _FinalAnswerLlm([invalid, invalid])
+        recorder = SmokeDiagnosticsRecorder()
+
+        result = self._run(
+            planner,
+            llm,
+            limits=replace(AgentLimits(), max_tool_calls=1),
+            recorder=recorder,
+        )
+
+        diagnostics = recorder.snapshot()
+        self.assertEqual(result["agent_status"], "final_answer_failed")
+        self.assertEqual(result["answer_mode"], "deterministic")
+        self.assertNotEqual(result["answer_mode"], "llm_grounded")
+        self.assertEqual(llm.calls, 2)
+        self.assertTrue(diagnostics["final_answer_repair_attempted"])
+        self.assertFalse(diagnostics["final_answer_repair_succeeded"])
+
+    def test_provider_failure_during_repair_is_not_citation_failure(self):
+        planner = ScriptedPlanner(
+            [decision("continue", "search_code", {"query": "authenticate_user"})]
+        )
+        invalid = _structured("Fact [E1]", ["A1"])
+        provider_error = ProviderError(
+            "provider_unavailable",
+            "The generation provider is unavailable.",
+            retryable=True,
+            status_code=503,
+        )
+        llm = _FinalAnswerLlm([invalid, provider_error])
+        recorder = SmokeDiagnosticsRecorder()
+
+        with self.assertRaises(ProviderError) as raised:
+            self._run(
+                planner,
+                llm,
+                limits=replace(AgentLimits(), max_tool_calls=1),
+                recorder=recorder,
+            )
+
+        diagnostics = recorder.snapshot()
+        self.assertEqual(raised.exception.code, "provider_unavailable")
+        self.assertEqual(llm.calls, 2)
+        self.assertTrue(diagnostics["final_answer_repair_attempted"])
+        self.assertFalse(diagnostics["final_answer_repair_protocol_succeeded"])
+        self.assertFalse(diagnostics["final_answer_repair_succeeded"])
+        self.assertEqual(
+            diagnostics["final_answer_repair_failure"]["stable_code"],
+            "provider_failed",
+        )
+        self.assertEqual(
+            diagnostics["final_answer_failure_reason_code"], "provider_failed"
+        )
+        self.assertNotIn("citation_failure_reason_code", diagnostics)
+
+    def test_deadline_before_repair_call_does_not_record_attempt(self):
+        outcome = retrieve_code(
+            self.database,
+            disabled_embedding_service(),
+            self.project_id,
+            "authenticate_user",
+            evidence_count=1,
+        )
+        evidence = EvidenceBuilder().build(
+            outcome.results,
+            self.bundle["project"],
+            retrieval_strategy_version=outcome.retrieval_strategy_version,
+        )
+        llm = _FinalAnswerLlm(_structured("Rejected [E1]"))
+        recorder = SmokeDiagnosticsRecorder()
+
+        # Six checks/build-time reads remain within budget.  The seventh is
+        # the repair logical-call boundary after its messages are complete.
+        with patch(
+            "app.services.qa_agent.time.monotonic",
+            side_effect=[0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 2.0],
+        ):
+            with self.assertRaises(ProviderError) as raised:
+                answer_from_evidence(
+                    "authenticate_user",
+                    evidence,
+                    llm,
+                    self.database,
+                    retrieval_mode=outcome.retrieval_mode,
+                    diagnostics_recorder=recorder,
+                    request_deadline_at=1.0,
+                )
+
+        diagnostics = recorder.snapshot()
+        self.assertEqual(raised.exception.code, "deadline_exceeded")
+        self.assertEqual(llm.calls, 1)
+        self.assertFalse(diagnostics.get("final_answer_repair_attempted", False))
+        self.assertFalse(
+            diagnostics.get("final_answer_repair_protocol_succeeded", False)
+        )
+        self.assertFalse(diagnostics.get("final_answer_repair_succeeded", False))
+        self.assertNotIn("final_answer_repair_failure", diagnostics)
+
+    def test_repair_reuses_one_absolute_request_deadline(self):
+        outcome = retrieve_code(
+            self.database,
+            disabled_embedding_service(),
+            self.project_id,
+            "authenticate_user",
+            evidence_count=1,
+        )
+        evidence = EvidenceBuilder().build(
+            outcome.results,
+            self.bundle["project"],
+            retrieval_strategy_version=outcome.retrieval_strategy_version,
+        )
+        class _DeadlineCaptureLlm(LLMClient):
+            def __init__(self):
+                super().__init__(
+                    LLMSettings(
+                        provider="openai_compatible",
+                        base_url="https://provider.invalid/v1",
+                        api_key="test-placeholder",
+                        model="configured-model",
+                        max_retries=0,
+                    )
+                )
+                self.responses = [
+                    _structured("Rejected [E1]"),
+                    _structured("Repaired answer"),
+                ]
+                self.calls = 0
+                self.messages = []
+                self.kwargs = []
+
+            def chat(self, messages, **kwargs):
+                self.messages.append(messages)
+                self.kwargs.append(kwargs)
+                value = self.responses[self.calls]
+                self.calls += 1
+                return value
+
+        llm = _DeadlineCaptureLlm()
+        deadline = time.monotonic() + 60
+
+        result = answer_from_evidence(
+            "authenticate_user",
+            evidence,
+            llm,
+            self.database,
+            retrieval_mode=outcome.retrieval_mode,
+            request_deadline_at=deadline,
+        )
+
+        self.assertEqual(result["answer_mode"], "llm_grounded")
+        self.assertEqual(llm.calls, 2)
+        self.assertEqual(
+            [item["deadline_monotonic"] for item in llm.kwargs],
+            [deadline, deadline],
+        )
+        repair_payload = json.loads(llm.messages[1][1]["content"])
+        self.assertGreater(repair_payload["remaining_deadline_ms"], 0)
+        self.assertLessEqual(repair_payload["remaining_deadline_ms"], 60_000)
+
+    def test_concurrent_repairs_keep_request_ids_counts_and_flags_isolated(self):
+        def execute(responses):
+            planner = ScriptedPlanner(
+                [decision("continue", "search_code", {"query": "authenticate_user"})]
+            )
+            llm = _FinalAnswerLlm(responses)
+            recorder = SmokeDiagnosticsRecorder()
+            result = self._run(
+                planner,
+                llm,
+                limits=replace(AgentLimits(), max_tool_calls=1),
+                recorder=recorder,
+            )
+            return result, recorder.snapshot(), llm.calls
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            successful = executor.submit(
+                execute,
+                [_structured("First [E1]"), _structured("First repaired")],
+            )
+            failed = executor.submit(
+                execute,
+                [_structured("Second [E1]"), _structured("Second [E2]")],
+            )
+            first_result, first_diagnostics, first_calls = successful.result()
+            second_result, second_diagnostics, second_calls = failed.result()
+
+        self.assertNotEqual(first_result["request_id"], second_result["request_id"])
+        self.assertEqual((first_calls, second_calls), (2, 2))
+        self.assertTrue(first_diagnostics["final_answer_repair_attempted"])
+        self.assertTrue(first_diagnostics["final_answer_repair_protocol_succeeded"])
+        self.assertTrue(first_diagnostics["final_answer_repair_succeeded"])
+        self.assertTrue(second_diagnostics["final_answer_repair_attempted"])
+        self.assertFalse(second_diagnostics["final_answer_repair_protocol_succeeded"])
+        self.assertFalse(second_diagnostics["final_answer_repair_succeeded"])
+        self.assertEqual(first_result["agent_status"], "completed")
+        self.assertEqual(second_result["agent_status"], "final_answer_failed")
 
     def test_tool_budget_exhausted_without_evidence_does_not_call_final_answer(self):
         planner = ScriptedPlanner([
@@ -212,7 +471,7 @@ class AgentFinalizationTests(unittest.TestCase):
         self.assertEqual(len(result["evidence"]), 1)
         self.assertEqual(len(result["citations"]), 1)
         self.assertNotIn("E999", result["answer"])
-        self.assertEqual(llm.calls, 1)
+        self.assertEqual(llm.calls, 2)
 
     def test_missing_candidate_citation_has_fixed_reason_and_keeps_fallback_count_separate(self):
         planner = ScriptedPlanner(
