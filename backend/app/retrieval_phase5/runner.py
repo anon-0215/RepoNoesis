@@ -7,7 +7,7 @@ import sqlite3
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 from app.database import Database
 from app.m5.contracts import RepositorySpec, Scenario
@@ -16,9 +16,12 @@ from app.retrieval_phase5.contracts import (
     FROZEN_PATHS,
     MATCHER_DEFINITION,
     FrozenPath,
+    ManifestError,
     canonical_hash,
     ensure_formal_embedding_identity,
     file_hash,
+    frozen_text_hash,
+    read_frozen_text,
 )
 from app.retrieval_phase5.metrics import evaluate_query
 from app.services.agent_contracts import AgentLimits, CancellationToken, SearchCodeInput
@@ -63,19 +66,35 @@ class CountingEmbeddingService:
     def settings(self) -> Any:
         return self.service.settings
 
-    def encode_query(self, text: str, local_files_only: bool = False) -> list[float]:
+    def encode_query(
+        self,
+        text: str,
+        local_files_only: bool = False,
+        *,
+        check_active: Callable[[], None] | None = None,
+    ) -> list[float]:
         self.query_encode_calls += 1
         self.query_encode_items += 1
-        return self.service.encode_query(text, local_files_only=local_files_only)
+        return self.service.encode_query(
+            text,
+            local_files_only=local_files_only,
+            check_active=check_active,
+        )
 
     def encode_documents(
         self,
         texts: list[str],
         local_files_only: bool = False,
+        *,
+        check_active: Callable[[], None] | None = None,
     ) -> list[list[float]]:
         self.document_encode_calls += 1
         self.document_encode_items += len(texts)
-        return self.service.encode_documents(texts, local_files_only=local_files_only)
+        return self.service.encode_documents(
+            texts,
+            local_files_only=local_files_only,
+            check_active=check_active,
+        )
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self.service, name)
@@ -86,21 +105,21 @@ def load_click_benchmark(dataset_directory: Path) -> ClickBenchmarkSnapshot:
     manifest_path = directory / "manifest.json"
     repositories_path = directory / "repositories.json"
     scenarios_path = directory / "scenarios.jsonl"
-    manifest = _read_json(manifest_path)
-    repositories_raw = _read_json(repositories_path)
+    manifest, manifest_hash = _read_frozen_json(manifest_path)
+    repositories_raw, repositories_hash = _read_frozen_json(repositories_path)
     if not isinstance(repositories_raw, list):
         raise Phase5RunError("benchmark repositories must be a JSON array")
     repositories = [RepositorySpec.model_validate(item) for item in repositories_raw]
     click = [item for item in repositories if item.repo_id == "click"]
     if len(click) != 1:
         raise Phase5RunError("benchmark must contain exactly one Click repository")
+    scenario_records, scenarios_hash = _read_frozen_jsonl(scenarios_path)
     scenarios = tuple(
         sorted(
             (
-                Scenario.model_validate(json.loads(line))
-                for line in scenarios_path.read_text(encoding="utf-8").splitlines()
-                if line.strip()
-                and json.loads(line).get("repo_id") == "click"
+                Scenario.model_validate(item)
+                for item in scenario_records
+                if item.get("repo_id") == "click"
             ),
             key=lambda item: item.scenario_id,
         )
@@ -110,9 +129,9 @@ def load_click_benchmark(dataset_directory: Path) -> ClickBenchmarkSnapshot:
     if any(item.repository_revision != click[0].exact_commit_sha for item in scenarios):
         raise Phase5RunError("Click query/gold revisions do not match the repository revision")
     dataset_identity = {
-        "manifest_sha256": file_hash(manifest_path),
-        "repositories_sha256": file_hash(repositories_path),
-        "scenarios_sha256": file_hash(scenarios_path),
+        "manifest_sha256": manifest_hash,
+        "repositories_sha256": repositories_hash,
+        "scenarios_sha256": scenarios_hash,
         "dataset_version": manifest.get("dataset_version"),
         "selection": {"repo_id": "click", "scenario_ids": [item.scenario_id for item in scenarios]},
     }
@@ -390,7 +409,10 @@ class Phase5Harness:
         if not self.formal:
             return
         if query_encode_count != 1:
-            raise Phase5RunError("formal answerable query must encode exactly once")
+            raise Phase5RunError(
+                "formal answerable query encode count mismatch: "
+                f"expected=1 actual={query_encode_count}"
+            )
         warning_text = " ".join(warnings).casefold()
         forbidden = ("dense retrieval unavailable", "semantic retrieval unavailable", "embeddings are disabled")
         if any(value in warning_text for value in forbidden):
@@ -492,8 +514,18 @@ class Phase5Harness:
         }
 
 
-def _read_json(path: Path) -> Any:
+def _read_frozen_json(path: Path) -> tuple[Any, str]:
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+        content = read_frozen_text(path)
+        return json.loads(content), frozen_text_hash(content)
+    except (ManifestError, json.JSONDecodeError) as exc:
+        raise Phase5RunError(f"unable to read benchmark file: {path.name}") from exc
+
+
+def _read_frozen_jsonl(path: Path) -> tuple[list[dict[str, Any]], str]:
+    try:
+        content = read_frozen_text(path)
+        records = [json.loads(line) for line in content.splitlines() if line.strip()]
+        return records, frozen_text_hash(content)
+    except (ManifestError, json.JSONDecodeError) as exc:
         raise Phase5RunError(f"unable to read benchmark file: {path.name}") from exc

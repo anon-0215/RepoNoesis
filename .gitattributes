@@ -1,0 +1,4 @@
+benchmarks/m5/**/*.json text eol=lf
+benchmarks/m5/**/*.jsonl text eol=lf
+benchmarks/retrieval_v2_phase6/*.json text eol=lf
+benchmarks/retrieval_v2_phase6/*.jsonl text eol=lf

@@ -5,10 +5,9 @@ import json
 import math
 from collections import Counter, defaultdict
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterable
 
 from app.retrieval_phase5.contracts import (
-    FORMAL_TOP_K,
     FROZEN_PATHS,
     canonical_hash,
     canonical_json,
@@ -17,9 +16,31 @@ from app.retrieval_phase5.contracts import (
 from app.retrieval_phase5.metrics import classify_failures
 from app.retrieval_phase6.metrics import aggregate_cross_repository
 from app.retrieval_phase6.metrics import repository_stratified_compare
+from app.retrieval_phase6.contracts import PHASE6_FORMAL_TOP_K
 
 
 COMPARISON_PAIRS = (("A", "B"), ("B", "C"), ("B", "D"), ("C", "E"), ("D", "E"))
+
+PHASE5_TO_PHASE6_FAILURE = {
+    "all paths hit": "all paths hit",
+    "all paths miss": "all paths miss",
+    "v2 fixes v1": "v2 fixes v1",
+    "v2 regresses v1": "v2 regresses v1",
+    "hierarchy gain": "hierarchy gain",
+    "hierarchy noise": "hierarchy noise",
+    "relation gain": "relation new strict gain",
+    "relation noise": "relation noise",
+    "hierarchy + relation complementary": "relation new strict gain",
+    "hierarchy + relation conflict": "relation gold loss",
+    "matcher limitation": "matcher limitation",
+    "relation unavailable": "relation opportunity uncovered",
+    "budget truncation": "budget truncation",
+    "ambiguous relation target": "external/unresolved/ambiguous/stale",
+    "external relation": "external/unresolved/ambiguous/stale",
+    "stale relation graph": "external/unresolved/ambiguous/stale",
+    "scope conflict": "external/unresolved/ambiguous/stale",
+    "slot-cap suppression": "slot-cap suppression",
+}
 
 
 def validate_cross_repository_matrix(
@@ -46,7 +67,7 @@ def validate_cross_repository_matrix(
             for item in records:
                 if item.get("repository_id") != repo or item.get("path_id") != path:
                     raise ValueError("record repository/path attribution is inconsistent")
-                if not item.get("skipped") and int(item.get("top_k", 0)) != FORMAL_TOP_K:
+                if not item.get("skipped") and int(item.get("top_k", 0)) != PHASE6_FORMAL_TOP_K:
                     raise ValueError("result matrix changed the frozen top-k")
     return {
         "repository_count": len(records_by_repo_path),
@@ -196,6 +217,10 @@ def write_phase6_artifacts(
     determinism: dict[str, Any],
 ) -> dict[str, Any]:
     root.mkdir(parents=True, exist_ok=True)
+    taxonomy = manifest.get("failure_taxonomy")
+    if not isinstance(taxonomy, list) or not taxonomy:
+        raise ValueError("Phase 6 artifact manifest requires the frozen failure taxonomy")
+    allowed_failures = frozenset(str(item) for item in taxonomy)
     validation = validate_cross_repository_matrix(records_by_repo_path)
     aggregate = aggregate_cross_repository(records_by_repo_path)
     comparisons = []
@@ -222,10 +247,21 @@ def write_phase6_artifacts(
     by_query: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
     for item in flat:
         by_query[(str(item["repository_id"]), str(item["query_id"]))].append(item)
-    failures = [
-        {"repository_id": repo, **classify_failures(records)}
-        for (repo, _query), records in sorted(by_query.items())
-    ]
+    failures = []
+    for (repo, _query), records in sorted(by_query.items()):
+        failure = classify_failures(records)
+        failure["categories"] = adapt_phase6_failure_categories(
+            failure.get("categories") or [],
+            allowed_failures,
+        )
+        failures.append({"repository_id": repo, **failure})
+    emitted = {
+        category
+        for failure in failures
+        for category in failure["categories"]
+    }
+    if not emitted.issubset(allowed_failures):
+        raise ValueError("failure_cases.json contains a category outside the frozen taxonomy")
     invalid_evidence = sum(int((item.get("citation_validation") or {}).get("invalid") or 0) for item in flat)
     invalid_relations = sum(int((item.get("relation_validation") or {}).get("invalid") or 0) for item in flat)
     validation.update(
@@ -265,6 +301,21 @@ def write_phase6_artifacts(
     immutable_write_json(root / "result_hashes.json", value)
     _write_text(root / "report.md", _report(manifest, aggregate, comparisons, diagnostics, validation, value["result_hash"]))
     return value
+
+
+def adapt_phase6_failure_categories(
+    categories: Iterable[str],
+    allowed: frozenset[str],
+) -> list[str]:
+    output: set[str] = set()
+    for category in categories:
+        mapped = PHASE5_TO_PHASE6_FAILURE.get(str(category))
+        if mapped is None:
+            raise ValueError(f"unmapped Phase 5 failure category: {category}")
+        if mapped not in allowed:
+            raise ValueError(f"mapped failure category is outside the frozen Phase 6 taxonomy: {mapped}")
+        output.add(mapped)
+    return sorted(output)
 
 
 def _grouped_diagnostics(

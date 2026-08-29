@@ -30,7 +30,11 @@ from app.retrieval_phase5.runtime import (
 )
 from app.retrieval_phase6 import EVALUATION_VERSION
 from app.retrieval_phase6.artifacts import write_phase6_artifacts
-from app.retrieval_phase6.contracts import Phase6BenchmarkSnapshot, load_phase6_benchmark
+from app.retrieval_phase6.contracts import (
+    Phase6BenchmarkSnapshot,
+    load_phase6_benchmark,
+    phase6_path_label,
+)
 from app.retrieval_phase6.runner import Phase6Harness, phase6_determinism_summary
 from app.services.embedding_indexer import EmbeddingIndexer
 from app.services.embedding_service import EmbeddingService
@@ -178,6 +182,7 @@ def run_formal_evaluation(config: RuntimeConfig) -> dict[str, Any]:
             scenarios_by_repo=benchmark.scenarios_by_repo,
             strata_by_query=benchmark.strata_by_query,
             formal=True,
+            formal_top_k=benchmark.formal_top_k,
         )
         forward = harness.run_matrix(
             repo_order=list(benchmark.repository_ids),
@@ -204,6 +209,7 @@ def run_formal_evaluation(config: RuntimeConfig) -> dict[str, Any]:
             scenarios_by_repo=subset_scenarios,
             strata_by_query=subset_strata,
             formal=True,
+            formal_top_k=benchmark.formal_top_k,
         ).run_matrix(
             repo_order=list(reversed(benchmark.repository_ids)),
             path_order=["D", "A", "E", "B", "C"],
@@ -327,6 +333,7 @@ def _build_manifest(
         "branch": _git(root, "branch", "--show-current"),
         "benchmark_commit": _git(root, "rev-parse", "f559fda248015e8107fb87aa4922ca1483c739b3^{commit}"),
         "benchmark_version": frozen["benchmark_version"],
+        "frozen_text_hash_policy": frozen["frozen_text_hash_policy"],
         "dataset_hash": frozen["dataset_hash"],
         "query_hash": frozen["query_hash"],
         "gold_hash": frozen["gold_hash"],
@@ -354,8 +361,15 @@ def _build_manifest(
         "source_database_path": str(source_database.resolve()),
         "source_database_hash": source_database_hash,
         "historical_embedding_rows_removed_from_copy": historical_rows,
-        "retrieval_paths": [{"path_id": item.path_id, "label": item.label, **item.request_parameters} for item in FROZEN_PATHS],
-        "formal_top_k": 8,
+        "retrieval_paths": [
+            {
+                "path_id": item.path_id,
+                "label": phase6_path_label(item.path_id, item.label),
+                **item.request_parameters,
+            }
+            for item in FROZEN_PATHS
+        ],
+        "formal_top_k": benchmark.formal_top_k,
         "top_k_values": [1, 3, 5, 8],
         "metrics": ["hit_at_1", "hit_at_3", "hit_at_5", "hit_at_8", "mrr_at_8", "recall_at_8", "ndcg_at_8"],
         "aggregation": ["per_repository", "micro", "macro", "primary_stratum"],
@@ -375,6 +389,7 @@ def _build_manifest(
         "model_download_allowed": False,
         "dependency_changes_allowed": False,
         "production_retrieval_changes": "none",
+        "failure_taxonomy": list(benchmark.failure_taxonomy),
     }
 
 

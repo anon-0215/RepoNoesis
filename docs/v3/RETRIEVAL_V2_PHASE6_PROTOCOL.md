@@ -95,7 +95,7 @@ separators, no NaN, and SHA-256.
 | Identity | SHA-256 |
 | --- | --- |
 | repository | `1b64c648231ffd792fd05070b8599ac73d5c944eabcc1175272353bf44355d5d` |
-| dataset | `44291240a1874899adfc4978be7fbdda3fd2bfd1ef1bc8fe31cc523777a7643a` |
+| dataset | `f65d3544d520b3d71de151f15eb7963c1e2595f0872185885fb9d003b8d380b1` |
 | query | `ddf738c7dc5a6a5cb1666a65cb371d37d6bfb81e440ebf539627351f891e4b67` |
 | gold | `29b8ac2613bd33a644da09615e4d7a1f8a69e8e53314f7281137989fe4931181` |
 | matcher | `169b0515ffcdd889212f88cc51430ac8b706eb25817e7647e7b064b45a405cb6` |
@@ -106,6 +106,53 @@ The matcher hash is exactly the Phase 5 matcher hash. Containment remains a
 diagnostic only. Correct file/wrong chunk and correct symbol/wrong span remain
 strict misses. Unanswerable queries are skipped and excluded from quality
 denominators.
+
+### Frozen-text transport and finite loader contract
+
+Frozen benchmark JSON and JSONL are strict UTF-8 text; a UTF-8 BOM is invalid.
+For component-file hashing, the loader normalizes only CRLF and standalone CR
+to LF, then hashes the resulting UTF-8 bytes. It does not normalize Unicode,
+trim whitespace, reorder JSON keys, or parse/reserialize content for this hash.
+The policy identifier is `utf8-lf-v1`. This is a transport-level identity
+policy, not a semantic-identity framework.
+Each loader parses the same normalized bytes it hashed and reads each frozen
+file only once per load.
+
+Narrow `.gitattributes` rules keep JSON/JSONL under `benchmarks/m5/` and
+`benchmarks/retrieval_v2_phase6/` at LF on checkout. The loader policy remains
+the runtime guarantee. Benchmark business content and the checked-in LF
+component hashes do not change. The former Click identity
+`1e658877c9b0aa9481700fa09868242b596b4a9c818db9e3159e192825155eb3`
+came from Windows CRLF materialization. The active `utf8-lf-v1` Click identity
+is `40bbc1f2c39a94e5c9d02e949c6fefdc5fe79c0e6b46ff0666448656c1a2f32f`;
+the directly derived Phase 6 dataset identity changes from
+`44291240a1874899adfc4978be7fbdda3fd2bfd1ef1bc8fe31cc523777a7643a`
+to `f65d3544d520b3d71de151f15eb7963c1e2595f0872185885fb9d003b8d380b1`.
+Query, gold, matcher, repository, strata, and protocol identities remain
+unchanged.
+
+Runs produced under the legacy identities remain historical results under
+those identities. This migration does not relabel or rerun them. Publishing
+formal results for the active LF identities required a new benchmark run; no
+benchmark was run as part of the R1 migration itself. The later R3 controlled
+formal run completed under the active identities and is recorded separately in
+`RETRIEVAL_V2_PHASE6_RESULTS.md`. It does not relabel or overwrite the legacy
+result.
+
+The Phase 6 loader and runtime bind `formal_top_k` to 8. Phase 6 Path E is
+reported as `hierarchy + relation`; the unchanged Phase 5 Path E label remains
+`v2 + hierarchy + relation`. Multi-gold matching is an atomic OR over complete
+source-span candidates: fields from different candidates cannot be combined.
+
+Repository paths receive only deterministic baseline validation: they must be
+non-empty and repository-relative, and cannot be POSIX absolute, drive
+qualified, UNC, or contain a `..` escape segment. The loader does not resolve
+paths or require live files. Required repository revisions are non-empty and
+must agree across the manifest, repository declaration, queries, gold
+candidates, and applicable graph declaration; no network commit lookup occurs.
+Final `failure_cases.json` categories are adapted deterministically from the
+existing Phase 5 classifier and must belong to the frozen Phase 6 taxonomy in
+`protocol.json`; unknown classifier output fails closed.
 
 ## Frozen five paths
 
@@ -120,7 +167,7 @@ denominators.
 Every repository/path/query cell receives a fresh server-bound context. A
 request, query, Planner, source file, prior run, path order, query order, or
 repository order cannot override the frozen mode. Both repositories share the
-same strict matcher, Top K 8, metric definitions, real provider contract, and
+same strict matcher, formal Top K 8, metric definitions, real provider contract, and
 model revision.
 
 ## Metrics and paired comparisons
@@ -196,15 +243,52 @@ guard with Hugging Face and Transformers offline settings; network attempts,
 downloads, dependency drift, provider fallback, graph revision drift, or
 model revision drift fail the run.
 
+## Reproducible formal CLI
+
+Run from the repository's `backend` working directory with an existing Python
+environment and fixed local inputs. The placeholders are intentionally
+portable and must be replaced for the local host:
+
+```powershell
+$env:REPONOESIS_SKIP_ENV_FILE = '1'
+$env:PYTHONDONTWRITEBYTECODE = '1'
+$env:HF_HUB_OFFLINE = '1'
+$env:TRANSFORMERS_OFFLINE = '1'
+$env:HF_DATASETS_OFFLINE = '1'
+
+<PYTHON> -B -m app.retrieval_phase6 `
+  --phase6-benchmark <PHASE6_BENCHMARK_DIR> `
+  --click-dataset <CLICK_DATASET_DIR> `
+  --source-database <SOURCE_DATABASE> `
+  --model-snapshot <MODEL_SNAPSHOT> `
+  --artifacts <ARTIFACTS_DIR>
+```
+
+- `<SOURCE_DATABASE>` is a read-only formal input. The runner copies it into
+  the run directory and evaluates the copy; it must not modify the source.
+- `<MODEL_SNAPSHOT>` must resolve to the fixed local model snapshot. Missing
+  models must not be downloaded.
+- `<ARTIFACTS_DIR>` must be a new empty directory outside the Git worktree.
+- Formal execution is offline. Provider calls, `/ask`, and network access are
+  outside this protocol.
+- After completion, reload the frozen inputs with the production loader and
+  pass the emitted matrix through the production
+  `validate_cross_repository_matrix` validator. Recompute and compare every
+  file listed in `result_hashes.json`.
+- Never reuse or overwrite a partial or completed run directory. Preserve a
+  failed partial run as diagnostic evidence and choose a new artifacts
+  directory for any separately authorized run.
+
 ## Freeze statement and execution order
 
-At this protocol freeze, no Phase 6 production retrieval has been run for
-HTTPX and no HTTPX rank has been viewed. The next allowed sequence is tests,
-minimal harness extension, fake-provider contract verification, full backend
-regression with embeddings disabled, real offline provider smoke, isolated
-HTTPX embedding generation, two-repository five-path evaluation,
+At the original protocol freeze, no Phase 6 production retrieval had been run
+for HTTPX and no HTTPX rank had been viewed. The preregistered sequence was
+tests, minimal harness extension, fake-provider contract verification, full
+backend regression with embeddings disabled, real offline provider smoke,
+isolated HTTPX embedding generation, two-repository five-path evaluation,
 deterministic replay, immutable results, final regression, static audit, and a
-separate final local commit. The frozen benchmark commit is not amended.
+separate final local commit. R3 subsequently completed the formal evaluation;
+the frozen benchmark commit was not amended.
 
 No push, merge, tag, reranker, multi-hop relation, filtering/weight tuning, or
 Phase 7 work is authorized.

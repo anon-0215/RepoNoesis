@@ -28,6 +28,7 @@ BGE_M3_SNAPSHOT_REVISION = "5617a9f61b028005a4858fdac845db406aefb181"
 MATCHER_NAME = "strict_source_span_identity"
 MATCHER_VERSION = "strict_source_span_identity_v1@1"
 GOLD_GRANULARITY = "repository_revision+path+qualified_symbol+exact_span+content_hash"
+FROZEN_TEXT_HASH_POLICY = "utf8-lf-v1"
 
 
 class ManifestError(ValueError):
@@ -122,6 +123,25 @@ def file_hash(path: Path) -> str:
     return digest.hexdigest()
 
 
+def read_frozen_text(path: Path) -> bytes:
+    """Read frozen text once and apply only the transport newline policy."""
+    try:
+        raw = path.read_bytes()
+    except OSError as exc:
+        raise ManifestError(f"unable to read frozen text: {path.name}") from exc
+    if raw.startswith(b"\xef\xbb\xbf"):
+        raise ManifestError(f"frozen text must not contain a UTF-8 BOM: {path.name}")
+    try:
+        text = raw.decode("utf-8", errors="strict")
+    except UnicodeDecodeError as exc:
+        raise ManifestError(f"frozen text is not strict UTF-8: {path.name}") from exc
+    return text.replace("\r\n", "\n").replace("\r", "\n").encode("utf-8")
+
+
+def frozen_text_hash(content: bytes) -> str:
+    return hashlib.sha256(content).hexdigest()
+
+
 def ensure_formal_embedding_identity(
     identity: EffectiveEmbeddingIdentity,
     *,
@@ -202,6 +222,7 @@ def build_frozen_manifest(
         "dataset_name": "RepoNoesis M5 real-repository pilot / Click subset",
         "dataset_version": "pilot-v1",
         "dataset_hash": dataset_hash,
+        "frozen_text_hash_policy": FROZEN_TEXT_HASH_POLICY,
         "query_file": source_files["query_file"],
         "query_hash": query_hash,
         "gold_file": source_files["gold_file"],
