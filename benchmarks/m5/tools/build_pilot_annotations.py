@@ -604,11 +604,13 @@ def git(root: Path, *args):
 
 
 def write_json(path, value):
-    path.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    with path.open("w", encoding="utf-8", newline="\n") as handle:
+        handle.write(json.dumps(value, ensure_ascii=False, indent=2) + "\n")
 
 
 def write_jsonl(path, values):
-    path.write_text("".join(json.dumps(value, ensure_ascii=False, sort_keys=True) + "\n" for value in values), encoding="utf-8")
+    with path.open("w", encoding="utf-8", newline="\n") as handle:
+        handle.write("".join(json.dumps(value, ensure_ascii=False, sort_keys=True) + "\n" for value in values))
 
 
 if __name__ == "__main__":

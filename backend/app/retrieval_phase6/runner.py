@@ -6,8 +6,12 @@ from typing import Any, Iterable
 
 from app.database import Database
 from app.m5.contracts import Scenario
-from app.retrieval_phase5.contracts import FROZEN_PATHS
+from app.retrieval_phase5.contracts import FORMAL_TOP_K, FROZEN_PATHS
 from app.retrieval_phase5.runner import CountingEmbeddingService, Phase5Harness
+from app.retrieval_phase6.contracts import (
+    PHASE6_FORMAL_TOP_K,
+    phase6_path_label,
+)
 from app.services.embedding_service import EmbeddingService
 
 
@@ -21,7 +25,11 @@ class Phase6Harness:
         scenarios_by_repo: dict[str, Iterable[Scenario]],
         strata_by_query: dict[str, str],
         formal: bool,
+        formal_top_k: int = PHASE6_FORMAL_TOP_K,
     ) -> None:
+        if formal_top_k != PHASE6_FORMAL_TOP_K or FORMAL_TOP_K != PHASE6_FORMAL_TOP_K:
+            raise ValueError("Phase 6 execution requires formal_top_k=8")
+        self.formal_top_k = formal_top_k
         if set(projects_by_repo) != set(scenarios_by_repo):
             raise ValueError("project and scenario repository sets must match")
         self.database = database
@@ -85,6 +93,7 @@ class Phase6Harness:
                         **item,
                         "repository_id": repo,
                         "primary_stratum": self.strata_by_query[item["query_id"]],
+                        "path_label": phase6_path_label(path, str(item.get("path_label", ""))),
                     }
                     for item in records
                 ]

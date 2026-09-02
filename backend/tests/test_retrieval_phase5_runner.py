@@ -4,18 +4,21 @@ import hashlib
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from app.database import Database
 from app.m5.contracts import Scenario
 from app.m5.embedding import fake_embedding_service
 from app.retrieval_phase5.contracts import FROZEN_PATHS
 from app.retrieval_phase5.runner import (
+    CountingEmbeddingService,
     Phase5Harness,
     Phase5RunError,
     load_click_benchmark,
     relation_graph_identity,
 )
 from app.services.embedding_indexer import EmbeddingIndexer
+from app.services.semantic_retriever import SemanticRetriever
 from tests.m3_helpers import call_chain_sources, make_relation_project
 
 
@@ -107,6 +110,73 @@ class RetrievalPhase5RunnerTests(unittest.TestCase):
                 [item["chunk_identity"] for item in reverse[path][0]["candidates"]],
             )
             self.assertTrue(all(item["citation_validation"] == "valid" for item in forward[path][0]["candidates"]))
+            self.assertEqual(forward[path][0]["retrieval_mode"], "hybrid")
+            self.assertEqual(reverse[path][0]["retrieval_mode"], "hybrid")
+            self.assertEqual(forward[path][0]["query_encode_count"], 1)
+            self.assertEqual(reverse[path][0]["query_encode_count"], 1)
+
+    def test_counting_embedding_service_matches_production_call_shapes(self):
+        counting_service = CountingEmbeddingService(self.embedding_service)
+        cancellation_checks: list[None] = []
+
+        def check_active() -> None:
+            cancellation_checks.append(None)
+
+        with patch.object(
+            self.embedding_service,
+            "encode_query",
+            wraps=self.embedding_service.encode_query,
+        ) as encode_query:
+            outcome = SemanticRetriever(self.database, counting_service).search(
+                self.project_id,
+                "Where is function a defined?",
+                check_active=check_active,
+            )
+
+        self.assertEqual(outcome.status, "ok")
+        encode_query.assert_called_once()
+        self.assertIs(encode_query.call_args.kwargs["check_active"], check_active)
+        self.assertEqual(counting_service.query_encode_calls, 1)
+        self.assertEqual(counting_service.query_encode_items, 1)
+        self.assertGreater(len(cancellation_checks), 0)
+
+        with patch.object(
+            self.embedding_service,
+            "encode_documents",
+            wraps=self.embedding_service.encode_documents,
+        ) as encode_documents:
+            vectors = counting_service.encode_documents(
+                ["def a():\n    return 1"],
+                check_active=check_active,
+            )
+
+        self.assertEqual(len(vectors), 1)
+        encode_documents.assert_called_once()
+        self.assertIs(encode_documents.call_args.kwargs["check_active"], check_active)
+        self.assertEqual(counting_service.document_encode_calls, 1)
+        self.assertEqual(counting_service.document_encode_items, 1)
+
+    def test_formal_encode_count_error_reports_expected_and_actual(self):
+        harness = Phase5Harness(
+            database=self.database,
+            embedding_service=self.embedding_service,
+            project_id=self.project_id,
+            scenarios=[_scenario()],
+            formal=False,
+        )
+        harness.formal = True
+
+        with self.assertRaisesRegex(Phase5RunError, r"expected=1 actual=0"):
+            harness._validate_cell(
+                path=FROZEN_PATHS[0],
+                payload={},
+                audit={},
+                relation_audit={},
+                warnings=[],
+                query_encode_count=0,
+                invalid_evidence_count=0,
+                invalid_chain_count=0,
+            )
 
     def test_formal_mode_rejects_fake_provider_and_revision_mismatch(self):
         with self.assertRaises(Phase5RunError):

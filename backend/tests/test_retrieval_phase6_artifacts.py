@@ -6,10 +6,26 @@ import unittest
 from pathlib import Path
 
 from app.retrieval_phase6.artifacts import (
+    PHASE5_TO_PHASE6_FAILURE,
+    adapt_phase6_failure_categories,
     build_applicability_diagnostics,
     validate_cross_repository_matrix,
     write_phase6_artifacts,
 )
+
+
+ROOT = Path(__file__).resolve().parents[2]
+FROZEN_TAXONOMY = json.loads(
+    (ROOT / "benchmarks" / "retrieval_v2_phase6" / "protocol.json").read_text(encoding="utf-8")
+)["failure_taxonomy"]
+
+
+def _manifest() -> dict:
+    return {
+        "evaluation_version": "retrieval-v2-phase6@1",
+        "timestamp": "fixed",
+        "failure_taxonomy": FROZEN_TAXONOMY,
+    }
 
 
 def _record(repo: str, path: str, query: str, stratum: str, hit: float, *, relation=False, hierarchy=False) -> dict:
@@ -91,7 +107,7 @@ class RetrievalPhase6ArtifactTests(unittest.TestCase):
             root = Path(directory)
             hashes = write_phase6_artifacts(
                 root,
-                manifest={"evaluation_version": "retrieval-v2-phase6@1", "timestamp": "fixed"},
+                manifest=_manifest(),
                 records_by_repo_path=self._matrix(),
                 determinism={"passed": True, "mismatches": []},
             )
@@ -100,13 +116,37 @@ class RetrievalPhase6ArtifactTests(unittest.TestCase):
             self.assertEqual(set(aggregate), {"per_repository", "micro", "macro", "strata"})
             self.assertTrue((root / "applicability_diagnostics.json").is_file())
             self.assertTrue((root / "query_results.jsonl").is_file())
+            failures = json.loads((root / "failure_cases.json").read_text(encoding="utf-8"))
+            categories = {category for failure in failures for category in failure["categories"]}
+            self.assertTrue(categories.issubset(set(FROZEN_TAXONOMY)))
+            self.assertIn("relation new strict gain", categories)
+            self.assertNotIn("relation gain", categories)
+            self.assertEqual(set(failures[0]), {"repository_id", "query_id", "categories", "path_hits"})
             with self.assertRaises(FileExistsError):
                 write_phase6_artifacts(
                     root,
-                    manifest={"evaluation_version": "retrieval-v2-phase6@1", "timestamp": "fixed"},
+                    manifest=_manifest(),
                     records_by_repo_path=self._matrix(),
                     determinism={"passed": True, "mismatches": []},
                 )
+
+    def test_phase5_failure_outputs_are_explicitly_mapped_and_unknowns_fail_closed(self):
+        self.assertEqual(
+            set(PHASE5_TO_PHASE6_FAILURE),
+            {
+                "all paths hit", "all paths miss", "v2 fixes v1", "v2 regresses v1",
+                "hierarchy gain", "hierarchy noise", "relation gain", "relation noise",
+                "hierarchy + relation complementary", "hierarchy + relation conflict",
+                "matcher limitation", "relation unavailable", "budget truncation",
+                "ambiguous relation target", "external relation", "stale relation graph",
+                "scope conflict", "slot-cap suppression",
+            },
+        )
+        allowed = frozenset(FROZEN_TAXONOMY)
+        mapped = adapt_phase6_failure_categories(PHASE5_TO_PHASE6_FAILURE, allowed)
+        self.assertTrue(set(mapped).issubset(allowed))
+        with self.assertRaisesRegex(ValueError, "unmapped"):
+            adapt_phase6_failure_categories(["new classifier output"], allowed)
 
 
 if __name__ == "__main__":

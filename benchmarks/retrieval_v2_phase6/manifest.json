@@ -3,14 +3,14 @@
   "click": {
     "answerable_query_count": 11,
     "chunk_count": 663,
-    "dataset_hash": "1e658877c9b0aa9481700fa09868242b596b4a9c818db9e3159e192825155eb3",
+    "dataset_hash": "40bbc1f2c39a94e5c9d02e949c6fefdc5fe79c0e6b46ff0666448656c1a2f32f",
     "gold_hash": "3c0a48e5d97c263da7005092c99cf169e6a61397ad0fc6eefc1cb33d2b7ed999",
     "query_count": 12,
     "query_hash": "f75606d93bb4614c40d34423139f29e889bb6b19072a51981d06b07b26c47c79",
     "repository_revision": "00e592cea702e0b2caa0dee42489fdb1c22cd845",
     "unanswerable_query_count": 1
   },
-  "dataset_hash": "44291240a1874899adfc4978be7fbdda3fd2bfd1ef1bc8fe31cc523777a7643a",
+  "dataset_hash": "f65d3544d520b3d71de151f15eb7963c1e2595f0872185885fb9d003b8d380b1",
   "evaluation_version": "retrieval-v2-phase6@1",
   "file_hashes_before_manifest": {
     "click_strata.json": "18150244217c03bb86af2832ad02694956a30c5de32c8271b8c34eb9e1cbe922",
@@ -24,6 +24,7 @@
   "formal_top_k": 8,
   "freeze_timestamp": "2026-08-01T08:44:16.6504719+00:00",
   "frozen": true,
+  "frozen_text_hash_policy": "utf8-lf-v1",
   "gold_hash": "29b8ac2613bd33a644da09615e4d7a1f8a69e8e53314f7281137989fe4931181",
   "httpx": {
     "answerable_query_count": 20,

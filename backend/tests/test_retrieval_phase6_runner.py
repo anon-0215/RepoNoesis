@@ -8,7 +8,10 @@ from pathlib import Path
 from app.database import Database
 from app.m5.contracts import Scenario
 from app.m5.embedding import fake_embedding_service
+from app.retrieval_phase5.contracts import FROZEN_PATHS
+from app.retrieval_phase6.contracts import load_phase6_benchmark
 from app.retrieval_phase6.runner import Phase6Harness, phase6_determinism_summary
+from app.retrieval_phase6.runtime import _build_manifest
 from app.services.embedding_indexer import EmbeddingIndexer
 from tests.m3_helpers import call_chain_sources, make_relation_project
 
@@ -80,6 +83,8 @@ class RetrievalPhase6RunnerTests(unittest.TestCase):
             for path in "ABCDE":
                 self.assertEqual(forward[repo][path][0]["repository_id"], repo)
                 self.assertEqual(forward[repo][path][0]["primary_stratum"], "symbol_focused")
+            self.assertEqual(forward[repo]["E"][0]["path_label"], "hierarchy + relation")
+        self.assertEqual(next(item.label for item in FROZEN_PATHS if item.path_id == "E"), "v2 + hierarchy + relation")
         self.assertTrue(phase6_determinism_summary(forward, reverse)["passed"])
 
     def test_global_query_identity_collision_is_rejected(self):
@@ -93,6 +98,51 @@ class RetrievalPhase6RunnerTests(unittest.TestCase):
                 strata_by_query={"click-phase6-test": "symbol_focused"},
                 formal=False,
             )
+
+    def test_phase6_top_k_is_bound_and_runtime_manifest_uses_validated_contract(self):
+        with self.assertRaisesRegex(ValueError, "formal_top_k=8"):
+            Phase6Harness(
+                database=self.database,
+                embedding_service=self.service,
+                projects_by_repo=self.projects,
+                scenarios_by_repo=self.scenarios,
+                strata_by_query=self.strata,
+                formal=False,
+                formal_top_k=9,
+            )
+        repository_root = Path(__file__).resolve().parents[2]
+        benchmark = load_phase6_benchmark(
+            repository_root / "benchmarks" / "retrieval_v2_phase6",
+            repository_root / "benchmarks" / "m5" / "datasets" / "pilot-v1",
+        )
+        sources = {
+            item["repository_id"]: {
+                "project_id": item["project_id"],
+                "repository_revision": item["resolved_commit"],
+                "chunk_count": item["chunk_count"],
+                "relation_graph": {},
+            }
+            for item in benchmark.repositories
+        }
+        manifest = _build_manifest(
+            benchmark=benchmark,
+            sources=sources,
+            source_database=Path(self.temp.name) / "source.sqlite",
+            source_database_hash="a" * 64,
+            model_snapshot=Path(self.temp.name) / "model",
+            embedding_identity={},
+            pooling={},
+            environment={},
+            index_results={repo: {} for repo in sources},
+            embedding_rows={repo: source["chunk_count"] for repo, source in sources.items()},
+            historical_rows=0,
+            smoke_latency_ms=1.0,
+            timestamp="fixed",
+        )
+        self.assertEqual(manifest["formal_top_k"], benchmark.formal_top_k)
+        self.assertEqual(manifest["frozen_text_hash_policy"], "utf8-lf-v1")
+        self.assertEqual(next(item["label"] for item in manifest["retrieval_paths"] if item["path_id"] == "E"), "hierarchy + relation")
+        self.assertEqual(manifest["failure_taxonomy"], list(benchmark.failure_taxonomy))
 
 
 if __name__ == "__main__":
