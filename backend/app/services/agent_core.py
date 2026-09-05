@@ -34,6 +34,7 @@ from app.services.agent_tools import (
     build_m2_tool_registry,
     build_tool_context,
 )
+from app.services.candidate_evidence import CANDIDATE_REJECTION_CODES
 from app.services.embedding_service import EmbeddingService
 from app.services.evidence import CitationValidator
 from app.services.hierarchy_normalization import (
@@ -65,6 +66,14 @@ from app.services.retrieval_v2 import (
 from app.services.smoke_diagnostics import SmokeDiagnosticsRecorder
 
 logger = logging.getLogger(__name__)
+
+
+def validate_non_blank_question(question: object) -> str:
+    """Reject empty user goals without changing valid question text."""
+
+    if not isinstance(question, str) or not question.strip():
+        raise ValueError("question must contain non-whitespace characters")
+    return question
 
 
 class Planner(Protocol):
@@ -309,6 +318,7 @@ def run_bounded_agent(
     request_budget: RequestBudget | None = None,
     allow_planner_failure_fallback: bool = True,
 ) -> dict[str, Any]:
+    validate_non_blank_question(question)
     retrieval_version = validate_retrieval_version(retrieval_version)
     hierarchy_mode = validate_hierarchy_mode(
         hierarchy_mode,
@@ -359,6 +369,10 @@ def run_bounded_agent(
     if request_budget.request_expired(budget_check_now) or request_budget.work_expired(
         budget_check_now
     ):
+        _record_unattempted_base_retrieval(
+            diagnostics_recorder,
+            status="deadline_exceeded",
+        )
         return _empty_budget_failure(
             request_id=request_id,
             mode="bounded",
@@ -396,6 +410,10 @@ def run_bounded_agent(
             diagnostics_recorder=diagnostics_recorder,
         )
     except ValueError as exc:
+        _record_unattempted_base_retrieval(
+            diagnostics_recorder,
+            status="failed",
+        )
         fallback_now = time.monotonic()
         if request_budget.request_expired(fallback_now) or request_budget.work_expired(
             fallback_now
@@ -485,6 +503,10 @@ def run_bounded_agent(
     if request_budget.request_expired(budget_check_now) or request_budget.work_expired(
         budget_check_now
     ):
+        _record_unattempted_base_retrieval(
+            diagnostics_recorder,
+            status="deadline_exceeded",
+        )
         return _empty_budget_failure(
             request_id=request_id,
             mode="bounded",
@@ -520,30 +542,41 @@ def run_bounded_agent(
         "top_k": _request_top_k(evidence_count, limits.max_search_results),
     }
 
-    if server_constraints.requires_evidence_seed:
-        seed_budget_ms = state.budget.work_remaining_ms(time.monotonic())
-        if state.remaining_budget()["tool_calls"] > 0 and seed_budget_ms > 0:
-            seed_spec = registry.get("search_code")
-            _call, seed_observation = _execute_agent_tool(
+    normalized_question = question.strip()
+    seed_budget_ms = state.budget.work_remaining_ms(time.monotonic())
+    if seed_budget_ms > 0:
+        seed_spec = _resolve_tool_spec(registry, "search_code")
+        context.candidate_provenance = "deterministic_base_retrieval"
+        try:
+            seed_observation = _execute_deterministic_base_retrieval(
                 state=state,
                 registry=registry,
-                action="search_code",
                 tool_spec=seed_spec,
-                arguments=dict(default_search_arguments),
-                step_id="SEED",
-                phase="seed",
-                diagnostics_recorder=diagnostics_recorder,
+                arguments={
+                    **default_search_arguments,
+                    "query": normalized_question,
+                },
             )
-            seed_code = (seed_observation.error or {}).get("code")
-            if seed_code == "deadline_exceeded":
-                state.completion_status = "budget_exhausted"
-                state.failure_reason = "deadline_exceeded"
-            elif seed_code in {"tool_timeout", "final_answer_not_attempted"}:
-                state.completion_status = "failed"
-                state.failure_reason = seed_code
-            elif seed_observation.status == "cancelled":
-                state.completion_status = "cancelled"
-        elif state.budget.request_expired(time.monotonic()):
+        finally:
+            context.candidate_provenance = "planner_search_code"
+        state.warnings.extend(seed_observation.warnings)
+        seed_results = seed_observation.structured_results
+        if isinstance(seed_results, dict):
+            state.retrieval_mode = str(
+                seed_results.get("retrieval_mode", state.retrieval_mode)
+            )
+        seed_code = (seed_observation.error or {}).get("code")
+        if seed_code == "deadline_exceeded":
+            state.completion_status = "budget_exhausted"
+            state.failure_reason = "deadline_exceeded"
+        elif seed_observation.status == "cancelled":
+            state.completion_status = "cancelled"
+    else:
+        _record_unattempted_base_retrieval(
+            diagnostics_recorder,
+            status="deadline_exceeded",
+        )
+        if state.budget.request_expired(time.monotonic()):
             state.completion_status = "budget_exhausted"
             state.failure_reason = "deadline_exceeded"
 
@@ -711,6 +744,15 @@ def run_bounded_agent(
                     remaining_budget=state.remaining_budget(),
                 )
             )
+            break
+
+        if state.remaining_budget()["tool_calls"] <= 0:
+            state.completion_status = "tool_budget_exhausted"
+            state.warnings.append(
+                "Agent tool budget was exhausted; continuing to bounded finalization."
+            )
+            if diagnostics_recorder is not None:
+                diagnostics_recorder.record_tool_budget_exhausted()
             break
 
         action = decision.action or ""
@@ -1561,8 +1603,6 @@ def _pre_step_stop_status(state: AgentState) -> str | None:
         return "cancelled"
     if state.budget.request_expired(now) or state.budget.work_expired(now):
         return "budget_exhausted"
-    if remaining["tool_calls"] <= 0:
-        return "tool_budget_exhausted"
     if remaining["planner_tokens"] <= 0:
         return "budget_exhausted"
     return None
@@ -1858,6 +1898,121 @@ def _merge_server_bound_constraints(
         if key in accepted_fields:
             merged[key] = value
     return merged
+
+
+def _execute_deterministic_base_retrieval(
+    *,
+    state: AgentState,
+    registry: ToolRegistry,
+    tool_spec: ToolSpec | None,
+    arguments: dict[str, Any],
+) -> ToolObservation:
+    """Run the mandatory base search without touching Planner-owned state."""
+
+    call = ToolCall(
+        call_id="BASE",
+        step_id="BASE",
+        tool_name="search_code",
+        tool_version=tool_spec.version if tool_spec is not None else None,
+        parameters=arguments,
+        timeout_ms=state.limits.default_tool_timeout_ms,
+        budget={
+            "max_results": state.limits.max_search_results,
+            "max_bytes": state.limits.max_observation_bytes,
+        },
+    )
+    evidence_before = len(state.context.evidence_store.all(state.request_id))
+    observation = registry.execute(state.context, call)
+    evidence_after = len(state.context.evidence_store.all(state.request_id))
+    metrics = observation.metrics
+    retrieval_hit_count = _safe_base_metric_count(metrics.get("retrieval_hit_count"))
+    normalized_candidate_count = _safe_base_metric_count(
+        metrics.get("normalized_candidate_count")
+    )
+    valid_candidate_count = _safe_base_metric_count(
+        metrics.get("valid_candidate_count")
+    )
+    new_evidence_count = _safe_base_metric_count(metrics.get("new_evidence_count"))
+    rejected_candidate_count = _safe_base_metric_count(
+        metrics.get("rejected_candidate_count")
+    )
+    rejection_code_counts = {
+        code: _safe_base_metric_count(
+            metrics.get(f"candidate_rejection_{code}_count")
+        )
+        for code in CANDIDATE_REJECTION_CODES
+        if _safe_base_metric_count(
+            metrics.get(f"candidate_rejection_{code}_count")
+        )
+        > 0
+    }
+    error_code = (observation.error or {}).get("code")
+    if error_code == "deadline_exceeded":
+        base_status = "deadline_exceeded"
+    elif observation.status != "succeeded":
+        base_status = observation.status
+    elif retrieval_hit_count == 0:
+        base_status = "zero_hit"
+    elif valid_candidate_count == 0 and rejected_candidate_count > 0:
+        base_status = "all_rejected"
+    else:
+        base_status = "succeeded"
+    if state.context.diagnostics_recorder is not None:
+        state.context.diagnostics_recorder.record_base_retrieval(
+            attempted=True,
+            status=base_status,
+            retrieval_hit_count=retrieval_hit_count,
+            normalized_candidate_count=normalized_candidate_count,
+            valid_candidate_count=valid_candidate_count,
+            new_evidence_count=new_evidence_count,
+            rejected_candidate_count=rejected_candidate_count,
+            rejection_code_counts=rejection_code_counts,
+        )
+    logger.info(
+        "agent_base_retrieval",
+        extra={
+            "request_id": state.request_id,
+            "status": observation.status,
+            "duration_ms": observation.metrics.get("duration_ms", 0),
+            "result_count": observation.metrics.get("result_count", 0),
+            "retrieval_hit_count": observation.metrics.get(
+                "retrieval_hit_count", 0
+            ),
+            "normalized_candidate_count": normalized_candidate_count,
+            "valid_candidate_count": observation.metrics.get(
+                "valid_candidate_count", 0
+            ),
+            "rejected_candidate_count": rejected_candidate_count,
+            "evidence_added": max(0, evidence_after - evidence_before),
+            "truncated": observation.truncated,
+        },
+    )
+    return observation
+
+
+def _record_unattempted_base_retrieval(
+    recorder: SmokeDiagnosticsRecorder | None,
+    *,
+    status: str,
+) -> None:
+    if recorder is None:
+        return
+    recorder.record_base_retrieval(
+        attempted=False,
+        status=status,
+        retrieval_hit_count=0,
+        normalized_candidate_count=0,
+        valid_candidate_count=0,
+        new_evidence_count=0,
+        rejected_candidate_count=0,
+        rejection_code_counts={},
+    )
+
+
+def _safe_base_metric_count(value: object) -> int:
+    if not isinstance(value, int) or isinstance(value, bool):
+        return 0
+    return min(1_000_000, max(0, value))
 
 
 def _execute_agent_tool(

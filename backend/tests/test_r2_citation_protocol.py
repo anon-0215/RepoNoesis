@@ -812,6 +812,65 @@ class DiagnosticsBoundaryTests(unittest.TestCase):
         self.assertEqual(diagnostics["failure_reason_code"], "provider_error")
         self.assertEqual(diagnostics["planner_attempts"], smoke["planner_attempts"])
 
+    def test_base_retrieval_diagnostics_are_single_bounded_and_allowlisted(self):
+        recorder = SmokeDiagnosticsRecorder()
+        recorder.begin_agent(["search_code"], request_id="request-base-audit")
+        recorder.record_base_retrieval(
+            attempted=True,
+            status="all_rejected",
+            retrieval_hit_count=10**12,
+            normalized_candidate_count=4,
+            valid_candidate_count=0,
+            new_evidence_count=0,
+            rejected_candidate_count=4,
+            rejection_code_counts={
+                "path_mismatch": 3,
+                "retrieval_sources_invalid": 1,
+                "unknown_sensitive_code": 10**12,
+            },
+        )
+        recorder.record_base_retrieval(
+            attempted=True,
+            status="succeeded",
+            retrieval_hit_count=1,
+            normalized_candidate_count=1,
+            valid_candidate_count=1,
+            new_evidence_count=1,
+            rejected_candidate_count=0,
+            rejection_code_counts={},
+        )
+
+        smoke = recorder.snapshot()
+        base = smoke["base_retrieval"]
+        self.assertEqual(base["status"], "all_rejected")
+        self.assertEqual(base["retrieval_hit_count"], 1_000_000)
+        self.assertEqual(
+            base["rejection_code_counts"],
+            {"path_mismatch": 3, "retrieval_sources_invalid": 1},
+        )
+        self.assertTrue(smoke["diagnostics_truncated"])
+        self.assertNotIn("unknown_sensitive_code", json.dumps(smoke))
+        self._assert_safe_bounded(
+            smoke,
+            smoke_diagnostics.MAX_SMOKE_DIAGNOSTICS_BYTES,
+        )
+
+        detail = ask_diagnostics.build_ask_failure_detail(
+            result={
+                "request_id": "request-base-audit",
+                "agent_mode": "bounded",
+                "agent_status": "failed",
+                "answer_mode": "not_available",
+            },
+            recorder_snapshot=smoke,
+            retrieval_version="v1",
+            hierarchy_mode="off",
+            relation_mode="off",
+            terminal_reason="provider_error",
+        )
+        self.assertEqual(detail["diagnostics"]["base_retrieval"], base)
+        self.assertEqual(detail["diagnostics"].get("tool_executions", []), [])
+
 
 class CitationProtocolRouteTests(unittest.TestCase):
     def setUp(self) -> None:

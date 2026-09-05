@@ -24,6 +24,11 @@ from app.services.agent_contracts import (
     normalize_repository_relative_path,
     utc_now,
 )
+from app.services.candidate_evidence import (
+    CANDIDATE_REJECTION_CODES,
+    CandidateEvidencePool,
+    CandidateProvenance,
+)
 from app.services.embedding_service import EmbeddingService
 from app.services.evidence import CitationValidator, Evidence, EvidenceBuilder
 from app.services.hierarchy_normalization import (
@@ -129,6 +134,7 @@ class ToolContext:
     database: Database
     embedding_service: EmbeddingService
     evidence_store: EvidenceStore
+    candidate_pool: CandidateEvidencePool
     chain_store: EvidenceChainStore
     limits: AgentLimits
     cancellation: CancellationToken
@@ -141,6 +147,7 @@ class ToolContext:
     retrieval_version: str = RETRIEVAL_VERSION_V1
     hierarchy_mode: str = HIERARCHY_MODE_OFF
     relation_mode: str = RELATION_MODE_OFF
+    candidate_provenance: CandidateProvenance = "planner_search_code"
 
     def check_active(self) -> None:
         if self.cancellation.cancelled:
@@ -539,6 +546,7 @@ def build_tool_context(
         database=database,
         embedding_service=embedding_service,
         evidence_store=evidence_store,
+        candidate_pool=CandidateEvidencePool(capacity=evidence_store.capacity),
         chain_store=chain_store or EvidenceChainStore(),
         limits=limits,
         cancellation=cancellation,
@@ -601,11 +609,19 @@ def _search_code(
     )
     context.check_active()
     project = context.bundle.get("project") or {}
-    built = EvidenceBuilder().build(
+    candidates = context.candidate_pool.normalize_retrieval_results(
         outcome.results,
-        project,
+        provenance=context.candidate_provenance,
+    )
+    promotion = context.candidate_pool.promote(
+        candidates,
+        database=context.database,
+        project=project,
+        project_id=context.project_id,
+        repository_revision=context.repository_revision,
         retrieval_strategy_version=outcome.retrieval_strategy_version,
     )
+    built = promotion.evidence
     context.check_active()
     built = [
         item
@@ -653,16 +669,34 @@ def _search_code(
                 ordered_directions=[direction],
             )
     results = [_evidence_summary(item) for item in added]
+    rejection_metrics = {
+        f"candidate_rejection_{code}_count": promotion.rejection_counts.get(code, 0)
+        for code in CANDIDATE_REJECTION_CODES
+    }
     payload = {
         "evidence": results,
         "retrieval_mode": outcome.retrieval_mode,
         "grounding": "unvalidated",
         "retrieval_metrics": {
             "candidate_count": len(outcome.results),
+            "retrieval_hit_count": len(outcome.results),
+            "normalized_candidate_count": promotion.candidate_count,
+            "valid_candidate_count": promotion.valid_candidate_count,
             "new_evidence_count": len(added),
+            "rejected_candidate_count": sum(promotion.rejection_counts.values()),
+            "candidate_rejection_counts": promotion.rejection_counts,
         },
         "_observation_metrics": {
-            "result_count": len(outcome.results),
+            # ToolObservation.result_count is the Planner progress signal. Raw
+            # retrieval hits remain available only in the explicit bounded
+            # counters below.
+            "result_count": len(added),
+            "retrieval_hit_count": len(outcome.results),
+            "normalized_candidate_count": promotion.candidate_count,
+            "valid_candidate_count": promotion.valid_candidate_count,
+            "new_evidence_count": len(added),
+            "rejected_candidate_count": sum(promotion.rejection_counts.values()),
+            **rejection_metrics,
         },
     }
     if context.retrieval_version != RETRIEVAL_VERSION_V1:

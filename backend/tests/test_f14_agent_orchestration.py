@@ -181,13 +181,33 @@ class F14AgentOrchestrationTests(unittest.TestCase):
     def test_request_capacity_bounds_two_searches_seed_and_finalization(self):
         recorder = SmokeDiagnosticsRecorder()
         final_context_sizes: list[int] = []
+        base_observations = []
+        planner_observations = []
         original = agent_core.answer_from_evidence
+        registry = build_m2_tool_registry(self.limits)
+        original_execute = registry.execute
+        original_execute_resolved = registry.execute_resolved
 
         def capture_final(question, evidence, *args, **kwargs):
             final_context_sizes.append(len(evidence))
             return original(question, evidence, *args, **kwargs)
 
-        with patch.object(agent_core, "answer_from_evidence", side_effect=capture_final):
+        def capture_base(context, call):
+            observation = original_execute(context, call)
+            if call.call_id == "BASE":
+                base_observations.append(observation)
+            return observation
+
+        def capture_planner(context, call, spec):
+            observation = original_execute_resolved(context, call, spec)
+            planner_observations.append(observation)
+            return observation
+
+        with (
+            patch.object(agent_core, "answer_from_evidence", side_effect=capture_final),
+            patch.object(registry, "execute", side_effect=capture_base),
+            patch.object(registry, "execute_resolved", side_effect=capture_planner),
+        ):
             result = run_bounded_agent(
                 "authenticate_user and upload_file",
                 self.bundle,
@@ -203,12 +223,29 @@ class F14AgentOrchestrationTests(unittest.TestCase):
                 ),
                 evidence_count=1,
                 diagnostics_recorder=recorder,
+                registry=registry,
             )
         self.assertEqual(final_context_sizes, [1])
         self.assertEqual(len(result["evidence"]), 1)
         executions = recorder.snapshot()["tool_executions"]
-        self.assertEqual([item["result_count"] for item in executions], [1, 1])
-        self.assertEqual([item["evidence_added"] for item in executions], [1, 0])
+        self.assertEqual(len(base_observations), 1)
+        self.assertEqual(len(planner_observations), 2)
+        self.assertEqual(result["budget_usage"]["tool_calls_used"], 2)
+        self.assertEqual([item["result_count"] for item in executions], [0, 0])
+        self.assertEqual([item["evidence_added"] for item in executions], [0, 0])
+        self.assertEqual(
+            base_observations[0].metrics["result_count"],
+            base_observations[0].metrics["new_evidence_count"],
+        )
+        self.assertGreater(base_observations[0].metrics["new_evidence_count"], 0)
+        for observation in planner_observations:
+            self.assertEqual(observation.metrics["result_count"], 0)
+            self.assertEqual(observation.metrics["new_evidence_count"], 0)
+            self.assertGreater(observation.metrics["retrieval_hit_count"], 0)
+            self.assertGreaterEqual(
+                observation.metrics["valid_candidate_count"],
+                observation.metrics["new_evidence_count"],
+            )
 
         seed_db = Database(Path(self.directory.name) / "seed-capacity.sqlite")
         seed_project = seed_db.create_project(
@@ -278,7 +315,9 @@ class F14AgentOrchestrationTests(unittest.TestCase):
         self.assertEqual(len(seeded["evidence"]), 1)
         self.assertEqual(seeded["evidence"][0]["path"], "src/auth.py")
         seed_executions = seed_recorder.snapshot()["tool_executions"]
-        self.assertEqual([item["evidence_added"] for item in seed_executions], [1, 0])
+        self.assertEqual([item["evidence_added"] for item in seed_executions], [0])
+        self.assertEqual([item["result_count"] for item in seed_executions], [0])
+        self.assertEqual(seeded["budget_usage"]["tool_calls_used"], 1)
 
     def test_capacity_deduplicates_before_count_and_preserves_multi_item_behavior(self):
         captured: list = []
@@ -372,14 +411,31 @@ class F14AgentOrchestrationTests(unittest.TestCase):
         captured: dict[str, list[dict]] = {
             "search_code": [], "lookup_symbol": [], "read_source": []
         }
+        execution_order: list[str] = []
         for action in captured:
             spec = registry.get(action)
 
             def capture(context, parameters, *, _action=action, _handler=spec.handler):
-                captured[_action].append(parameters.model_dump())
+                phase = context.candidate_provenance
+                captured[_action].append(
+                    {"phase": phase, "parameters": parameters.model_dump()}
+                )
+                execution_order.append(
+                    "base_search"
+                    if phase == "deterministic_base_retrieval"
+                    else f"planner_{_action}"
+                )
                 return _handler(context, parameters)
 
             registry._tools[action] = replace(spec, handler=capture)
+        original_chat = provider.chat
+
+        def capture_chat(*args, **kwargs):
+            if kwargs.get("purpose") == "planner":
+                execution_order.append("planner_call")
+            return original_chat(*args, **kwargs)
+
+        provider.chat = capture_chat
         result = run_bounded_agent(
             "authenticate_user",
             self.bundle,
@@ -392,7 +448,17 @@ class F14AgentOrchestrationTests(unittest.TestCase):
             diagnostics_recorder=SmokeDiagnosticsRecorder(),
         )
         self.assertEqual(result["agent_status"], "completed")
-        self.assertTrue(all(items[0]["path"] == "src/auth.py" for items in captured.values()))
+        self.assertEqual(execution_order[:2], ["base_search", "planner_call"])
+        self.assertEqual(len(captured["search_code"]), 2)
+        base_search, planner_search = captured["search_code"]
+        self.assertEqual(base_search["phase"], "deterministic_base_retrieval")
+        self.assertEqual(base_search["parameters"]["query"], "authenticate_user")
+        self.assertIsNone(base_search["parameters"]["path"])
+        self.assertEqual(planner_search["phase"], "planner_search_code")
+        self.assertEqual(planner_search["parameters"]["path"], "src/auth.py")
+        for action in ("lookup_symbol", "read_source"):
+            self.assertEqual(captured[action][0]["phase"], "planner_search_code")
+            self.assertEqual(captured[action][0]["parameters"]["path"], "src/auth.py")
         self.assertEqual(planner_arguments, originals)
 
         unsafe_paths = (

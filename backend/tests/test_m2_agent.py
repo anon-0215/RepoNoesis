@@ -135,6 +135,10 @@ class M2AgentTests(unittest.TestCase):
         )
         result = self._run(planner)
         self.assertEqual(result["agent_status"], "completed")
+        self.assertEqual(
+            [step["action"] for step in result["agent_trace"]],
+            ["search_code", "answer"],
+        )
         self.assertEqual(result["agent_trace"][0]["tool_calls"][0]["status"], "succeeded")
         self.assertEqual(
             planner.repair_hints[1]["stable_code"],
@@ -184,7 +188,7 @@ class M2AgentTests(unittest.TestCase):
             for step in result["agent_trace"]
             if step["tool_calls"]
         ]
-        self.assertEqual(statuses, ["succeeded"])
+        self.assertEqual(statuses, [])
         self.assertNotIn("shell", [step["action"] for step in result["agent_trace"]])
         self.assertEqual(
             planner.repair_hints[1]["stable_code"],
@@ -377,7 +381,7 @@ class M2AgentTests(unittest.TestCase):
             for step in result["agent_trace"]
             if step["tool_calls"]
         ]
-        self.assertEqual(statuses, ["succeeded", "succeeded"])
+        self.assertEqual(statuses, ["succeeded"])
         self.assertEqual(result["agent_status"], "degraded")
         self.assertEqual(result["budget_usage"]["limits"]["max_agent_steps"], 5)
         self.assertEqual([item["path"] for item in result["citations"]], ["README.md"])

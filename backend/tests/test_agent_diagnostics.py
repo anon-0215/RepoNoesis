@@ -24,7 +24,11 @@ from app.services.agent_tools import (
     build_m2_tool_registry,
 )
 from app.services.agent_contracts import SearchCodeInput
-from app.services.ask_diagnostics import ask_failure_http_status, build_ask_failure_detail
+from app.services.ask_diagnostics import (
+    ask_failure_http_status,
+    build_ask_failure_detail,
+    build_ask_success_diagnostics,
+)
 from app.services.llm_client import ProviderError
 from app.services.smoke_diagnostics import SmokeDiagnosticsRecorder
 from tests.m1_helpers import disabled_embedding_service, make_project
@@ -193,6 +197,33 @@ class AgentDiagnosticsTests(unittest.TestCase):
             hierarchy_mode="off",
             relation_mode="off",
         )["code"]
+
+    def test_base_retrieval_has_one_independent_public_safe_summary(self):
+        result, diagnostics = self._run(ScriptedPlanner([decision("answer")]))
+
+        base = diagnostics["base_retrieval"]
+        self.assertEqual(base["status"], "succeeded")
+        self.assertEqual(base["retrieval_hit_count"], 1)
+        self.assertEqual(base["normalized_candidate_count"], 1)
+        self.assertEqual(base["valid_candidate_count"], 1)
+        self.assertEqual(base["new_evidence_count"], 1)
+        self.assertEqual(base["rejected_candidate_count"], 0)
+        self.assertEqual(base["rejection_code_counts"], {})
+        self.assertEqual(diagnostics.get("tool_executions", []), [])
+        self.assertEqual(diagnostics["tool_calls_attempted"], 0)
+        self.assertEqual(result["budget_usage"]["tool_calls_used"], 0)
+
+        projected = build_ask_success_diagnostics(
+            result=result,
+            recorder_snapshot=diagnostics,
+            retrieval_version="v1",
+            hierarchy_mode="off",
+            relation_mode="off",
+        )
+        self.assertEqual(projected["base_retrieval"], base)
+        serialized = json.dumps(projected, sort_keys=True)
+        self.assertNotIn("return verify(password)", serialized)
+        self.assertNotIn("authenticate_user", serialized)
 
     def test_planner_invalid_json_then_repair_success_is_recorded(self):
         result, diagnostics = self._run(
@@ -608,8 +639,13 @@ class AgentDiagnosticsTests(unittest.TestCase):
                     default_tool_timeout_ms=tool_ms,
                 )
                 registry = ToolRegistry()
+                handler_calls = 0
 
                 def handler(_context, _parameters, *, target=end_time):
+                    nonlocal handler_calls
+                    handler_calls += 1
+                    if handler_calls == 1:
+                        return {"retrieval_mode": "lexical", "evidence": []}, [], False
                     clock.value = target
                     return {"retrieval_mode": "lexical", "evidence": []}, [], False
 
@@ -773,6 +809,60 @@ class AgentDiagnosticsTests(unittest.TestCase):
                     diagnostics["tool_calls_failed"],
                 )
                 self.assertEqual(actual, expected)
+
+    def test_search_diagnostics_report_canonical_progress_not_raw_hits(self):
+        initial = agent_tools.retrieve_code(
+            self.database,
+            disabled_embedding_service(),
+            self.bundle["project"]["id"],
+            "authenticate_user",
+            evidence_count=1,
+        )
+        valid = initial.results[0]
+        empty = replace(initial, results=[])
+        forged = replace(initial, results=[replace(valid, path="src/forged.py")])
+        captured_metrics = []
+        limits = AgentLimits()
+        registry = build_m2_tool_registry(limits)
+        search = registry.get("search_code")
+
+        def capture(context, parameters):
+            payload, warnings, truncated = search.handler(context, parameters)
+            captured_metrics.append(dict(payload["retrieval_metrics"]))
+            return payload, warnings, truncated
+
+        registry._tools["search_code"] = replace(search, handler=capture)
+        recorder = SmokeDiagnosticsRecorder()
+        with patch.object(agent_tools, "retrieve_code", side_effect=[empty, forged]):
+            result = run_bounded_agent(
+                "authenticate_user",
+                self.bundle,
+                NoLlm(),
+                self.database,
+                disabled_embedding_service(),
+                planner=ScriptedPlanner(
+                    [
+                        decision("continue", "search_code", {"query": "authenticate_user"}),
+                        decision("answer"),
+                    ]
+                ),
+                registry=registry,
+                limits=limits,
+                diagnostics_recorder=recorder,
+            )
+
+        self.assertEqual(len(captured_metrics), 2)
+        planner_metrics = captured_metrics[1]
+        self.assertEqual(planner_metrics["retrieval_hit_count"], 1)
+        self.assertEqual(planner_metrics["normalized_candidate_count"], 1)
+        self.assertEqual(planner_metrics["valid_candidate_count"], 0)
+        self.assertEqual(planner_metrics["new_evidence_count"], 0)
+        self.assertEqual(planner_metrics["rejected_candidate_count"], 1)
+        execution = recorder.snapshot()["tool_executions"][0]
+        self.assertEqual(execution["result_count"], 0)
+        self.assertEqual(execution["evidence_added"], 0)
+        self.assertEqual(result["evidence"], [])
+        self.assertNotIn("src/forged.py", json.dumps(recorder.snapshot()))
 
     def test_final_answer_and_validators_are_recorded_without_response_schema_change(self):
         result, diagnostics = self._run(
