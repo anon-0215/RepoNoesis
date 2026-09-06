@@ -187,7 +187,7 @@ class F12AgentOrchestrationTests(unittest.TestCase):
         self.assertTrue(all(item["evidence_count"] == 1 for item in calls))
         self.assertEqual(result["evidence"][0]["path"], "src/auth.py")
 
-    def test_seed_precedes_planner_and_counts_as_tool_not_step(self):
+    def test_unconstrained_base_retrieval_precedes_planner_without_using_planner_state(self):
         events = []
 
         class CapturingPlanner(ScriptedPlanner):
@@ -214,30 +214,97 @@ class F12AgentOrchestrationTests(unittest.TestCase):
                 self.database,
                 disabled_embedding_service(),
                 planner=planner,
-                path="src/auth.py",
-                symbol="authenticate_user",
                 evidence_count=1,
                 diagnostics_recorder=recorder,
                 request_id="seed-before-planner",
             )
 
         self.assertEqual(events[:2], ["seed", "planner"])
-        self.assertEqual(result["budget_usage"]["tool_calls_used"], 1)
+        self.assertEqual(events.count("seed"), 1)
+        self.assertEqual(result["budget_usage"]["tool_calls_used"], 0)
         self.assertEqual(result["budget_usage"]["steps_used"], 1)
-        execution = recorder.snapshot()["tool_executions"]
+        snapshot = recorder.snapshot()
+        self.assertEqual(snapshot.get("tool_calls_attempted", 0), 0)
+        self.assertEqual(snapshot.get("tool_executions", []), [])
         self.assertEqual(
-            execution,
-            [
-                {
-                    "phase": "seed",
-                    "tool_name": "search_code",
-                    "status": "succeeded",
-                    "result_count": 1,
-                    "evidence_added": 1,
-                    "reason_code": None,
-                }
-            ],
+            snapshot["base_retrieval"],
+            {
+                "attempted": True,
+                "status": "succeeded",
+                "retrieval_hit_count": 1,
+                "normalized_candidate_count": 1,
+                "valid_candidate_count": 1,
+                "new_evidence_count": 1,
+                "rejected_candidate_count": 0,
+                "rejection_code_counts": {},
+            },
         )
+
+    def test_blank_question_is_rejected_before_route_or_direct_agent_work(self):
+        invalid_questions = ("", "   ", "\t\n \r")
+        with patch.object(main, "run_bounded_agent") as route_agent:
+            for question in invalid_questions:
+                with self.subTest(layer="api", question=repr(question)):
+                    status, body = asyncio.run(
+                        _post(
+                            main.app,
+                            f"/api/projects/{self.project_id}/ask",
+                            {"question": question},
+                        )
+                    )
+                    self.assertEqual(status, 422)
+                    self.assertEqual(body["detail"][0]["loc"][-1], "question")
+            route_agent.assert_not_called()
+
+        from app.services import agent_tools
+
+        for question in invalid_questions:
+            provider = _ScriptedProvider([decision("answer")])
+            planner = ScriptedPlanner([decision("answer")])
+            with (
+                self.subTest(layer="agent", question=repr(question)),
+                patch.object(agent_tools, "retrieve_code") as retrieve,
+                patch.object(self.database, "save_chat_answer") as persist,
+                self.assertRaisesRegex(ValueError, "non-whitespace"),
+            ):
+                run_bounded_agent(
+                    question,
+                    self.bundle,
+                    provider,
+                    self.database,
+                    disabled_embedding_service(),
+                    planner=planner,
+                )
+            retrieve.assert_not_called()
+            persist.assert_not_called()
+            self.assertEqual(planner.calls, 0)
+            self.assertEqual(provider.planner_calls, 0)
+            self.assertEqual(provider.final_calls, 0)
+
+    def test_padded_nonblank_question_retains_business_text_and_uses_trimmed_base_query(self):
+        question = "  authenticate_user  "
+        self.assertEqual(main.AskRequest(question=question).question, question)
+        queries = []
+        from app.services import agent_tools
+
+        real_retrieve = agent_tools.retrieve_code
+
+        def capture(*args, **kwargs):
+            queries.append(args[3])
+            return real_retrieve(*args, **kwargs)
+
+        with patch.object(agent_tools, "retrieve_code", side_effect=capture):
+            result = run_bounded_agent(
+                question,
+                self.bundle,
+                NoLlm(),
+                self.database,
+                disabled_embedding_service(),
+                planner=ScriptedPlanner([decision("answer")]),
+            )
+
+        self.assertEqual(queries, ["authenticate_user"])
+        self.assertEqual(result["agent_status"], "completed")
 
     def test_locator_steps_exhaust_then_use_one_formal_grounded_answer(self):
         planner = ScriptedPlanner(
@@ -273,13 +340,13 @@ class F12AgentOrchestrationTests(unittest.TestCase):
         self.assertEqual(result["agent_status"], "completed")
         self.assertEqual(result["answer_mode"], "llm_grounded")
         self.assertEqual(result["budget_usage"]["steps_used"], 3)
-        self.assertEqual(result["budget_usage"]["tool_calls_used"], 4)
+        self.assertEqual(result["budget_usage"]["tool_calls_used"], 3)
         self.assertEqual(
             [item["phase"] for item in recorder.snapshot()["tool_executions"]],
-            ["seed", "planner", "planner", "planner"],
+            ["planner", "planner", "planner"],
         )
 
-    def test_zero_seed_and_unconstrained_request_keep_failure_and_old_behavior(self):
+    def test_zero_base_retrieval_keeps_failure_but_unconstrained_request_is_seeded(self):
         missing_recorder = SmokeDiagnosticsRecorder()
         missing = run_bounded_agent(
             "authenticate_user",
@@ -307,12 +374,78 @@ class F12AgentOrchestrationTests(unittest.TestCase):
 
         self.assertEqual(missing["agent_status"], "insufficient_evidence")
         self.assertEqual(missing["evidence"], [])
+        self.assertEqual(missing_recorder.snapshot().get("tool_executions", []), [])
         self.assertEqual(
-            missing_recorder.snapshot()["tool_executions"][0]["evidence_added"], 0
+            missing_recorder.snapshot()["base_retrieval"]["status"],
+            "zero_hit",
         )
         self.assertEqual(ordinary["budget_usage"]["tool_calls_used"], 0)
-        self.assertNotIn("tool_executions", ordinary_recorder.snapshot())
+        self.assertEqual(len(ordinary["evidence"]), 1)
+        self.assertEqual(ordinary_recorder.snapshot().get("tool_executions", []), [])
+        self.assertEqual(
+            ordinary_recorder.snapshot()["base_retrieval"]["status"],
+            "succeeded",
+        )
         self.assertEqual(self._chat_count(), 0)
+
+    def test_base_retrieval_audit_covers_rejection_failure_and_request_isolation(self):
+        from app.services import agent_tools
+
+        initial = agent_tools.retrieve_code(
+            self.database,
+            disabled_embedding_service(),
+            self.project_id,
+            "authenticate_user",
+            evidence_count=1,
+        )
+        forged = replace(initial, results=[replace(initial.results[0], path="src/forged.py")])
+        empty = replace(initial, results=[])
+
+        records = []
+        for request_id, outcome in (("base-rejected", forged), ("base-zero", empty)):
+            recorder = SmokeDiagnosticsRecorder()
+            with patch.object(agent_tools, "retrieve_code", return_value=outcome):
+                run_bounded_agent(
+                    "authenticate_user",
+                    self.bundle,
+                    NoLlm(),
+                    self.database,
+                    disabled_embedding_service(),
+                    planner=ScriptedPlanner([decision("answer")]),
+                    diagnostics_recorder=recorder,
+                    request_id=request_id,
+                )
+            records.append(recorder.snapshot())
+
+        rejected = records[0]["base_retrieval"]
+        self.assertEqual(rejected["status"], "all_rejected")
+        self.assertEqual(rejected["retrieval_hit_count"], 1)
+        self.assertEqual(rejected["normalized_candidate_count"], 1)
+        self.assertEqual(rejected["valid_candidate_count"], 0)
+        self.assertEqual(rejected["new_evidence_count"], 0)
+        self.assertEqual(rejected["rejected_candidate_count"], 1)
+        self.assertEqual(rejected["rejection_code_counts"], {"path_mismatch": 1})
+        self.assertEqual(records[1]["base_retrieval"]["status"], "zero_hit")
+        self.assertEqual(records[1]["base_retrieval"]["retrieval_hit_count"], 0)
+        self.assertEqual(records[0].get("tool_executions", []), [])
+        self.assertEqual(records[1].get("tool_executions", []), [])
+        self.assertNotEqual(records[0]["request_id"], records[1]["request_id"])
+
+        failed_recorder = SmokeDiagnosticsRecorder()
+        with patch.object(agent_tools, "retrieve_code", side_effect=RuntimeError("sensitive body")):
+            run_bounded_agent(
+                "authenticate_user",
+                self.bundle,
+                NoLlm(),
+                self.database,
+                disabled_embedding_service(),
+                planner=ScriptedPlanner([decision("answer")]),
+                diagnostics_recorder=failed_recorder,
+                request_id="base-safe-failure",
+            )
+        failed = failed_recorder.snapshot()
+        self.assertEqual(failed["base_retrieval"]["status"], "failed")
+        self.assertNotIn("sensitive body", json.dumps(failed))
 
     def test_off_modes_do_not_disable_base_seed(self):
         result = run_bounded_agent(
@@ -329,6 +462,32 @@ class F12AgentOrchestrationTests(unittest.TestCase):
         )
         self.assertEqual(len(result["evidence"]), 1)
         self.assertEqual(result["analysis_mode"], "retrieval_only")
+
+    def test_question_only_route_seeds_before_planner_and_persists_once(self):
+        events = []
+        provider = _ScriptedProvider([decision("answer")], events=events)
+        from app.services import agent_tools
+
+        real_retrieve = agent_tools.retrieve_code
+
+        def capture(*args, **kwargs):
+            events.append("base-retrieval")
+            return real_retrieve(*args, **kwargs)
+
+        with patch.object(agent_tools, "retrieve_code", side_effect=capture):
+            status, body = self._route(
+                provider,
+                {"question": "Where is authenticate_user defined?"},
+            )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(events[:2], ["base-retrieval", "provider:planner"])
+        self.assertEqual(events.count("base-retrieval"), 1)
+        self.assertEqual(provider.planner_calls, 1)
+        self.assertEqual(provider.final_calls, 1)
+        self.assertEqual(body["budget_usage"]["tool_calls_used"], 0)
+        self.assertEqual(len(body["evidence"]), 1)
+        self.assertEqual(self._chat_count(), 1)
 
     def test_tool_diagnostics_are_allowlisted_content_free_and_bounded(self):
         registry = build_m2_tool_registry(AgentLimits())
@@ -348,7 +507,12 @@ class F12AgentOrchestrationTests(unittest.TestCase):
             NoLlm(),
             self.database,
             disabled_embedding_service(),
-            planner=ScriptedPlanner([decision("answer")]),
+            planner=ScriptedPlanner(
+                [
+                    decision("continue", "search_code", {"query": "PRIVATE-QUERY"}),
+                    decision("answer"),
+                ]
+            ),
             path="PRIVATE-PATH",
             registry=registry,
             diagnostics_recorder=recorder,
@@ -451,7 +615,7 @@ class F12AgentOrchestrationTests(unittest.TestCase):
         self.assertEqual(captured_constraints[0]["language"], "python")
         self.assertEqual(captured_constraints[0]["symbol"], "authenticate_user")
         self.assertEqual(body["answer_mode"], "llm_grounded")
-        self.assertEqual(body["budget_usage"]["tool_calls_used"], 4)
+        self.assertEqual(body["budget_usage"]["tool_calls_used"], 3)
         self.assertEqual(self._chat_count(), 1)
 
         before = self._chat_count()
@@ -550,12 +714,71 @@ class F12AgentOrchestrationTests(unittest.TestCase):
         self.assertEqual(second["evidence"], [])
         self.assertEqual(first_recorder.snapshot()["evidence_count"], 1)
         self.assertEqual(second_recorder.snapshot().get("evidence_count", 0), 0)
-        self.assertEqual(
-            first_recorder.snapshot()["tool_executions"][0]["evidence_added"], 1
+        self.assertEqual(first_recorder.snapshot().get("tool_executions", []), [])
+        self.assertEqual(second_recorder.snapshot().get("tool_executions", []), [])
+
+    def test_zero_tool_budget_still_runs_base_and_allows_one_terminal_planner_decision(self):
+        events = []
+
+        class CapturingPlanner(ScriptedPlanner):
+            def decide(inner_self, state, *, repair_hint=None):
+                events.append("planner")
+                self.assertEqual(state["known_evidence_ids"], ["E1"])
+                self.assertEqual(state["remaining_budget"]["tool_calls"], 0)
+                return super().decide(state, repair_hint=repair_hint)
+
+        planner = CapturingPlanner([decision("answer")])
+        from app.services import agent_tools
+
+        real_retrieve = agent_tools.retrieve_code
+
+        def capture(*args, **kwargs):
+            events.append("base")
+            return real_retrieve(*args, **kwargs)
+
+        with patch.object(agent_tools, "retrieve_code", side_effect=capture):
+            result = run_bounded_agent(
+                "  authenticate_user  ",
+                self.bundle,
+                NoLlm(),
+                self.database,
+                disabled_embedding_service(),
+                planner=planner,
+                limits=replace(AgentLimits(), max_tool_calls=0),
+            )
+
+        self.assertEqual(events[:2], ["base", "planner"])
+        self.assertEqual(events.count("base"), 1)
+        self.assertEqual(planner.calls, 1)
+        self.assertEqual(result["agent_status"], "completed")
+        self.assertEqual(result["budget_usage"]["tool_calls_used"], 0)
+
+    def test_seed_does_not_repeat_block_same_planner_query_or_consume_no_progress(self):
+        planner = ScriptedPlanner(
+            [
+                decision("continue", "search_code", {"query": "authenticate_user"}),
+                decision("answer"),
+            ]
         )
-        self.assertEqual(
-            second_recorder.snapshot()["tool_executions"][0]["evidence_added"], 0
+        recorder = SmokeDiagnosticsRecorder()
+        result = run_bounded_agent(
+            "authenticate_user",
+            self.bundle,
+            NoLlm(),
+            self.database,
+            disabled_embedding_service(),
+            planner=planner,
+            limits=replace(AgentLimits(), max_tool_calls=1, max_no_progress_steps=2),
+            diagnostics_recorder=recorder,
         )
+
+        execution = recorder.snapshot()["tool_executions"]
+        self.assertEqual(len(execution), 1)
+        self.assertEqual(execution[0]["phase"], "planner")
+        self.assertEqual(execution[0]["status"], "succeeded")
+        self.assertEqual(execution[0]["result_count"], 0)
+        self.assertIsNone(execution[0]["reason_code"])
+        self.assertEqual(result["budget_usage"]["tool_calls_used"], 1)
 
 
 if __name__ == "__main__":

@@ -329,6 +329,14 @@ class F15AgentOrchestrationTests(unittest.TestCase):
         registry = build_m2_tool_registry(self.limits)
         captured_results: list[dict] = []
         captured_failures: list[dict] = []
+        base_provenance: list[tuple[str, str]] = []
+        original_execute = registry.execute
+
+        def capture_base(context, call):
+            if call.call_id == "BASE":
+                base_provenance.append((context.request_id, context.candidate_provenance))
+            return original_execute(context, call)
+
         collector = _LogCollector()
         log = logging.getLogger("app.services.agent_core")
         previous_level = log.level
@@ -337,7 +345,7 @@ class F15AgentOrchestrationTests(unittest.TestCase):
         try:
             with (
                 patch.object(registry, "get", wraps=registry.get) as get_tool,
-                patch.object(registry, "execute", wraps=registry.execute) as execute,
+                patch.object(registry, "execute", side_effect=capture_base) as execute,
                 patch.object(
                     registry,
                     "execute_resolved",
@@ -361,31 +369,34 @@ class F15AgentOrchestrationTests(unittest.TestCase):
             log.setLevel(previous_level)
 
         raw_gets = [call for call in get_tool.call_args_list if call.args == (raw_unknown,)]
+        base_calls = [
+            call
+            for call in execute.call_args_list
+            if len(call.args) == 2 and call.args[1].call_id == "BASE"
+        ]
         self.assertEqual(len(raw_gets), 1)
-        self.assertEqual(execute.call_count, 0)
+        self.assertEqual(len(base_calls), 1)
+        self.assertEqual(base_provenance, [(base_calls[0].args[0].request_id, "deterministic_base_retrieval")])
         self.assertEqual(execute_resolved.call_count, 0)
-        self.assertEqual(save.call_count, 0)
-        self.assertEqual(self._chat_count(), 0)
-        self.assertEqual(status, 422)
-        self.assertEqual(body["detail"]["diagnostics"]["evidence_count"], 0)
-        self.assertEqual(body["detail"]["diagnostics"]["tool_calls_used"], 0)
+        self.assertEqual(save.call_count, 1)
+        self.assertEqual(self._chat_count(), 1)
+        self.assertEqual(status, 200)
+        self.assertEqual(body["agent_status"], "completed")
+        self.assertEqual(body["budget_usage"]["tool_calls_used"], 0)
+        self.assertTrue(body["evidence"])
         self.assertEqual(
             captured_results[0]["agent_trace"][0]["action"],
             "insufficient_evidence",
         )
-        attempts = body["detail"]["diagnostics"]["planner_attempts"]
-        self.assertEqual(attempts[0]["stage"], "semantic")
-        self.assertEqual(
-            attempts[0]["stable_code"], "semantic_invalid_tool_contract"
-        )
-        self.assertEqual(attempts[0]["field_path"], ["action"])
-        self.assertTrue(attempts[1]["repair_attempt"])
+        self.assertTrue(captured_results[0]["evidence"])
+        self.assertEqual(captured_results[0]["budget_usage"]["tool_calls_used"], 0)
+        self.assertEqual(captured_failures, [])
+        self.assertEqual(provider.planner_calls, 2)
         serialized = json.dumps(
             {
                 "body": body,
                 "result": captured_results,
                 "failure": captured_failures,
-                "failure_log": format_ask_failure_log(captured_failures[0]),
                 "records": collector.records,
             },
             default=str,
@@ -411,6 +422,7 @@ class F15AgentOrchestrationTests(unittest.TestCase):
         captured_results: list[dict] = []
         with (
             patch.object(registry, "get", wraps=registry.get) as get_tool,
+            patch.object(registry, "execute", wraps=registry.execute) as execute,
             patch.object(
                 registry,
                 "execute_resolved",
@@ -469,8 +481,17 @@ class F15AgentOrchestrationTests(unittest.TestCase):
             deadline_at=10.0,
             final_answer_reserve_ms=3_000,
         )
+        base_provenance: list[tuple[str, str]] = []
+        original_execute = registry.execute
+
+        def capture_base(context, call):
+            if call.call_id == "BASE":
+                base_provenance.append((context.request_id, context.candidate_provenance))
+            return original_execute(context, call)
+
         with (
             patch.object(registry, "get", wraps=registry.get) as get_tool,
+            patch.object(registry, "execute", side_effect=capture_base) as execute,
             patch.object(
                 agent_core, "answer_from_evidence", wraps=agent_core.answer_from_evidence
             ) as finalization,
@@ -517,10 +538,26 @@ class F15AgentOrchestrationTests(unittest.TestCase):
         self.assertEqual(snapshot_a["request_id"], "f15-request-a")
         self.assertEqual(snapshot_b["request_id"], "f15-request-b")
         self.assertEqual(snapshot_a["evidence_count"], 1)
-        self.assertEqual(snapshot_b["evidence_count"], 0)
+        self.assertEqual(snapshot_b["evidence_count"], 1)
         self.assertIsNot(recorder_a, recorder_b)
         raw_gets = [call for call in get_tool.call_args_list if call.args == (raw_unknown,)]
         self.assertEqual(len(raw_gets), 1)
+        base_calls = [
+            call
+            for call in execute.call_args_list
+            if len(call.args) == 2 and call.args[1].call_id == "BASE"
+        ]
+        self.assertEqual(
+            [call.args[0].request_id for call in base_calls],
+            ["f15-request-a", "f15-request-b"],
+        )
+        self.assertEqual(
+            base_provenance,
+            [
+                ("f15-request-a", "deterministic_base_retrieval"),
+                ("f15-request-b", "deterministic_base_retrieval"),
+            ],
+        )
 
 
 if __name__ == "__main__":

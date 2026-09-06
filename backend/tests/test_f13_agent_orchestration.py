@@ -76,12 +76,14 @@ class _CutoffProviderHarness:
         self.cancellation = cancellation
         self.planner_calls = 0
         self.final_calls = 0
+        self.events: list[str] = []
 
     def opener(self, request, *, timeout):
         del timeout
         payload = json.loads(request.data.decode("utf-8"))
         system_prompt = payload["messages"][0]["content"]
         if "bounded_repository_planner" in system_prompt:
+            self.events.append("planner")
             self.planner_calls += 1
             if self.cancellation is not None:
                 self.cancellation.cancel()
@@ -89,6 +91,7 @@ class _CutoffProviderHarness:
                 raise urllib.error.URLError("safe fake planner failure")
             self.clock.value = self.planner_end
             raise TimeoutError("safe fake planner cutoff")
+        self.events.append("final")
         self.final_calls += 1
         if self.final_error == "provider":
             raise urllib.error.URLError("safe fake final failure")
@@ -174,6 +177,7 @@ class F13AgentOrchestrationTests(unittest.TestCase):
         cancellation: CancellationToken | None = None,
         limits: AgentLimits | None = None,
         recorder: SmokeDiagnosticsRecorder | None = None,
+        registry=None,
     ):
         client = _client(harness)
         patches = self._clock_patches(harness.clock)
@@ -192,6 +196,7 @@ class F13AgentOrchestrationTests(unittest.TestCase):
                 diagnostics_recorder=recorder,
                 request_id="f13-cutoff",
                 request_budget=self._budget(),
+                registry=registry,
             )
 
     def _route(self, harness: _CutoffProviderHarness):
@@ -252,7 +257,6 @@ class F13AgentOrchestrationTests(unittest.TestCase):
     def test_planner_deadline_nonrecoverable_conditions_propagate(self):
         cases = (
             ("request-deadline", {"planner_end": 10.1}, {}),
-            ("no-evidence", {}, {"path": None, "symbol": None}),
             ("provider-error", {"planner_error": "provider"}, {}),
         )
         for name, harness_kwargs, run_kwargs in cases:
@@ -262,6 +266,56 @@ class F13AgentOrchestrationTests(unittest.TestCase):
                 with self.assertRaises(ProviderError):
                     self._run_cutoff(harness, **run_kwargs)
                 self.assertEqual(harness.final_calls, 0)
+
+        # A valid unconstrained question now has deterministic base Evidence
+        # before the Planner deadline. That makes the deadline-recovery branch
+        # authorized without turning the base search into a Planner tool call.
+        clock = _Clock()
+        harness = _CutoffProviderHarness(clock)
+        registry = build_m2_tool_registry(self.limits)
+        base_calls: list[tuple[str, str, str, dict]] = []
+        original_execute = registry.execute
+
+        def capture_base(context, call):
+            if call.call_id == "BASE":
+                harness.events.append("base")
+                base_calls.append(
+                    (
+                        context.candidate_provenance,
+                        call.call_id,
+                        call.tool_name,
+                        dict(call.parameters),
+                    )
+                )
+            return original_execute(context, call)
+
+        with patch.object(registry, "execute", side_effect=capture_base):
+            recovered = self._run_cutoff(
+                harness,
+                path=None,
+                symbol=None,
+                registry=registry,
+            )
+        self.assertEqual(
+            base_calls,
+            [
+                (
+                    "deterministic_base_retrieval",
+                    "BASE",
+                    "search_code",
+                    {
+                        "query": "authenticate_user",
+                        "top_k": 1,
+                    },
+                )
+            ],
+        )
+        self.assertEqual(harness.events, ["base", "planner", "final"])
+        self.assertEqual(harness.planner_calls, 1)
+        self.assertEqual(harness.final_calls, 1)
+        self.assertEqual(recovered["agent_status"], "completed")
+        self.assertEqual(recovered["budget_usage"]["tool_calls_used"], 0)
+        self.assertTrue(recovered["evidence"])
 
         cancellation = CancellationToken()
         clock = _Clock()
@@ -496,24 +550,47 @@ class F13AgentOrchestrationTests(unittest.TestCase):
     def test_unknown_tool_has_one_fixed_safe_diagnostic_and_shared_failure_payload(self):
         raw_unknown = "private_unregistered_tool"
         recorder = SmokeDiagnosticsRecorder()
-        result = run_bounded_agent(
-            "authenticate_user",
-            self.bundle,
-            NoLlm(),
-            self.database,
-            disabled_embedding_service(),
-            planner=ScriptedPlanner(
-                [decision("continue", raw_unknown, {}), decision("answer")]
-            ),
-            diagnostics_recorder=recorder,
-            request_id="unknown-tool-request",
-        )
+        registry = build_m2_tool_registry(self.limits)
+        base_calls: list[tuple[str, str, str]] = []
+        original_execute = registry.execute
+
+        def capture_base(context, call):
+            if call.call_id == "BASE":
+                base_calls.append(
+                    (context.candidate_provenance, call.call_id, call.tool_name)
+                )
+            return original_execute(context, call)
+
+        with patch.object(registry, "execute", side_effect=capture_base), patch.object(
+            registry, "execute_resolved", wraps=registry.execute_resolved
+        ) as execute_resolved:
+            result = run_bounded_agent(
+                "authenticate_user",
+                self.bundle,
+                NoLlm(),
+                self.database,
+                disabled_embedding_service(),
+                planner=ScriptedPlanner(
+                    [decision("continue", raw_unknown, {}), decision("answer")]
+                ),
+                diagnostics_recorder=recorder,
+                request_id="unknown-tool-request",
+                registry=registry,
+            )
         diagnostics = recorder.snapshot()
+        self.assertEqual(
+            base_calls,
+            [("deterministic_base_retrieval", "BASE", "search_code")],
+        )
+        self.assertEqual(execute_resolved.call_count, 0)
         self.assertEqual(diagnostics.get("tool_executions", []), [])
         self.assertEqual(diagnostics.get("tool_calls_attempted", 0), 0)
         self.assertEqual(diagnostics.get("tool_calls_failed", 0), 0)
         self.assertEqual(result["budget_usage"]["tool_calls_used"], 0)
-        self.assertEqual(result["evidence"], [])
+        self.assertTrue(result["evidence"])
+        self.assertTrue(
+            all(item["project_id"] == self.project_id for item in result["evidence"])
+        )
         attempts = diagnostics["planner_attempts"]
         self.assertEqual(attempts[0]["stage"], "semantic")
         self.assertEqual(

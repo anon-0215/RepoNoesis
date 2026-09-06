@@ -4,7 +4,11 @@ import json
 import re
 from typing import Any
 
-from app.services.smoke_diagnostics import normalize_public_failure_reason
+from app.services.smoke_diagnostics import (
+    BASE_RETRIEVAL_REJECTION_CODES,
+    BASE_RETRIEVAL_STATUSES,
+    normalize_public_failure_reason,
+)
 
 
 MAX_ASK_DIAGNOSTICS_BYTES = 4_096
@@ -225,6 +229,9 @@ def build_ask_success_diagnostics(
             recorder_snapshot.get("final_answer_repair_failure")
         ),
     }
+    base_retrieval = _safe_base_retrieval(recorder_snapshot.get("base_retrieval"))
+    if base_retrieval is not None:
+        diagnostics["base_retrieval"] = base_retrieval
     return _bounded_payload(diagnostics)
 
 
@@ -402,6 +409,9 @@ def build_ask_failure_detail(
             recorder_snapshot.get("final_answer_repair_failure")
         ),
     }
+    base_retrieval = _safe_base_retrieval(recorder_snapshot.get("base_retrieval"))
+    if base_retrieval is not None:
+        diagnostics["base_retrieval"] = base_retrieval
     diagnostics = _bounded_payload(diagnostics)
     message = (
         "The server rejected an invalid answer response before persistence."
@@ -600,6 +610,34 @@ def _safe_tool_executions(value: Any) -> list[dict[str, Any]]:
             }
         )
     return safe
+
+
+def _safe_base_retrieval(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    attempted = value.get("attempted")
+    status = value.get("status")
+    if not isinstance(attempted, bool) or status not in BASE_RETRIEVAL_STATUSES:
+        return None
+    raw_rejections = value.get("rejection_code_counts")
+    rejection_code_counts: dict[str, int] = {}
+    if isinstance(raw_rejections, dict):
+        for code in BASE_RETRIEVAL_REJECTION_CODES:
+            count = raw_rejections.get(code)
+            if isinstance(count, int) and not isinstance(count, bool) and count > 0:
+                rejection_code_counts[code] = _count(count)
+    return {
+        "attempted": attempted,
+        "status": status,
+        "retrieval_hit_count": _count(value.get("retrieval_hit_count")),
+        "normalized_candidate_count": _count(
+            value.get("normalized_candidate_count")
+        ),
+        "valid_candidate_count": _count(value.get("valid_candidate_count")),
+        "new_evidence_count": _count(value.get("new_evidence_count")),
+        "rejected_candidate_count": _count(value.get("rejected_candidate_count")),
+        "rejection_code_counts": rejection_code_counts,
+    }
 
 
 def _safe_planner_attempts(value: Any) -> list[dict[str, Any]]:
@@ -851,6 +889,7 @@ def _bounded_payload(value: dict[str, Any]) -> dict[str, Any]:
         "citation_failure_reason_code",
         "relation_failure_reason_code",
         "elapsed_ms",
+        "base_retrieval",
         "planner_attempts",
         "final_answer_protocol_failure",
         "final_answer_initial_failure",
@@ -971,6 +1010,7 @@ def _minimal_ask_payload(value: dict[str, Any]) -> dict[str, Any]:
         "success_stage",
         "core_validation_passed",
         "observability_degraded",
+        "base_retrieval",
     )
     result = {key: value[key] for key in keys if key in value}
     result["diagnostics_truncated"] = True

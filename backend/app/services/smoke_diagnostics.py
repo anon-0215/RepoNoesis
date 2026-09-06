@@ -126,6 +126,31 @@ _TOOL_REASON_CODES = frozenset(
         "unknown_tool",
     }
 )
+BASE_RETRIEVAL_STATUSES = frozenset(
+    {
+        "succeeded",
+        "zero_hit",
+        "all_rejected",
+        "failed",
+        "rejected",
+        "timed_out",
+        "cancelled",
+        "deadline_exceeded",
+    }
+)
+BASE_RETRIEVAL_REJECTION_CODES = (
+    "project_mismatch",
+    "repository_revision_mismatch",
+    "chunk_not_found",
+    "chunk_identity_mismatch",
+    "path_mismatch",
+    "language_mismatch",
+    "symbol_mismatch",
+    "span_mismatch",
+    "content_hash_mismatch",
+    "retrieval_sources_invalid",
+    "score_invalid",
+)
 _PROVIDER_ATTEMPT_OUTCOMES = frozenset(
     {"success", "http_error", "timeout", "network_error", "invalid_response", "deadline"}
 )
@@ -223,6 +248,7 @@ class SmokeDiagnosticsRecorder:
         self._registered_tools: set[str] = set()
         self._tool_calls: dict[str, dict[str, int | str]] = {}
         self._tool_executions: list[dict[str, Any]] = []
+        self._base_retrieval: dict[str, Any] | None = None
         self._planner_attempts: list[dict[str, Any]] = []
         self._final_answer_protocol_failure: dict[str, Any] | None = None
         self._final_answer_initial_failure: dict[str, Any] | None = None
@@ -456,6 +482,39 @@ class SmokeDiagnosticsRecorder:
             }
         )
 
+    def record_base_retrieval(
+        self,
+        *,
+        attempted: bool,
+        status: str,
+        retrieval_hit_count: int,
+        normalized_candidate_count: int,
+        valid_candidate_count: int,
+        new_evidence_count: int,
+        rejected_candidate_count: int,
+        rejection_code_counts: dict[str, int],
+    ) -> None:
+        """Record one request-local base phase without Planner tool accounting."""
+
+        if self._base_retrieval is not None:
+            self._truncated = True
+            return
+        safe = _safe_base_retrieval(
+            {
+                "attempted": attempted,
+                "status": status,
+                "retrieval_hit_count": retrieval_hit_count,
+                "normalized_candidate_count": normalized_candidate_count,
+                "valid_candidate_count": valid_candidate_count,
+                "new_evidence_count": new_evidence_count,
+                "rejected_candidate_count": rejected_candidate_count,
+                "rejection_code_counts": rejection_code_counts,
+            }
+        )
+        if safe is None:
+            raise ValueError("unsupported base retrieval diagnostics")
+        self._base_retrieval = safe
+
     def record_unknown_tool_rejection(self) -> None:
         """Record a content-free sentinel for an unregistered Planner tool."""
 
@@ -669,6 +728,8 @@ class SmokeDiagnosticsRecorder:
             payload["tool_calls"] = [
                 dict(self._tool_calls[name]) for name in sorted(self._tool_calls)
             ][:MAX_TOOL_ENTRIES]
+        if self._base_retrieval is not None:
+            payload["base_retrieval"] = dict(self._base_retrieval)
         if self._tool_executions:
             payload["tool_executions"] = [dict(item) for item in self._tool_executions]
         if self._planner_attempts:
@@ -838,6 +899,7 @@ def _minimal_smoke_diagnostics(value: dict[str, Any]) -> dict[str, Any]:
         "relation_validation_passed",
         "post_generation_validation_passed",
         "elapsed_ms",
+        "base_retrieval",
     )
     result = {key: value[key] for key in keys if key in value}
     result["diagnostics_truncated"] = True
@@ -1004,6 +1066,9 @@ def _safe_smoke_diagnostics(value: Any) -> dict[str, Any]:
             )
         if safe_executions:
             result["tool_executions"] = safe_executions
+    base_retrieval = _safe_base_retrieval(value.get("base_retrieval"))
+    if base_retrieval is not None:
+        result["base_retrieval"] = base_retrieval
     planner_attempts = value.get("planner_attempts")
     if isinstance(planner_attempts, list):
         safe_attempts = [
@@ -1035,6 +1100,36 @@ def _bounded_count(value: Any) -> int:
     if not isinstance(value, int) or isinstance(value, bool):
         return 0
     return min(1_000_000, max(0, value))
+
+
+def _safe_base_retrieval(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    attempted = value.get("attempted")
+    status = value.get("status")
+    if not isinstance(attempted, bool) or status not in BASE_RETRIEVAL_STATUSES:
+        return None
+    rejection_counts = value.get("rejection_code_counts")
+    safe_rejections: dict[str, int] = {}
+    if isinstance(rejection_counts, dict):
+        for code in BASE_RETRIEVAL_REJECTION_CODES:
+            count = rejection_counts.get(code)
+            if isinstance(count, int) and not isinstance(count, bool) and count > 0:
+                safe_rejections[code] = _bounded_count(count)
+    return {
+        "attempted": attempted,
+        "status": status,
+        "retrieval_hit_count": _bounded_count(value.get("retrieval_hit_count")),
+        "normalized_candidate_count": _bounded_count(
+            value.get("normalized_candidate_count")
+        ),
+        "valid_candidate_count": _bounded_count(value.get("valid_candidate_count")),
+        "new_evidence_count": _bounded_count(value.get("new_evidence_count")),
+        "rejected_candidate_count": _bounded_count(
+            value.get("rejected_candidate_count")
+        ),
+        "rejection_code_counts": safe_rejections,
+    }
 
 
 def _safe_provider_metadata(value: Any) -> dict[str, Any]:

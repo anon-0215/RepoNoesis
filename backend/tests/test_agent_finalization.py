@@ -87,9 +87,9 @@ class AgentFinalizationTests(unittest.TestCase):
             ],
         )
 
-    def _run(self, planner, llm, *, limits, recorder=None):
+    def _run(self, planner, llm, *, limits, recorder=None, question="authenticate_user"):
         return run_bounded_agent(
-            "authenticate_user",
+            question,
             self.bundle,
             llm,
             self.database,
@@ -389,6 +389,7 @@ class AgentFinalizationTests(unittest.TestCase):
             llm,
             limits=replace(AgentLimits(), max_tool_calls=1),
             recorder=recorder,
+            question="definitely_absent",
         )
 
         diagnostics = recorder.snapshot()
@@ -447,6 +448,7 @@ class AgentFinalizationTests(unittest.TestCase):
             planner,
             llm,
             limits=replace(AgentLimits(), max_tool_calls=2),
+            question="definitely_absent",
         )
 
         self.assertEqual(result["agent_status"], "insufficient_evidence")

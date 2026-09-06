@@ -31,7 +31,7 @@ from app.config import (
 )
 from app.database import Database, SCHEMA_VERSION
 from app.services.analyzer import analyze_snapshot
-from app.services.agent_core import run_bounded_agent
+from app.services.agent_core import run_bounded_agent, validate_non_blank_question
 from app.services.agent_contracts import (
     RequestBudget,
     normalize_repository_relative_path,
@@ -270,6 +270,11 @@ class AskRequest(BaseModel):
     retrieval_version: Literal["v1", "v2"] = "v1"
     hierarchy_mode: Literal["off", "normalize_v1"] = "off"
     relation_mode: Literal["off", "expand_v1"] = "off"
+
+    @field_validator("question")
+    @classmethod
+    def validate_question(cls, value: str) -> str:
+        return validate_non_blank_question(value)
 
     @field_validator("path")
     @classmethod
