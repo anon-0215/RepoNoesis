@@ -330,7 +330,9 @@ class F12AgentOrchestrationTests(unittest.TestCase):
             path="src/auth.py",
             symbol="authenticate_user",
             evidence_count=1,
-            limits=replace(AgentLimits(), max_agent_steps=3),
+            limits=replace(
+                AgentLimits(), max_agent_steps=3, max_no_progress_steps=3
+            ),
             diagnostics_recorder=recorder,
             request_id="locator-recovery",
         )
@@ -605,7 +607,9 @@ class F12AgentOrchestrationTests(unittest.TestCase):
                     "hierarchy_mode": "off",
                     "relation_mode": "off",
                 },
-                limits=replace(AgentLimits(), max_agent_steps=3),
+                limits=replace(
+                    AgentLimits(), max_agent_steps=3, max_no_progress_steps=3
+                ),
             )
         self.assertEqual(status, 200)
         self.assertEqual(events[0], "tool:seed")

@@ -10,6 +10,8 @@ from unittest.mock import patch
 
 from pydantic import BaseModel, ConfigDict
 
+import app.services.agent_tools as agent_tools
+import app.services.agent_core as agent_core
 from app.database import Database
 from app.services.agent_contracts import (
     AgentLimits,
@@ -24,7 +26,12 @@ from app.services.agent_tools import (
     build_m2_tool_registry,
     build_tool_context,
 )
-from tests.m1_helpers import REVISION, disabled_embedding_service, make_project
+from tests.m1_helpers import (
+    REVISION,
+    disabled_embedding_service,
+    make_chunk,
+    make_project,
+)
 
 
 class EmptyInput(BaseModel):
@@ -230,6 +237,442 @@ class M2ToolTests(unittest.TestCase):
             ["src/admin.py", "src/auth.py"],
         )
         self.assertTrue(all("references" not in item for item in observation.structured_results))
+
+    def test_lookup_symbol_promotes_via_canonical_chunk_and_duplicate_is_zero_progress(self):
+        _call, first = self._call(
+            "lookup_symbol",
+            {"symbol": "AuthService.authenticate_user", "match_mode": "exact"},
+        )
+        self.assertEqual(first.metrics["raw_result_count"], 1)
+        self.assertEqual(first.metrics["normalized_candidate_count"], 1)
+        self.assertEqual(first.metrics["valid_candidate_count"], 1)
+        self.assertEqual(first.metrics["new_evidence_count"], 1)
+        self.assertEqual(first.metrics["result_count"], 1)
+        evidence = self.store.all(self.context.request_id)
+        self.assertEqual(len(evidence), 1)
+        self.assertEqual(first.structured_results[0]["evidence_id"], evidence[0].evidence_id)
+        self.assertIn("return verify", evidence[0].excerpt)
+
+        _call, duplicate = self._call(
+            "lookup_symbol",
+            {"symbol": "AuthService.authenticate_user", "match_mode": "exact"},
+        )
+        self.assertEqual(duplicate.metrics["raw_result_count"], 1)
+        self.assertEqual(duplicate.metrics["new_evidence_count"], 0)
+        self.assertEqual(duplicate.metrics["result_count"], 0)
+        self.assertEqual(len(self.store.all(self.context.request_id)), 1)
+
+    def test_lookup_symbol_invalid_locator_fails_closed_without_blocking_valid_peer(self):
+        valid = agent_tools.SymbolRetriever(self.db).search(
+            self.project_id,
+            "AuthService.authenticate_user",
+            top_k=1,
+            match_mode="exact",
+            explicit_symbol=True,
+            repository_revision=REVISION,
+        )[0]
+        forged = replace(valid, chunk_identity="forged-identity")
+        with patch.object(
+            agent_tools.SymbolRetriever,
+            "search",
+            return_value=[forged, valid],
+        ):
+            _call, observation = self._call(
+                "lookup_symbol",
+                {"symbol": "AuthService.authenticate_user", "match_mode": "exact"},
+            )
+        self.assertEqual(observation.metrics["raw_result_count"], 2)
+        self.assertEqual(observation.metrics["valid_candidate_count"], 1)
+        self.assertEqual(observation.metrics["new_evidence_count"], 1)
+        self.assertEqual(observation.metrics["candidate_rejection_chunk_identity_mismatch_count"], 1)
+        self.assertEqual(len(self.store.all(self.context.request_id)), 1)
+
+    def test_lookup_symbol_validates_before_final_limit_and_never_claims_existing_evidence(self):
+        valid = agent_tools.SymbolRetriever(self.db).search(
+            self.project_id,
+            "AuthService.authenticate_user",
+            top_k=1,
+            match_mode="exact",
+            explicit_symbol=True,
+            repository_revision=REVISION,
+        )[0]
+        invalid_first = replace(valid, chunk_identity="forged-identity")
+        with patch.object(
+            agent_tools.SymbolRetriever,
+            "search",
+            return_value=[invalid_first, valid],
+        ):
+            _call, observation = self._call(
+                "lookup_symbol",
+                {"symbol": "AuthService.authenticate_user", "match_mode": "exact", "top_k": 1},
+            )
+        self.assertEqual(observation.metrics["raw_result_count"], 2)
+        self.assertEqual(observation.metrics["valid_candidate_count"], 1)
+        self.assertEqual(observation.metrics["new_evidence_count"], 1)
+        self.assertEqual(observation.metrics["candidate_rejection_chunk_identity_mismatch_count"], 1)
+        self.assertEqual(
+            [item["qualified_name"] for item in observation.structured_results],
+            [valid.qualified_name],
+        )
+        self.assertEqual(observation.structured_results[0]["evidence_id"], "E1")
+
+        forged_existing_identity = replace(valid, content_hash="0" * 64)
+        with patch.object(
+            agent_tools.SymbolRetriever,
+            "search",
+            return_value=[forged_existing_identity],
+        ):
+            _call, rejected = self._call(
+                "lookup_symbol",
+                {"symbol": "AuthService.authenticate_user", "match_mode": "exact", "top_k": 1},
+            )
+        self.assertEqual(rejected.metrics["new_evidence_count"], 0)
+        self.assertEqual(rejected.metrics["result_count"], 0)
+        self.assertEqual(rejected.structured_results, [])
+        self.assertEqual(agent_core._progress_keys("lookup_symbol", rejected.structured_results), set())
+
+        _call, duplicate = self._call(
+            "lookup_symbol",
+            {"symbol": "AuthService.authenticate_user", "match_mode": "exact", "top_k": 1},
+        )
+        self.assertEqual(duplicate.metrics["new_evidence_count"], 0)
+        self.assertEqual(duplicate.metrics["result_count"], 0)
+        self.assertIsNone(duplicate.structured_results[0]["evidence_id"])
+        self.assertEqual(agent_core._progress_keys("lookup_symbol", duplicate.structured_results), set())
+
+    def test_lookup_symbol_rejects_raw_score_and_rank_type_confusion_without_blocking_peer(self):
+        valid = agent_tools.SymbolRetriever(self.db).search(
+            self.project_id,
+            "AuthService.authenticate_user",
+            top_k=1,
+            match_mode="exact",
+            explicit_symbol=True,
+            repository_revision=REVISION,
+        )[0]
+        invalid_values = (
+            ("score_false", {"symbol_score": False}),
+            ("score_true", {"symbol_score": True}),
+            ("score_string", {"symbol_score": "1.0"}),
+            ("score_nan", {"symbol_score": float("nan")}),
+            ("score_infinite", {"symbol_score": float("inf")}),
+            ("rank_true", {"symbol_rank": True}),
+            ("rank_float", {"symbol_rank": 1.0}),
+            ("rank_string", {"symbol_rank": "1"}),
+        )
+        for name, values in invalid_values:
+            with self.subTest(name=name):
+                invalid = replace(valid, **values)
+                with patch.object(
+                    agent_tools.SymbolRetriever,
+                    "search",
+                    return_value=[invalid, valid],
+                ):
+                    _call, observation = self._call(
+                        "lookup_symbol",
+                        {"symbol": "AuthService.authenticate_user", "match_mode": "exact", "top_k": 1},
+                    )
+                self.assertEqual(observation.status, "succeeded")
+                self.assertEqual(observation.metrics["raw_result_count"], 2)
+                self.assertEqual(observation.metrics["valid_candidate_count"], 1)
+                self.assertEqual(observation.metrics["candidate_rejection_score_invalid_count"], 1)
+                self.assertEqual(
+                    [item["qualified_name"] for item in observation.structured_results],
+                    [valid.qualified_name],
+                )
+
+    def test_lookup_symbol_rejected_locator_cannot_claim_existing_evidence_id_or_progress(self):
+        _call, first = self._call(
+            "lookup_symbol",
+            {"symbol": "AuthService.authenticate_user", "match_mode": "exact", "top_k": 1},
+        )
+        self.assertEqual(first.metrics["new_evidence_count"], 1)
+        valid = agent_tools.SymbolRetriever(self.db).search(
+            self.project_id,
+            "AuthService.authenticate_user",
+            top_k=1,
+            match_mode="exact",
+            explicit_symbol=True,
+            repository_revision=REVISION,
+        )[0]
+        forged_existing_identity = replace(valid, content_hash="0" * 64)
+        with patch.object(
+            agent_tools.SymbolRetriever,
+            "search",
+            return_value=[forged_existing_identity],
+        ):
+            _call, observation = self._call(
+                "lookup_symbol",
+                {"symbol": "AuthService.authenticate_user", "match_mode": "exact", "top_k": 1},
+            )
+        self.assertEqual(observation.metrics["new_evidence_count"], 0)
+        self.assertEqual(observation.metrics["result_count"], 0)
+        self.assertEqual(observation.structured_results, [])
+        self.assertEqual(agent_core._progress_keys("lookup_symbol", observation.structured_results), set())
+
+    def test_read_source_mapping_cap_reports_pre_cap_count_separately_from_body_truncation(self):
+        source = "".join(f"line_{index}\n" for index in range(1, 51))
+        self.project_id, self.bundle = make_project(
+            self.db, [("src/mapping.py", "mapping_container", source)]
+        )
+        self.store = EvidenceStore(capacity=1)
+        self.context = build_tool_context(
+            request_id="mapping-cap-only",
+            bundle=self.bundle,
+            database=self.db,
+            embedding_service=disabled_embedding_service(),
+            evidence_store=self.store,
+            limits=self.limits,
+            cancellation=CancellationToken(),
+            deadline_monotonic=time.monotonic() + 60,
+        )
+        self.db.save_code_chunks_for_project(
+            self.project_id,
+            [
+                make_chunk(
+                    "src/mapping.py",
+                    f"candidate_{index}",
+                    source.splitlines(keepends=True)[index - 1],
+                    start_line=index,
+                )
+                for index in range(1, 51)
+            ],
+        )
+        _call, observation = self._call(
+            "read_source", {"path": "src/mapping.py", "start_line": 1, "end_line": 50}
+        )
+        self.assertEqual(observation.metrics["raw_result_count"], 50)
+        self.assertEqual(observation.metrics["mapping_candidate_count"], 50)
+        self.assertEqual(observation.metrics["mapping_considered_count"], 20)
+        self.assertTrue(observation.metrics["mapping_truncated"])
+        self.assertFalse(observation.truncated)
+
+    def test_read_source_prefers_complementary_siblings_and_reports_mapping_truncation(self):
+        source = (
+            "class AuthService:\n"
+            "    def authenticate_user(self, password):\n"
+            "        return verify(password)\n"
+        )
+        parent = make_chunk("src/auth.py", "AuthService", source)
+        child_one = make_chunk(
+            "src/auth.py", "AuthService.authenticate_user.signature", source.splitlines(keepends=True)[1], start_line=2
+        )
+        child_two = make_chunk(
+            "src/auth.py", "AuthService.authenticate_user.body", source.splitlines(keepends=True)[2], start_line=3
+        )
+        self.db.save_code_chunks_for_project(self.project_id, [parent, child_one, child_two])
+        _call, sibling_observation = self._call(
+            "read_source", {"path": "src/auth.py", "start_line": 2, "end_line": 3}
+        )
+        self.assertEqual(sibling_observation.status, "succeeded")
+        self.assertEqual(
+            [item.qualified_name for item in self.store.all(self.context.request_id)],
+            [child_one["qualified_name"], child_two["qualified_name"]],
+        )
+
+        hierarchy = self.db.get_code_chunks_for_hierarchy(
+            self.project_id, REVISION, "src/auth.py", limit=20
+        )
+        forward = agent_tools._map_read_range_to_chunks(
+            hierarchy, start_line=2, end_line=3, limit=2
+        )
+        backward = agent_tools._map_read_range_to_chunks(
+            list(reversed(hierarchy)), start_line=2, end_line=3, limit=2
+        )
+        self.assertEqual(
+            [item["id"] for item in forward], [item["id"] for item in backward]
+        )
+
+        mapping_source = "".join(f"line_{index}\n" for index in range(1, 51))
+        self.project_id, self.bundle = make_project(
+            self.db, [("src/mapping.py", "mapping_container", mapping_source)]
+        )
+        self.store = EvidenceStore(capacity=1)
+        self.context = build_tool_context(
+            request_id="mapping-cap",
+            bundle=self.bundle,
+            database=self.db,
+            embedding_service=disabled_embedding_service(),
+            evidence_store=self.store,
+            limits=self.limits,
+            cancellation=CancellationToken(),
+            deadline_monotonic=time.monotonic() + 60,
+        )
+        self.db.save_code_chunks_for_project(
+            self.project_id,
+            [
+                make_chunk(
+                    "src/mapping.py",
+                    f"candidate_{index}",
+                    mapping_source.splitlines(keepends=True)[index - 1],
+                    start_line=index,
+                )
+                for index in range(1, 51)
+            ],
+        )
+        _call, capped = self._call(
+            "read_source", {"path": "src/mapping.py", "start_line": 1, "end_line": 50}
+        )
+        self.assertEqual(capped.metrics["raw_result_count"], 50)
+        self.assertEqual(capped.metrics["mapping_candidate_count"], 50)
+        self.assertEqual(capped.metrics["mapping_considered_count"], 20)
+        self.assertTrue(capped.metrics["mapping_truncated"])
+        self.assertFalse(capped.truncated)
+
+    def test_read_source_prefers_child_for_narrow_span_and_uses_parent_only_as_fallback(self):
+        source = (
+            "class AuthService:\n"
+            "    def authenticate_user(self, password):\n"
+            "        return verify(password)\n"
+        )
+        parent = make_chunk("src/auth.py", "AuthService", source)
+        child = make_chunk(
+            "src/auth.py",
+            "AuthService.authenticate_user",
+            source.splitlines(keepends=True)[1],
+            start_line=2,
+        )
+        self.db.save_code_chunks_for_project(self.project_id, [parent, child])
+        _call, narrow = self._call(
+            "read_source", {"path": "src/auth.py", "start_line": 2, "end_line": 2}
+        )
+        self.assertEqual(narrow.status, "succeeded")
+        self.assertEqual(
+            [item.qualified_name for item in self.store.all(self.context.request_id)],
+            [child["qualified_name"]],
+        )
+
+        fallback_store = EvidenceStore()
+        fallback_context = build_tool_context(
+            request_id="parent-fallback",
+            bundle=self.bundle,
+            database=self.db,
+            embedding_service=disabled_embedding_service(),
+            evidence_store=fallback_store,
+            limits=self.limits,
+            cancellation=CancellationToken(),
+            deadline_monotonic=time.monotonic() + 60,
+        )
+        self.db.save_code_chunks_for_project(self.project_id, [parent])
+        fallback_call = ToolCall(
+            "parent-fallback-call",
+            "S",
+            "read_source",
+            "1",
+            {"path": "src/auth.py", "start_line": 2, "end_line": 2},
+            15_000,
+            {},
+        )
+        fallback = self.registry.execute(fallback_context, fallback_call)
+        self.assertEqual(fallback.status, "succeeded")
+        self.assertEqual(
+            [item.qualified_name for item in fallback_store.all("parent-fallback")],
+            [parent["qualified_name"]],
+        )
+
+    def test_lookup_duplicate_with_base_retrieval_merges_candidate_provenance(self):
+        self._call("search_code", {"query": "verify"})
+        _call, observation = self._call(
+            "lookup_symbol",
+            {"symbol": "AuthService.authenticate_user", "match_mode": "exact"},
+        )
+        self.assertEqual(observation.metrics["new_evidence_count"], 0)
+        self.assertEqual(len(self.store.all(self.context.request_id)), 1)
+        provenance = self.context.candidate_pool.accepted_candidates()[0].provenance
+        self.assertEqual(
+            provenance,
+            ("planner_search_code", "planner_lookup_symbol"),
+        )
+
+    def test_read_source_maps_complete_canonical_chunks_and_never_uses_read_excerpt(self):
+        _call, observation = self._call(
+            "read_source", {"path": "src/auth.py", "start_line": 2, "end_line": 2}
+        )
+        self.assertEqual(observation.status, "succeeded")
+        self.assertGreaterEqual(observation.metrics["normalized_candidate_count"], 1)
+        self.assertEqual(observation.metrics["new_evidence_count"], 1)
+        self.assertEqual(observation.metrics["result_count"], 1)
+        read_content = observation.structured_results["content"]
+        evidence = self.store.all(self.context.request_id)
+        self.assertEqual(len(evidence), 1)
+        self.assertNotEqual(evidence[0].excerpt, read_content)
+        self.assertIn("return verify", evidence[0].excerpt)
+
+        _call, duplicate = self._call(
+            "read_source", {"path": "src/auth.py", "start_line": 2, "end_line": 2}
+        )
+        self.assertEqual(duplicate.metrics["new_evidence_count"], 0)
+        self.assertEqual(duplicate.metrics["result_count"], 0)
+        self.assertEqual(duplicate.structured_results["evidence"], [])
+
+    def test_read_source_mapping_is_stable_for_nested_chunks_and_respects_capacity(self):
+        self.db.save_code_chunks_for_project(
+            self.project_id,
+            [
+                make_chunk(
+                    "src/auth.py",
+                    "AuthService",
+                    "class AuthService:\n    def authenticate_user(self, password):\n        return verify(password)\n",
+                ),
+                make_chunk(
+                    "src/auth.py",
+                    "AuthService.authenticate_user",
+                    "    def authenticate_user(self, password):\n        return verify(password)\n",
+                    start_line=2,
+                ),
+            ],
+        )
+        _call, observation = self._call(
+            "read_source", {"path": "src/auth.py", "start_line": 1, "end_line": 3}
+        )
+        self.assertEqual(observation.status, "succeeded")
+        self.assertGreaterEqual(observation.metrics["raw_result_count"], 2)
+        self.assertEqual(observation.metrics["new_evidence_count"], 1)
+        self.assertEqual(
+            [item.start_line for item in self.store.all(self.context.request_id)],
+            [1],
+        )
+
+        limited_store = EvidenceStore(capacity=1)
+        limited_context = build_tool_context(
+            request_id="limited-read",
+            bundle=self.bundle,
+            database=self.db,
+            embedding_service=disabled_embedding_service(),
+            evidence_store=limited_store,
+            limits=self.limits,
+            cancellation=CancellationToken(),
+            deadline_monotonic=time.monotonic() + 60,
+        )
+        call = ToolCall(
+            "C",
+            "S",
+            "read_source",
+            "1",
+            {"path": "src/auth.py", "start_line": 1, "end_line": 3},
+            15_000,
+            {},
+        )
+        limited = self.registry.execute(limited_context, call)
+        self.assertEqual(limited.metrics["new_evidence_count"], 1)
+        self.assertEqual(len(limited_store.all("limited-read")), 1)
+
+    def test_read_source_boundary_without_chunk_is_not_mapped_and_metrics_are_content_free(self):
+        chunks = [
+            {
+                "id": 2,
+                "path": "src/auth.py",
+                "qualified_name": "AuthService.authenticate_user",
+                "chunk_type": "function",
+                "start_line": 2,
+                "end_line": 3,
+            },
+        ]
+        self.assertEqual(
+            agent_tools._map_read_range_to_chunks(
+                chunks, start_line=4, end_line=4, limit=20
+            ),
+            [],
+        )
 
     def test_lookup_symbol_no_result_and_bound_revision(self):
         _call, observation = self._call(

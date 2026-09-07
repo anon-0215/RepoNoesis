@@ -12,7 +12,8 @@ from app.database import Database, SCHEMA_VERSION
 from app.services.agent_contracts import AgentLimits, CancellationToken, PlannerDecision
 from app.services.agent_core import run_bounded_agent
 from app.services.qa_agent import INSUFFICIENT_ANSWER
-from tests.m1_helpers import disabled_embedding_service, make_project
+from app.services.smoke_diagnostics import SmokeDiagnosticsRecorder
+from tests.m1_helpers import disabled_embedding_service, make_chunk, make_project
 
 
 class NoLlm:
@@ -65,7 +66,15 @@ class M2AgentTests(unittest.TestCase):
     def tearDown(self):
         self.directory.cleanup()
 
-    def _run(self, planner, *, limits=None, cancellation=None, question="authenticate_user"):
+    def _run(
+        self,
+        planner,
+        *,
+        limits=None,
+        cancellation=None,
+        question="authenticate_user",
+        diagnostics_recorder=None,
+    ):
         return run_bounded_agent(
             question,
             self.bundle,
@@ -75,6 +84,7 @@ class M2AgentTests(unittest.TestCase):
             planner=planner,
             limits=limits,
             cancellation=cancellation,
+            diagnostics_recorder=diagnostics_recorder,
         )
 
     def test_search_observe_replan_answer_and_final_validation(self):
@@ -96,7 +106,7 @@ class M2AgentTests(unittest.TestCase):
         )
         self.assertNotIn("parameters", str(result["agent_trace"]))
 
-    def test_lookup_read_search_flow_is_bounded_and_source_is_not_evidence(self):
+    def test_lookup_read_search_flow_promotes_canonical_evidence_and_is_bounded(self):
         planner = ScriptedPlanner(
             [
                 decision(
@@ -121,9 +131,68 @@ class M2AgentTests(unittest.TestCase):
         self.assertEqual(result["agent_status"], "completed")
         self.assertEqual(
             [step["action"] for step in result["agent_trace"]],
-            ["lookup_symbol", "read_source", "search_code", "answer"],
+            ["lookup_symbol", "read_source"],
         )
         self.assertTrue(result["citations"])
+
+    def test_lookup_diagnostics_distinguish_raw_results_from_evidence_progress(self):
+        recorder = SmokeDiagnosticsRecorder()
+        planner = ScriptedPlanner(
+            [
+                decision("continue", "lookup_symbol", {"symbol": "upload_file"}),
+                decision("answer"),
+            ]
+        )
+        result = self._run(planner, diagnostics_recorder=recorder)
+        self.assertEqual(result["agent_status"], "completed")
+        execution = next(
+            item
+            for item in recorder.snapshot()["tool_executions"]
+            if item["tool_name"] == "lookup_symbol"
+        )
+        self.assertEqual(execution["result_count"], 1)
+        self.assertEqual(execution["evidence_added"], 1)
+        self.assertEqual(execution["candidate_metrics"]["raw_result_count"], 1)
+        self.assertEqual(execution["candidate_metrics"]["new_evidence_count"], 1)
+
+    def test_read_mapping_cap_metrics_reach_safe_agent_diagnostics(self):
+        source = "".join(f"line_{index}\n" for index in range(1, 51))
+        self.project_id, self.bundle = make_project(
+            self.db, [("src/mapping.py", "mapping_container", source)]
+        )
+        self.db.save_code_chunks_for_project(
+            self.project_id,
+            [
+                make_chunk(
+                    "src/mapping.py",
+                    f"candidate_{index}",
+                    source.splitlines(keepends=True)[index - 1],
+                    start_line=index,
+                )
+                for index in range(1, 51)
+            ],
+        )
+        recorder = SmokeDiagnosticsRecorder()
+        planner = ScriptedPlanner(
+            [
+                decision(
+                    "continue",
+                    "read_source",
+                    {"path": "src/mapping.py", "start_line": 1, "end_line": 50},
+                ),
+                decision("answer"),
+            ]
+        )
+        result = self._run(planner, question="mapping", diagnostics_recorder=recorder)
+        self.assertEqual(result["agent_status"], "completed")
+        execution = next(
+            item
+            for item in recorder.snapshot()["tool_executions"]
+            if item["tool_name"] == "read_source"
+        )
+        self.assertEqual(execution["candidate_metrics"]["mapping_candidate_count"], 50)
+        self.assertEqual(execution["candidate_metrics"]["mapping_considered_count"], 20)
+        self.assertTrue(execution["candidate_metrics"]["mapping_truncated"])
 
     def test_invalid_tool_input_is_repaired_before_any_tool_executes(self):
         planner = ScriptedPlanner(
@@ -195,7 +264,7 @@ class M2AgentTests(unittest.TestCase):
             "semantic_invalid_tool_contract",
         )
 
-    def test_identical_call_and_a_b_a_loop_are_rejected_and_terminate(self):
+    def test_duplicate_evidence_does_not_reset_no_progress_before_loop_rejection(self):
         search = decision("continue", "search_code", {"query": "authenticate_user"})
         planner = ScriptedPlanner(
             [
@@ -213,8 +282,9 @@ class M2AgentTests(unittest.TestCase):
             for step in result["agent_trace"]
             if step["tool_calls"]
         ]
-        self.assertIn("rejected", statuses)
-        self.assertIn(result["agent_status"], {"completed", "budget_exhausted"})
+        self.assertEqual(statuses, ["succeeded", "succeeded"])
+        self.assertEqual(result["budget_usage"]["steps_used"], 2)
+        self.assertEqual(result["agent_status"], "completed")
 
     def test_no_progress_and_max_same_tool_calls_stop(self):
         planner = ScriptedPlanner(

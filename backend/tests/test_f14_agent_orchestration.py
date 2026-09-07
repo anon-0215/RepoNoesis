@@ -444,7 +444,7 @@ class F14AgentOrchestrationTests(unittest.TestCase):
             disabled_embedding_service(),
             evidence_count=2,
             registry=registry,
-            limits=self.limits,
+            limits=replace(self.limits, max_no_progress_steps=4),
             diagnostics_recorder=SmokeDiagnosticsRecorder(),
         )
         self.assertEqual(result["agent_status"], "completed")
