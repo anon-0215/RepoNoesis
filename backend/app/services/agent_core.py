@@ -1539,6 +1539,10 @@ def _planner_state(state: AgentState) -> dict[str, Any]:
                 "warning_count": len(observation.warnings),
                 "error_code": (observation.error or {}).get("code"),
             }
+            if step.action in {"lookup_symbol", "read_source"}:
+                summary["candidate_metrics"] = _safe_candidate_metrics(
+                    observation.metrics
+                )
             if step.action == "expand_relations" and isinstance(results, dict):
                 summary["relation_summary"] = {
                     "analysis_mode": results.get("analysis_mode"),
@@ -1567,6 +1571,19 @@ def _planner_state(state: AgentState) -> dict[str, Any]:
                     "target_state_count": (results.get("metrics") or {}).get("target_state_count", 0),
                     "has_next_action": bool(results.get("recommended_next_action")),
                 }
+            if step.action == "lookup_symbol" and isinstance(results, list):
+                summary["locators"] = _safe_planner_locators(results)
+            if step.action == "read_source" and isinstance(results, dict):
+                summary["source_read"] = {
+                    "path": _safe_planner_path(results.get("path")),
+                    "start_line": _safe_planner_line(results.get("start_line")),
+                    "end_line": _safe_planner_line(results.get("end_line")),
+                    "evidence_ids": [
+                        str(item.get("evidence_id"))
+                        for item in results.get("evidence", [])[:8]
+                        if isinstance(item, dict) and item.get("evidence_id")
+                    ],
+                }
             observations.append(summary)
             if step.action == "lookup_symbol" and isinstance(results, list):
                 symbols.extend(
@@ -1594,6 +1611,100 @@ def _planner_state(state: AgentState) -> dict[str, Any]:
             dict.fromkeys(value for value in symbol_ids if value)
         )[:20],
     }
+
+
+def _safe_candidate_metrics(metrics: dict[str, Any]) -> dict[str, Any]:
+    """Project only bounded Candidate bridge counters into Planner state."""
+
+    keys = (
+        "raw_result_count",
+        "normalized_candidate_count",
+        "valid_candidate_count",
+        "new_evidence_count",
+        "rejected_candidate_count",
+    )
+    result = {
+        key: max(0, min(1_000_000, int(metrics.get(key, 0))))
+        if isinstance(metrics.get(key, 0), int)
+        and not isinstance(metrics.get(key, 0), bool)
+        else 0
+        for key in keys
+    }
+    result["rejection_code_counts"] = {
+        code: max(
+            0,
+            min(
+                1_000_000,
+                int(metrics.get(f"candidate_rejection_{code}_count", 0)),
+            ),
+        )
+        for code in CANDIDATE_REJECTION_CODES
+        if isinstance(metrics.get(f"candidate_rejection_{code}_count", 0), int)
+        and not isinstance(
+            metrics.get(f"candidate_rejection_{code}_count", 0), bool
+        )
+        and metrics.get(f"candidate_rejection_{code}_count", 0) > 0
+    }
+    for key in ("mapping_candidate_count", "mapping_considered_count"):
+        value = metrics.get(key, 0)
+        result[key] = (
+            max(0, min(1_000_000, int(value)))
+            if isinstance(value, int) and not isinstance(value, bool)
+            else 0
+        )
+    result["mapping_truncated"] = metrics.get("mapping_truncated") is True
+    return result
+
+
+def _safe_planner_path(value: Any) -> str | None:
+    if not isinstance(value, str) or len(value) > 500:
+        return None
+    try:
+        return normalize_repository_relative_path(value)
+    except ValueError:
+        return None
+
+
+def _safe_planner_line(value: Any) -> int | None:
+    if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+        return None
+    return min(value, 1_000_000)
+
+
+def _safe_planner_locators(results: list[Any]) -> list[dict[str, Any]]:
+    locators: list[dict[str, Any]] = []
+    for item in results[:8]:
+        if not isinstance(item, dict):
+            continue
+        path = _safe_planner_path(item.get("path"))
+        qualified_name = item.get("qualified_name")
+        chunk_identity = item.get("chunk_identity")
+        if (
+            path is None
+            or not isinstance(qualified_name, str)
+            or len(qualified_name) > 500
+            or not isinstance(chunk_identity, str)
+            or len(chunk_identity) > 1_000
+        ):
+            continue
+        locators.append(
+            {
+                "code_chunk_id": item.get("code_chunk_id")
+                if isinstance(item.get("code_chunk_id"), int)
+                and not isinstance(item.get("code_chunk_id"), bool)
+                else None,
+                "chunk_identity": chunk_identity,
+                "path": path,
+                "qualified_name": qualified_name,
+                "start_line": _safe_planner_line(item.get("start_line")),
+                "end_line": _safe_planner_line(item.get("end_line")),
+                "evidence_id": item.get("evidence_id")
+                if isinstance(item.get("evidence_id"), str)
+                and len(item.get("evidence_id")) <= 40
+                else None,
+            }
+        )
+    return locators
 
 
 def _pre_step_stop_status(state: AgentState) -> str | None:
@@ -1665,17 +1776,15 @@ def _progress_keys(action: str, results: Any) -> set[str]:
         }
     if action == "lookup_symbol" and isinstance(results, list):
         return {
-            f"symbol:{item.get('chunk_identity')}"
+            f"evidence:{item.get('evidence_id')}"
             for item in results
-            if isinstance(item, dict) and item.get("chunk_identity")
+            if isinstance(item, dict) and item.get("evidence_id")
         }
     if action == "read_source" and isinstance(results, dict):
         return {
-            "source:"
-            + ":".join(
-                str(results.get(key, ""))
-                for key in ("path", "start_line", "end_line", "content_hash")
-            )
+            f"evidence:{item.get('evidence_id')}"
+            for item in results.get("evidence", [])
+            if isinstance(item, dict) and item.get("evidence_id")
         }
     if action == "validate_evidence" and isinstance(results, list):
         return {
@@ -2091,6 +2200,11 @@ def _execute_agent_tool(
                 ),
                 evidence_added=max(0, evidence_after - evidence_before),
                 reason_code=(observation.error or {}).get("code"),
+                candidate_metrics=(
+                    _safe_candidate_metrics(observation.metrics)
+                    if action in {"lookup_symbol", "read_source"}
+                    else None
+                ),
             )
     logger.info(
         "agent_tool_call",

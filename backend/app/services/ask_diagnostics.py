@@ -553,6 +553,36 @@ def _bounded_list_count(value: Any, fallback: Any = None) -> int:
     return _count(fallback)
 
 
+def _safe_candidate_metrics(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    result = {
+        key: _count(value.get(key))
+        for key in (
+            "raw_result_count",
+            "normalized_candidate_count",
+            "valid_candidate_count",
+            "new_evidence_count",
+            "rejected_candidate_count",
+        )
+    }
+    for key in ("mapping_candidate_count", "mapping_considered_count"):
+        if key in value:
+            result[key] = _count(value.get(key))
+    if "mapping_truncated" in value:
+        result["mapping_truncated"] = value.get("mapping_truncated") is True
+    raw_rejections = value.get("rejection_code_counts")
+    if isinstance(raw_rejections, dict):
+        rejections = {
+            code: _count(raw_rejections.get(code))
+            for code in BASE_RETRIEVAL_REJECTION_CODES
+            if _count(raw_rejections.get(code)) > 0
+        }
+        if rejections:
+            result["rejection_code_counts"] = rejections
+    return result
+
+
 def _safe_attempt_outcomes(value: Any) -> list[str]:
     allowed = {"success", "http_error", "timeout", "network_error", "invalid_response", "deadline"}
     if not isinstance(value, list):
@@ -599,8 +629,7 @@ def _safe_tool_executions(value: Any) -> list[dict[str, Any]]:
             or re.fullmatch(r"[a-z][a-z0-9_]{0,63}", tool_name) is None
         ):
             continue
-        safe.append(
-            {
+        safe_item = {
                 "phase": phase,
                 "tool_name": tool_name,
                 "status": status,
@@ -608,7 +637,10 @@ def _safe_tool_executions(value: Any) -> list[dict[str, Any]]:
                 "evidence_added": _count(item.get("evidence_added")),
                 "reason_code": reason if reason in reasons else None,
             }
-        )
+        candidate_metrics = _safe_candidate_metrics(item.get("candidate_metrics"))
+        if candidate_metrics:
+            safe_item["candidate_metrics"] = candidate_metrics
+        safe.append(safe_item)
     return safe
 
 

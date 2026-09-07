@@ -12,6 +12,8 @@ from app.services.hybrid_retriever import HybridSearchResult
 CandidateProvenance = Literal[
     "deterministic_base_retrieval",
     "planner_search_code",
+    "planner_lookup_symbol",
+    "planner_read_source",
 ]
 CandidateRejectionCode = Literal[
     "project_mismatch",
@@ -44,6 +46,8 @@ CANDIDATE_REJECTION_CODES: tuple[CandidateRejectionCode, ...] = (
 _PROVENANCE_ORDER: tuple[CandidateProvenance, ...] = (
     "deterministic_base_retrieval",
     "planner_search_code",
+    "planner_lookup_symbol",
+    "planner_read_source",
 )
 _MAX_RETRIEVAL_SOURCES = 8
 _RETRIEVAL_SOURCE_ORDER = (
@@ -91,11 +95,14 @@ class CandidateEvidence:
     fusion_rank: int
     normalization_rejection: CandidateRejectionCode | None
     derived_sentinel_source_shape: bool
+    symbol_match_type: str | None = None
+    match_reasons: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
 class CandidatePromotion:
     evidence: list[Evidence]
+    selected_candidates: list[CandidateEvidence]
     rejection_counts: dict[CandidateRejectionCode, int]
     candidate_count: int
     valid_candidate_count: int
@@ -135,6 +142,20 @@ class CandidateEvidencePool:
         # passed the bound canonical lookup may consume the request-level pool.
         return sorted(prepared, key=_candidate_sort_key)
 
+    def normalize_symbol_results(
+        self,
+        results: list[object],
+        *,
+        provenance: CandidateProvenance,
+    ) -> list[CandidateEvidence]:
+        """Normalize symbol locators while retaining their claimed identity."""
+
+        prepared = [
+            _candidate_from_symbol_result(item, provenance=provenance)
+            for item in results
+        ]
+        return sorted(prepared, key=_candidate_sort_key)
+
     def promote(
         self,
         candidates: list[CandidateEvidence],
@@ -144,6 +165,7 @@ class CandidateEvidencePool:
         project_id: str,
         repository_revision: str,
         retrieval_strategy_version: str,
+        accepted_limit: int | None = None,
     ) -> CandidatePromotion:
         """Fail closed by rebuilding formal Evidence from bound authoritative chunks."""
 
@@ -191,8 +213,12 @@ class CandidateEvidencePool:
                 candidate if existing is None else _merge_candidate_metadata(existing, candidate)
             )
 
+        selected_candidates = sorted(merged_for_call.values(), key=_candidate_sort_key)
+        if accepted_limit is not None:
+            selected_candidates = selected_candidates[: max(0, accepted_limit)]
+
         newly_accepted: list[CandidateEvidence] = []
-        for candidate in sorted(merged_for_call.values(), key=_candidate_sort_key):
+        for candidate in selected_candidates:
             identity = candidate.chunk_identity
             existing = self._accepted_by_identity.get(identity)
             if existing is not None:
@@ -219,6 +245,7 @@ class CandidateEvidencePool:
             )
         return CandidatePromotion(
             evidence=evidence,
+            selected_candidates=selected_candidates,
             rejection_counts=dict(sorted(rejection_counts.items())),
             candidate_count=len(candidates),
             valid_candidate_count=len(canonical_valid),
@@ -274,6 +301,64 @@ def _candidate_from_retrieval(
         normalization_rejection=normalization_rejection,
         derived_sentinel_source_shape=derived_sentinel_source_shape,
     )
+
+
+def _candidate_from_symbol_result(
+    item: object,
+    *,
+    provenance: CandidateProvenance,
+) -> CandidateEvidence:
+    raw_score = getattr(item, "symbol_score", None)
+    raw_rank = getattr(item, "symbol_rank", None)
+    # Symbol locators are untrusted until canonical promotion. Preserve the
+    # original score/rank values so bools, strings, and non-finite numbers
+    # cannot be converted into apparently valid metadata before rejection.
+    ranking_rejection = (
+        None
+        if _valid_score(raw_score, optional=False)
+        and _valid_rank(raw_rank, optional=False)
+        else "score_invalid"
+    )
+    return CandidateEvidence(
+        project_id=str(item.project_id),
+        repository_revision=str(item.repository_revision),
+        code_chunk_id=_raw_int_or_sentinel(getattr(item, "code_chunk_id", None)),
+        chunk_identity=str(item.chunk_identity),
+        path=str(item.path),
+        language=str(item.language),
+        chunk_type=str(item.chunk_type),
+        symbol_name=str(item.symbol_name),
+        qualified_name=str(item.qualified_name),
+        start_line=_raw_int_or_sentinel(getattr(item, "start_line", None)),
+        end_line=_raw_int_or_sentinel(getattr(item, "end_line", None)),
+        content_hash=str(item.content_hash),
+        provenance=(provenance,),
+        retrieval_sources=("symbol",),
+        lexical_score=None,
+        lexical_rank=None,
+        semantic_score=None,
+        semantic_rank=None,
+        fusion_score=raw_score,
+        fusion_rank=raw_rank,
+        normalization_rejection=ranking_rejection,
+        derived_sentinel_source_shape=False,
+        symbol_match_type=(
+            item.symbol_match_type
+            if isinstance(getattr(item, "symbol_match_type", None), str)
+            else None
+        ),
+        match_reasons=tuple(
+            reason
+            for reason in getattr(item, "match_reasons", ())
+            if isinstance(reason, str)
+        )[:8],
+    )
+
+
+def _raw_int_or_sentinel(value: object) -> int:
+    """Keep malformed locator integers out of conversion-driven acceptance."""
+
+    return value if isinstance(value, int) and not isinstance(value, bool) else -1
 
 
 def _normalize_retrieval_sources(

@@ -509,7 +509,9 @@ class F13AgentOrchestrationTests(unittest.TestCase):
                 ),
                 path=request.path,
                 evidence_count=1,
-                limits=replace(AgentLimits(), max_agent_steps=4),
+                limits=replace(
+                    AgentLimits(), max_agent_steps=4, max_no_progress_steps=4
+                ),
                 registry=registry,
             )
 

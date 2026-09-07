@@ -457,6 +457,7 @@ class SmokeDiagnosticsRecorder:
         result_count: int,
         evidence_added: int,
         reason_code: str | None,
+        candidate_metrics: dict[str, Any] | None = None,
     ) -> None:
         """Record one fixed-shape, content-free summary of a real tool execution."""
 
@@ -469,8 +470,7 @@ class SmokeDiagnosticsRecorder:
             or status not in _TOOL_STATUSES
         ):
             raise ValueError("unsupported tool execution diagnostics")
-        self._tool_executions.append(
-            {
+        item = {
                 "phase": phase,
                 "tool_name": tool_name,
                 "status": status,
@@ -480,7 +480,10 @@ class SmokeDiagnosticsRecorder:
                     reason_code if reason_code in _TOOL_REASON_CODES else None
                 ),
             }
-        )
+        safe_candidate_metrics = _safe_candidate_metrics(candidate_metrics)
+        if safe_candidate_metrics:
+            item["candidate_metrics"] = safe_candidate_metrics
+        self._tool_executions.append(item)
 
     def record_base_retrieval(
         self,
@@ -1062,6 +1065,13 @@ def _safe_smoke_diagnostics(value: Any) -> dict[str, Any]:
                     "reason_code": (
                         reason_code if reason_code in _TOOL_REASON_CODES else None
                     ),
+                    **(
+                        {"candidate_metrics": safe_candidate_metrics}
+                        if (safe_candidate_metrics := _safe_candidate_metrics(
+                            item.get("candidate_metrics")
+                        ))
+                        else {}
+                    ),
                 }
             )
         if safe_executions:
@@ -1100,6 +1110,36 @@ def _bounded_count(value: Any) -> int:
     if not isinstance(value, int) or isinstance(value, bool):
         return 0
     return min(1_000_000, max(0, value))
+
+
+def _safe_candidate_metrics(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    result = {
+        key: _bounded_count(value.get(key))
+        for key in (
+            "raw_result_count",
+            "normalized_candidate_count",
+            "valid_candidate_count",
+            "new_evidence_count",
+            "rejected_candidate_count",
+        )
+    }
+    for key in ("mapping_candidate_count", "mapping_considered_count"):
+        if key in value:
+            result[key] = _bounded_count(value.get(key))
+    if "mapping_truncated" in value:
+        result["mapping_truncated"] = value.get("mapping_truncated") is True
+    raw_rejections = value.get("rejection_code_counts")
+    rejections: dict[str, int] = {}
+    if isinstance(raw_rejections, dict):
+        for code in BASE_RETRIEVAL_REJECTION_CODES:
+            count = raw_rejections.get(code)
+            if isinstance(count, int) and not isinstance(count, bool) and count > 0:
+                rejections[code] = _bounded_count(count)
+    if rejections:
+        result["rejection_code_counts"] = rejections
+    return result
 
 
 def _safe_base_retrieval(value: Any) -> dict[str, Any] | None:

@@ -425,7 +425,11 @@ class AgentFinalizationTests(unittest.TestCase):
         )
         llm = _FinalAnswerLlm(_structured())
 
-        result = self._run(planner, llm, limits=AgentLimits())
+        result = self._run(
+            planner,
+            llm,
+            limits=replace(AgentLimits(), max_no_progress_steps=10),
+        )
 
         self.assertEqual(result["agent_status"], "completed")
         self.assertEqual(result["answer_mode"], "llm_grounded")

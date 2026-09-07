@@ -31,6 +31,7 @@ from app.services.candidate_evidence import (
 )
 from app.services.embedding_service import EmbeddingService
 from app.services.evidence import CitationValidator, Evidence, EvidenceBuilder
+from app.services.hybrid_retriever import HybridSearchResult
 from app.services.hierarchy_normalization import (
     HIERARCHY_MODE_OFF,
     validate_hierarchy_mode,
@@ -51,11 +52,20 @@ from app.services.retrieval_v2 import (
     retrieve_code,
     validate_retrieval_version,
 )
-from app.services.symbol_retriever import SymbolRetriever
+from app.services.symbol_retriever import MAX_TOP_K as SYMBOL_RETRIEVER_MAX_TOP_K, SymbolRetriever
 from app.services.smoke_diagnostics import SmokeDiagnosticsRecorder
 
 
 ToolHandler = Callable[["ToolContext", BaseModel], tuple[Any, list[str], bool]]
+_READ_MAPPING_CAP = 20
+
+
+class _ToolResultList(list[Any]):
+    """A public list result with private, bounded observation metrics."""
+
+    def __init__(self, values: list[Any], metrics: dict[str, int]) -> None:
+        super().__init__(values)
+        self.observation_metrics = dict(metrics)
 
 
 @dataclass(frozen=True)
@@ -334,6 +344,14 @@ class ToolRegistry:
             if isinstance(results, dict):
                 results = dict(results)
                 raw_metrics = results.pop("_observation_metrics", {})
+                if isinstance(raw_metrics, dict):
+                    handler_metrics = {
+                        str(key): value
+                        for key, value in raw_metrics.items()
+                        if isinstance(value, (int, float, str))
+                    }
+            else:
+                raw_metrics = getattr(results, "observation_metrics", {})
                 if isinstance(raw_metrics, dict):
                     handler_metrics = {
                         str(key): value
@@ -721,17 +739,31 @@ def _lookup_symbol(
     values = LookupSymbolInput.model_validate(parameters)
     context.check_active()
     limit = min(values.top_k, context.limits.max_search_results)
+    # The locator owner has a fixed, bounded maximum. Validate this complete
+    # window before applying the caller-visible accepted-result cap so a forged
+    # early locator cannot suppress a later canonical peer.
+    raw_window_limit = SYMBOL_RETRIEVER_MAX_TOP_K
     ranked = SymbolRetriever(context.database).search(
         context.project_id,
         values.symbol,
-        top_k=limit + 1,
+        top_k=raw_window_limit,
         path=values.path,
         language=values.language,
         match_mode=values.match_mode,
         explicit_symbol=True,
         repository_revision=context.repository_revision,
     )
-    truncated = len(ranked) > limit
+    truncated = len(ranked) >= raw_window_limit
+    candidates = context.candidate_pool.normalize_symbol_results(
+        ranked,
+        provenance="planner_lookup_symbol",
+    )
+    promotion, added = _promote_planner_candidates(
+        context,
+        candidates,
+        accepted_limit=limit,
+    )
+    newly_added_by_identity = {item.chunk_identity: item for item in added}
     results = [
         {
             "code_chunk_id": item.code_chunk_id,
@@ -745,11 +777,16 @@ def _lookup_symbol(
             "end_line": item.end_line,
             "repository_revision": item.repository_revision,
             "content_hash": item.content_hash,
-            "candidate_source": item.candidate_source,
+            "candidate_source": "symbol",
             "symbol_match_type": item.symbol_match_type,
-            "symbol_score": item.symbol_score,
-            "symbol_rank": item.symbol_rank,
+            "symbol_score": item.fusion_score,
+            "symbol_rank": item.fusion_rank,
             "match_reasons": list(item.match_reasons),
+            "evidence_id": (
+                newly_added_by_identity.get(item.chunk_identity).evidence_id
+                if newly_added_by_identity.get(item.chunk_identity) is not None
+                else None
+            ),
             "relation_node_id": next(
                 (
                     str(node["node_id"])
@@ -762,9 +799,20 @@ def _lookup_symbol(
                 None,
             ),
         }
-        for item in ranked[:limit]
+        for item in promotion.selected_candidates
     ]
-    return results, [], truncated
+    return (
+        _ToolResultList(
+            results,
+            _candidate_observation_metrics(
+                raw_result_count=len(ranked),
+                promotion=promotion,
+                new_evidence_count=len(added),
+            ),
+        ),
+        [],
+        truncated,
+    )
 
 
 def _read_source(
@@ -795,6 +843,53 @@ def _read_source(
     if _file_identity(before) != _file_identity(after):
         raise ToolError("stored source changed during read")
     context.check_active()
+    mapping_rejections: dict[str, int] = {}
+    mapped_candidates: list[HybridSearchResult] = []
+    mapping_candidate_count = 0
+    mapping_considered_count = 0
+    mapping_truncated = False
+    if not truncated:
+        source_lines = str(before["content"]).splitlines(keepends=True)
+        authoritative_content = "".join(
+            source_lines[values.start_line - 1 : values.end_line]
+        )
+        expected_hash = hashlib.sha256(authoritative_content.encode("utf-8")).hexdigest()
+        if expected_hash != hashlib.sha256(content.encode("utf-8")).hexdigest():
+            mapping_rejections["content_hash_mismatch"] = 1
+        else:
+            chunks = context.database.get_code_chunks_for_hierarchy(
+                context.project_id,
+                context.repository_revision,
+                values.path,
+                limit=2_049,
+            )
+            mapping_limit = min(context.limits.max_search_results, _READ_MAPPING_CAP)
+            mapped_chunks, mapping_candidate_count = _map_read_range_to_chunks_with_count(
+                chunks,
+                start_line=values.start_line,
+                end_line=values.end_line,
+                limit=mapping_limit,
+            )
+            mapping_considered_count = len(mapped_chunks)
+            mapping_truncated = mapping_candidate_count > mapping_considered_count
+            if not mapped_chunks:
+                mapping_rejections["chunk_not_found"] = 1
+            mapped_candidates = [
+                _chunk_as_read_candidate(chunk, rank=rank)
+                for rank, chunk in enumerate(mapped_chunks, start=1)
+            ]
+    else:
+        mapping_rejections["content_hash_mismatch"] = 1
+
+    candidates = context.candidate_pool.normalize_retrieval_results(
+        mapped_candidates,
+        provenance="planner_read_source",
+    )
+    promotion, added = _promote_planner_candidates(
+        context,
+        candidates,
+        extra_rejection_counts=mapping_rejections,
+    )
     return (
         {
             "path": values.path,
@@ -804,10 +899,195 @@ def _read_source(
             "content_hash": hashlib.sha256(content.encode("utf-8")).hexdigest(),
             "source_identity_hash": _file_identity(before),
             "content": content,
+            "evidence": [_evidence_summary(item) for item in added],
+            "_observation_metrics": _candidate_observation_metrics(
+                raw_result_count=mapping_candidate_count,
+                promotion=promotion,
+                new_evidence_count=len(added),
+                extra_rejection_counts=mapping_rejections,
+                extra_metrics={
+                    "mapping_candidate_count": mapping_candidate_count,
+                    "mapping_considered_count": mapping_considered_count,
+                    "mapping_truncated": mapping_truncated,
+                },
+            ),
         },
-        [],
+        [
+            "Canonical chunk mapping was rejected for this bounded source read."
+        ]
+        if mapping_rejections
+        else [],
         truncated,
     )
+
+
+def _chunk_as_read_candidate(
+    chunk: dict[str, Any],
+    *,
+    rank: int,
+) -> HybridSearchResult:
+    """Create a locator-only Candidate source from a real canonical chunk."""
+
+    return HybridSearchResult(
+        project_id=str(chunk["project_id"]),
+        repository_revision=str(chunk["repository_revision"]),
+        code_chunk_id=int(chunk["id"]),
+        language=str(chunk["language"]),
+        path=str(chunk["path"]),
+        chunk_type=str(chunk["chunk_type"]),
+        symbol_name=str(chunk["symbol_name"]),
+        qualified_name=str(chunk["qualified_name"]),
+        start_line=int(chunk["start_line"]),
+        end_line=int(chunk["end_line"]),
+        content="",
+        content_hash=str(chunk["content_hash"]),
+        retrieval_sources=["symbol"],
+        fusion_score=1.0 / max(1, rank),
+        fusion_rank=max(1, rank),
+    )
+
+
+def _map_read_range_to_chunks(
+    chunks: list[dict[str, Any]],
+    *,
+    start_line: int,
+    end_line: int,
+    limit: int,
+) -> list[dict[str, Any]]:
+    """Map a read range to complete chunks with stable coverage-aware selection."""
+
+    selected, _candidate_count = _map_read_range_to_chunks_with_count(
+        chunks,
+        start_line=start_line,
+        end_line=end_line,
+        limit=limit,
+    )
+    return selected
+
+
+def _map_read_range_to_chunks_with_count(
+    chunks: list[dict[str, Any]],
+    *,
+    start_line: int,
+    end_line: int,
+    limit: int,
+) -> tuple[list[dict[str, Any]], int]:
+    """Choose exact, then specific complementary chunks with bounded coverage."""
+
+    matches: list[tuple[dict[str, Any], int, int, int, int, bool, tuple[Any, ...]]] = []
+    for chunk in chunks:
+        chunk_start = int(chunk["start_line"])
+        chunk_end = int(chunk["end_line"])
+        overlap_start = max(start_line, chunk_start)
+        overlap_end = min(end_line, chunk_end)
+        if overlap_start > overlap_end:
+            continue
+        overlap = overlap_end - overlap_start + 1
+        chunk_span = chunk_end - chunk_start + 1
+        matches.append(
+            (
+                chunk,
+                chunk_start,
+                chunk_end,
+                overlap,
+                chunk_span,
+                chunk_start == start_line and chunk_end == end_line,
+                (
+                    str(chunk["path"]),
+                    chunk_start,
+                    chunk_end,
+                    str(chunk["qualified_name"]),
+                    str(chunk["chunk_type"]),
+                    int(chunk["id"]),
+                ),
+            )
+        )
+    candidate_count = len(matches)
+    uncovered = set(range(start_line, end_line + 1))
+    selected: list[dict[str, Any]] = []
+    remaining = list(matches)
+    while remaining and len(selected) < max(0, limit) and uncovered:
+        scored: list[tuple[tuple[Any, ...], int]] = []
+        for index, (_chunk, chunk_start, chunk_end, overlap, chunk_span, exact, identity) in enumerate(remaining):
+            contribution = len(uncovered.intersection(range(chunk_start, chunk_end + 1)))
+            if contribution <= 0:
+                continue
+            # Exact spans always win. Otherwise maximize the fraction of the
+            # chunk that adds uncovered requested lines, then prefer the more
+            # specific span and stable locator fields.
+            scored.append(
+                (
+                    (
+                        0 if exact else 1,
+                        -(contribution / max(1, chunk_span)),
+                        chunk_span,
+                        -overlap,
+                        identity,
+                    ),
+                    index,
+                )
+            )
+        if not scored:
+            break
+        _key, index = min(scored, key=lambda item: item[0])
+        chunk, chunk_start, chunk_end, _overlap, _chunk_span, _exact, _identity = remaining.pop(index)
+        contribution = uncovered.intersection(range(chunk_start, chunk_end + 1))
+        if not contribution:
+            continue
+        selected.append(chunk)
+        uncovered.difference_update(contribution)
+    return selected, candidate_count
+
+
+def _promote_planner_candidates(
+    context: ToolContext,
+    candidates: list[Any],
+    *,
+    extra_rejection_counts: dict[str, int] | None = None,
+    accepted_limit: int | None = None,
+) -> tuple[Any, list[Evidence]]:
+    project = context.bundle.get("project") or {}
+    promotion = context.candidate_pool.promote(
+        candidates,
+        database=context.database,
+        project=project,
+        project_id=context.project_id,
+        repository_revision=context.repository_revision,
+        retrieval_strategy_version="weighted-rrf-v1",
+        accepted_limit=accepted_limit,
+    )
+    context.check_active()
+    added = context.evidence_store.add(context.request_id, promotion.evidence)
+    return promotion, added
+
+
+def _candidate_observation_metrics(
+    *,
+    raw_result_count: int,
+    promotion: Any,
+    new_evidence_count: int,
+    extra_rejection_counts: dict[str, int] | None = None,
+    extra_metrics: dict[str, int | bool] | None = None,
+) -> dict[str, int | bool]:
+    rejection_counts = dict(promotion.rejection_counts)
+    for code, count in (extra_rejection_counts or {}).items():
+        rejection_counts[code] = rejection_counts.get(code, 0) + max(0, int(count))
+    metrics = {
+        "raw_result_count": max(0, int(raw_result_count)),
+        "normalized_candidate_count": int(promotion.candidate_count),
+        "valid_candidate_count": int(promotion.valid_candidate_count),
+        "new_evidence_count": max(0, int(new_evidence_count)),
+        "rejected_candidate_count": sum(rejection_counts.values()),
+        "result_count": max(0, int(new_evidence_count)),
+    }
+    metrics.update(
+        {
+            f"candidate_rejection_{code}_count": rejection_counts.get(code, 0)
+            for code in CANDIDATE_REJECTION_CODES
+        }
+    )
+    metrics.update(extra_metrics or {})
+    return metrics
 
 
 def _validate_evidence(
