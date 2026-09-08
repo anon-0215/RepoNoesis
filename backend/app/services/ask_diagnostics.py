@@ -7,6 +7,7 @@ from typing import Any
 from app.services.smoke_diagnostics import (
     BASE_RETRIEVAL_REJECTION_CODES,
     BASE_RETRIEVAL_STATUSES,
+    PLANNER_ENHANCEMENT_TERMINATION_CODES,
     normalize_public_failure_reason,
 )
 
@@ -151,6 +152,10 @@ def build_ask_success_diagnostics(
         ),
         "planner_logical_calls": max(0, planner_requests - planner_repairs),
         "planner_repair_calls": planner_repairs,
+        "planner_enhancement_termination_reason": _enum_or_none(
+            recorder_snapshot.get("planner_enhancement_termination_reason"),
+            PLANNER_ENHANCEMENT_TERMINATION_CODES,
+        ),
         "final_answer_attempted": final_attempted,
         "final_answer_repair_attempted": final_repair_attempted,
         "final_answer_repair_protocol_succeeded": recorder_snapshot.get(
@@ -333,6 +338,10 @@ def build_ask_failure_detail(
         ),
         "planner_logical_calls": max(0, planner_requests - planner_repairs),
         "planner_repair_calls": planner_repairs,
+        "planner_enhancement_termination_reason": _enum_or_none(
+            recorder_snapshot.get("planner_enhancement_termination_reason"),
+            PLANNER_ENHANCEMENT_TERMINATION_CODES,
+        ),
         "final_answer_attempted": final_attempted,
         "final_answer_repair_attempted": final_repair_attempted,
         "final_answer_repair_protocol_succeeded": recorder_snapshot.get(
@@ -911,6 +920,7 @@ def _bounded_payload(value: dict[str, Any]) -> dict[str, Any]:
         "tool_calls_used",
         "planner_logical_calls",
         "planner_repair_calls",
+        "planner_enhancement_termination_reason",
         "final_answer_attempted",
         "final_answer_repair_attempted",
         "final_answer_repair_protocol_succeeded",
@@ -1026,6 +1036,7 @@ def _minimal_ask_payload(value: dict[str, Any]) -> dict[str, Any]:
         "tool_calls_used",
         "planner_logical_calls",
         "planner_repair_calls",
+        "planner_enhancement_termination_reason",
         "final_answer_attempted",
         "final_answer_repair_attempted",
         "final_answer_repair_protocol_succeeded",

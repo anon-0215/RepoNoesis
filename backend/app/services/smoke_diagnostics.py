@@ -126,6 +126,18 @@ _TOOL_REASON_CODES = frozenset(
         "unknown_tool",
     }
 )
+PLANNER_ENHANCEMENT_TERMINATION_CODES = frozenset(
+    {
+        "planner_answer",
+        "planner_repair_failed",
+        "planner_budget_exhausted",
+        "repeat_call",
+        "no_progress",
+        "tool_budget_exhausted",
+        "unknown_tool",
+        "invalid_parameters",
+    }
+)
 BASE_RETRIEVAL_STATUSES = frozenset(
     {
         "succeeded",
@@ -249,6 +261,7 @@ class SmokeDiagnosticsRecorder:
         self._tool_calls: dict[str, dict[str, int | str]] = {}
         self._tool_executions: list[dict[str, Any]] = []
         self._base_retrieval: dict[str, Any] | None = None
+        self._planner_enhancement_termination: str | None = None
         self._planner_attempts: list[dict[str, Any]] = []
         self._final_answer_protocol_failure: dict[str, Any] | None = None
         self._final_answer_initial_failure: dict[str, Any] | None = None
@@ -518,6 +531,13 @@ class SmokeDiagnosticsRecorder:
             raise ValueError("unsupported base retrieval diagnostics")
         self._base_retrieval = safe
 
+    def record_planner_enhancement_termination(self, reason: str) -> None:
+        """Record a fixed, content-free optional-enhancement stop reason."""
+
+        if reason not in PLANNER_ENHANCEMENT_TERMINATION_CODES:
+            raise ValueError("unsupported planner enhancement termination")
+        self._planner_enhancement_termination = reason
+
     def record_unknown_tool_rejection(self) -> None:
         """Record a content-free sentinel for an unregistered Planner tool."""
 
@@ -733,6 +753,10 @@ class SmokeDiagnosticsRecorder:
             ][:MAX_TOOL_ENTRIES]
         if self._base_retrieval is not None:
             payload["base_retrieval"] = dict(self._base_retrieval)
+        if self._planner_enhancement_termination is not None:
+            payload["planner_enhancement_termination_reason"] = (
+                self._planner_enhancement_termination
+            )
         if self._tool_executions:
             payload["tool_executions"] = [dict(item) for item in self._tool_executions]
         if self._planner_attempts:
@@ -846,6 +870,7 @@ def _bounded_smoke_diagnostics(value: dict[str, Any]) -> dict[str, Any]:
             for key in (
                 "request_id",
                 "agent_failure_reason_code",
+                "planner_enhancement_termination_reason",
                 "final_answer_failure_reason_code",
                 "final_answer_repair_attempted",
                 "final_answer_repair_protocol_succeeded",
@@ -880,6 +905,7 @@ def _minimal_smoke_diagnostics(value: dict[str, Any]) -> dict[str, Any]:
         "answer_mode",
         "fallback_reason_code",
         "agent_failure_reason_code",
+        "planner_enhancement_termination_reason",
         "final_answer_failure_reason_code",
         "citation_failure_reason_code",
         "relation_failure_reason_code",
@@ -980,6 +1006,10 @@ def _safe_smoke_diagnostics(value: Any) -> dict[str, Any]:
         ("citation_failure_reason_code", FINAL_ANSWER_FAILURE_REASON_CODES),
         ("relation_failure_reason_code", FINAL_ANSWER_FAILURE_REASON_CODES),
         ("agent_failure_reason_code", AGENT_FAILURE_REASON_CODES),
+        (
+            "planner_enhancement_termination_reason",
+            PLANNER_ENHANCEMENT_TERMINATION_CODES,
+        ),
     ):
         item = value.get(key)
         if isinstance(item, str) and item in allowed:
