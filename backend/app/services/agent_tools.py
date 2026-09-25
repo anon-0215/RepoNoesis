@@ -624,8 +624,10 @@ def _search_code(
         relation_mode=context.relation_mode,
         check_active=context.check_active,
         diagnostics_recorder=context.diagnostics_recorder,
+        semantic_deadline_at=context.effective_deadline_monotonic,
     )
     context.check_active()
+    promotion_started = time.monotonic()
     project = context.bundle.get("project") or {}
     candidates = context.candidate_pool.normalize_retrieval_results(
         outcome.results,
@@ -648,6 +650,10 @@ def _search_code(
         and item.repository_revision == context.repository_revision
     ]
     added = context.evidence_store.add(context.request_id, built)
+    if context.candidate_provenance == "deterministic_base_retrieval" and context.diagnostics_recorder is not None:
+        context.diagnostics_recorder.record_evidence_promotion_ms(
+            int((time.monotonic() - promotion_started) * 1000)
+        )
     if context.relation_mode == RELATION_MODE_EXPAND_V1:
         relation_audit = outcome.audit.get("relation", {})
         selected_paths = relation_audit.get("selected_relation_paths", [])

@@ -161,7 +161,7 @@ class F15AgentOrchestrationTests(unittest.TestCase):
                 )
             )
 
-    def test_tool_evidence_then_work_cutoff_cannot_recover(self):
+    def test_tool_evidence_then_work_cutoff_finalizes_and_persists_once(self):
         clock = _Clock()
         provider = _ProductionProvider(
             [decision("continue", "search_code", {"query": "authenticate_user"})]
@@ -199,17 +199,16 @@ class F15AgentOrchestrationTests(unittest.TestCase):
             )
 
         self.assertEqual(evidence_added, [1])
-        self.assertEqual(finalization.call_count, 0)
-        self.assertEqual(provider.final_calls, 0)
-        self.assertEqual(save.call_count, 0)
-        self.assertEqual(self._chat_count(), 0)
-        self.assertNotEqual(status, 200)
-        self.assertEqual(body["detail"]["code"], "final_answer_not_attempted")
-        self.assertEqual(captured_failures[0]["code"], body["detail"]["code"])
-        self.assertNotEqual(captured_results[0]["agent_status"], "completed")
-        self.assertNotEqual(captured_results[0]["answer_mode"], "llm_grounded")
+        self.assertEqual(finalization.call_count, 1)
+        self.assertEqual(provider.final_calls, 1)
+        self.assertEqual(save.call_count, 1)
+        self.assertEqual(self._chat_count(), 1)
+        self.assertEqual(status, 200)
+        self.assertEqual(captured_failures, [])
+        self.assertEqual(captured_results[0]["agent_status"], "completed")
+        self.assertEqual(captured_results[0]["answer_mode"], "llm_grounded")
 
-    def test_evidence_then_planner_token_budget_exhaustion_cannot_recover(self):
+    def test_evidence_then_planner_token_budget_exhaustion_finalizes_once(self):
         first = decision(
             "continue", "search_code", {"query": "authenticate_user", "top_k": 1}
         )
@@ -240,15 +239,13 @@ class F15AgentOrchestrationTests(unittest.TestCase):
             )
 
         self.assertEqual(provider.planner_calls, 1)
-        self.assertEqual(provider.final_calls, 0)
-        self.assertEqual(finalization.call_count, 0)
-        self.assertEqual(save.call_count, 0)
-        self.assertEqual(self._chat_count(), 0)
-        self.assertEqual(status, 503)
-        self.assertEqual(body["detail"]["code"], "planner_budget_exhausted")
-        self.assertEqual(body["detail"]["diagnostics"]["evidence_count"], 1)
-        self.assertNotEqual(captured_results[0]["agent_status"], "completed")
-        self.assertNotEqual(captured_results[0]["answer_mode"], "llm_grounded")
+        self.assertEqual(provider.final_calls, 1)
+        self.assertEqual(finalization.call_count, 1)
+        self.assertEqual(save.call_count, 1)
+        self.assertEqual(self._chat_count(), 1)
+        self.assertEqual(status, 200)
+        self.assertEqual(captured_results[0]["agent_status"], "completed")
+        self.assertEqual(captured_results[0]["answer_mode"], "llm_grounded")
 
     def test_f13_planner_deadline_authorization_recovers_once_and_persists_once(self):
         clock = _Clock()

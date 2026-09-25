@@ -10,7 +10,7 @@ vi.mock('./lib/api', async () => {
   return {
     ...actual,
     analyzeProject: vi.fn(),
-    askProject: vi.fn(),
+    askProjectStream: vi.fn(),
     checkWorkspaceRevision: vi.fn(),
     deleteProject: vi.fn(),
     getConfigStatus: vi.fn(),
@@ -32,7 +32,7 @@ import App, { AskView } from './App';
 import {
   ApiError,
   analyzeProject,
-  askProject,
+  askProjectStream,
   deleteProject,
   getConfigStatus,
   getLearningPath,
@@ -56,9 +56,10 @@ function buttonWithText(root: ParentNode, text: string): HTMLButtonElement {
   return button;
 }
 
-function setInputValue(input: HTMLInputElement, value: string) {
-  const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
-  if (!setter) throw new Error('HTMLInputElement value setter is unavailable');
+function setInputValue(input: HTMLInputElement | HTMLTextAreaElement, value: string) {
+  const prototype = input instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+  const setter = Object.getOwnPropertyDescriptor(prototype, 'value')?.set;
+  if (!setter) throw new Error('form control value setter is unavailable');
   setter.call(input, value);
   input.dispatchEvent(new InputEvent('input', { bubbles: true, composed: true, data: value }));
   input.dispatchEvent(new Event('change', { bubbles: true, composed: true }));
@@ -318,7 +319,7 @@ describe('AskView safe server rendering', () => {
 });
 
 describe('App ask request gate integration', () => {
-  it('blocks a pending duplicate, releases after failure, and submits again through the DOM', async () => {
+  it('uses the shared workbench by default, preserves the draft across pages, and blocks a pending duplicate', async () => {
     vi.stubGlobal('IS_REACT_ACT_ENVIRONMENT', true);
     const originalUrl = `${window.location.pathname}${window.location.search}${window.location.hash}`;
     const workspaceId = '11111111-1111-4111-8111-111111111111';
@@ -388,7 +389,7 @@ describe('App ask request gate integration', () => {
     const firstRequest = new Promise<ChatAnswer>((_resolve, reject) => {
       rejectFirst = reject;
     });
-    vi.mocked(askProject)
+    vi.mocked(askProjectStream)
       .mockImplementationOnce(() => firstRequest)
       .mockResolvedValueOnce({
         answer: 'second grounded answer',
@@ -409,28 +410,46 @@ describe('App ask request gate integration', () => {
       });
 
       expect(getWorkspace).toHaveBeenCalledWith(workspaceId);
-      const askTab = buttonWithText(container, '源码问答');
+      expect(container.querySelectorAll('.wb-rail')).toHaveLength(1);
+      expect(container.querySelectorAll('.wb-context')).toHaveLength(1);
+      expect(container.querySelector('form.ask-form')).not.toBeNull();
+      const theme = container.querySelector<HTMLButtonElement>('.wb-theme')!;
       await act(async () => {
-        askTab.click();
+        theme.click();
         await Promise.resolve();
       });
+      expect(document.documentElement.dataset.theme).toBe('dark');
 
       let form = container.querySelector<HTMLFormElement>('form.ask-form');
-      let input = form?.querySelector<HTMLInputElement>('input');
+      let input = form?.querySelector<HTMLTextAreaElement>('textarea');
       let submit = form?.querySelector<HTMLButtonElement>('button[type="submit"]');
       expect(form).not.toBeNull();
       expect(input).not.toBeNull();
       expect(submit).not.toBeNull();
+      await act(async () => {
+        buttonWithText(container, '这个仓库的主要入口在哪里？').click();
+        await flushPromises();
+      });
+      expect(input?.value).toBe('这个仓库的主要入口在哪里？');
+      expect(askProjectStream).not.toHaveBeenCalled();
 
       await act(async () => {
         setInputValue(input!, 'first question');
         await Promise.resolve();
       });
+      await act(async () => { buttonWithText(container, '项目概览').click(); await flushPromises(); });
+      expect(container.querySelectorAll('.wb-rail')).toHaveLength(1);
+      expect(container.querySelectorAll('.wb-context')).toHaveLength(1);
+      expect(document.documentElement.dataset.theme).toBe('dark');
+      await act(async () => { buttonWithText(container, '源码问答').click(); await flushPromises(); });
+      input = container.querySelector<HTMLTextAreaElement>('form.ask-form textarea');
+      submit = container.querySelector<HTMLButtonElement>('form.ask-form button[type="submit"]');
+      expect(input?.value).toBe('first question');
       await act(async () => {
         submit!.click();
         await Promise.resolve();
       });
-      expect(askProject).toHaveBeenCalledTimes(1);
+      expect(askProjectStream).toHaveBeenCalledTimes(1);
 
       form = container.querySelector<HTMLFormElement>('form.ask-form');
       submit = form?.querySelector<HTMLButtonElement>('button[type="submit"]');
@@ -439,7 +458,7 @@ describe('App ask request gate integration', () => {
         form!.dispatchEvent(new SubmitEvent('submit', { bubbles: true, cancelable: true }));
         await Promise.resolve();
       });
-      expect(askProject).toHaveBeenCalledTimes(1);
+      expect(askProjectStream).toHaveBeenCalledTimes(1);
 
       await act(async () => {
         rejectFirst(new ApiError('safe failure', 500, failure));
@@ -447,10 +466,16 @@ describe('App ask request gate integration', () => {
       });
       const errorCard = container.querySelector<HTMLElement>('[role="alert"]');
       form = container.querySelector<HTMLFormElement>('form.ask-form');
-      input = form?.querySelector<HTMLInputElement>('input');
+      input = form?.querySelector<HTMLTextAreaElement>('textarea');
       submit = form?.querySelector<HTMLButtonElement>('button[type="submit"]');
       expect(errorCard?.textContent).toContain('tool_timeout');
       expect(submit?.disabled).toBe(false);
+      expect(container.querySelector('.wb-notification')).toBeNull();
+      await act(async () => { buttonWithText(container, '项目概览').click(); await flushPromises(); });
+      await act(async () => { buttonWithText(container, '源码问答').click(); await flushPromises(); });
+      expect(container.querySelector('.wb-error')?.textContent).toContain('request-safe-123');
+      form = container.querySelector<HTMLFormElement>('form.ask-form');
+      input = form?.querySelector<HTMLTextAreaElement>('textarea');
 
       await act(async () => {
         setInputValue(input!, 'second question');
@@ -461,9 +486,12 @@ describe('App ask request gate integration', () => {
         await flushPromises();
       });
 
-      expect(askProject).toHaveBeenCalledTimes(2);
-      expect(vi.mocked(askProject).mock.calls[1]).toEqual([projectId, 'second question']);
+      expect(askProjectStream).toHaveBeenCalledTimes(2);
+      expect(vi.mocked(askProjectStream).mock.calls[1].slice(0, 4)).toEqual([projectId, 'fixture-revision', 'second question', 'agent']);
       expect(container.textContent).toContain('second grounded answer');
+      expect(Array.from(container.querySelectorAll('.wb-answer')).map((card) =>
+        card.querySelector('.wb-question p')?.textContent
+      )).toEqual(['first question', 'second question']);
       expect(consoleError).not.toHaveBeenCalled();
     } finally {
       if (root) {
@@ -480,6 +508,26 @@ describe('App ask request gate integration', () => {
 });
 
 describe('App connection and import status integration', () => {
+  it('keeps the shared shell for an empty library and exposes import through project management', async () => {
+    vi.stubGlobal('IS_REACT_ACT_ENVIRONMENT', true);
+    vi.mocked(getConfigStatus).mockResolvedValue({ embedding: { ready: true }, llm: { ready: true } } as never);
+    vi.mocked(listWorkspaces).mockResolvedValue({ items: [], total: 0, limit: 20, offset: 0 } as never);
+    const container = document.createElement('div'); document.body.appendChild(container);
+    let root: Root | null = createRoot(container);
+    try {
+      await act(async () => { root!.render(<App />); await flushPromises(); });
+      expect(container.querySelectorAll('.wb-rail')).toHaveLength(1);
+      expect(container.querySelectorAll('.wb-context')).toHaveLength(1);
+      expect(container.textContent).toContain('选择一个已索引项目');
+      expect(container.querySelector<HTMLButtonElement>('form.ask-form button[type="submit"]')?.disabled).toBe(true);
+      await act(async () => { buttonWithText(container, '项目管理').click(); await flushPromises(); });
+      expect(container.querySelector('form.analyze-form')).not.toBeNull();
+    } finally {
+      if (root) await act(async () => root?.unmount());
+      container.remove();
+    }
+  });
+
   it('shows incomplete embedding progress, confirms deletion, and removes the item', async () => {
     vi.stubGlobal('IS_REACT_ACT_ENVIRONMENT', true);
     vi.mocked(getConfigStatus).mockResolvedValue({
@@ -502,8 +550,9 @@ describe('App connection and import status integration', () => {
     let root: Root | null = createRoot(container);
     try {
       await act(async () => { root!.render(<App />); await flushPromises(); });
+      await act(async () => { buttonWithText(container, '项目管理').click(); await flushPromises(); });
       expect(container.textContent).toContain('incomplete');
-      expect(container.textContent).toContain('Embedding：24 / 2850');
+      expect(container.textContent).toContain('向量记录：24 / 2850');
       await act(async () => {
         container.querySelector<HTMLButtonElement>('[aria-label="删除 RepoNoesis"]')!.click();
         await flushPromises();
@@ -532,6 +581,7 @@ describe('App connection and import status integration', () => {
     let root: Root | null = createRoot(container);
     try {
       await act(async () => { root!.render(<App />); await flushPromises(); });
+      await act(async () => { buttonWithText(container, '项目管理').click(); await flushPromises(); });
       const selector = '[aria-label="删除 Retry Repo"]';
       await act(async () => { container.querySelector<HTMLButtonElement>(selector)!.click(); await flushPromises(); });
       expect(container.textContent).toContain('Retry Repo');
@@ -563,6 +613,7 @@ describe('App connection and import status integration', () => {
         root!.render(<App />);
         await flushPromises();
       });
+      await act(async () => { buttonWithText(container, '项目管理').click(); await flushPromises(); });
       await act(async () => {
         rejectConfig(new ApiError('无法连接后端服务。请确认后端已启动后重试。', 0));
         await flushPromises();
@@ -573,7 +624,7 @@ describe('App connection and import status integration', () => {
         resolveLibrary({ items: [], total: 0, limit: 20, offset: 0 } as never);
         await flushPromises();
       });
-      expect(container.querySelector('.status-line')?.textContent).not.toContain('无法连接后端服务');
+      expect(container.querySelector('.status-line')?.textContent || '').not.toContain('无法连接后端服务');
     } finally {
       if (root) await act(async () => root?.unmount());
       container.remove();
@@ -602,6 +653,7 @@ describe('App connection and import status integration', () => {
         root!.render(<App />);
         await flushPromises();
       });
+      await act(async () => { buttonWithText(container, '项目管理').click(); await flushPromises(); });
       await act(async () => {
         buttonWithText(container, '公开 HTTPS Git').click();
         await Promise.resolve();
@@ -617,7 +669,7 @@ describe('App connection and import status integration', () => {
         await flushPromises();
       });
       expect(container.querySelector('.status-line')?.textContent).toContain('request-import-1');
-      expect(container.querySelector('.status-line')?.textContent).not.toContain('无法连接后端服务');
+      expect(container.querySelector('.status-line')?.textContent || '').not.toContain('无法连接后端服务');
       if (status === 504) {
         expect(container.querySelector('.status-line')?.textContent).toContain('部分临时文件将在稍后清理');
       }
@@ -660,6 +712,7 @@ describe('App connection and import status integration', () => {
         root!.render(<App />);
         await flushPromises();
       });
+      await act(async () => { buttonWithText(container, '项目管理').click(); await flushPromises(); });
       await act(async () => {
         buttonWithText(container, '公开 HTTPS Git').click();
         await Promise.resolve();
@@ -681,7 +734,7 @@ describe('App connection and import status integration', () => {
         buttonWithText(container, '刷新列表').click();
         await flushPromises();
       });
-      expect(container.querySelector('.status-line')?.textContent).not.toContain('无法连接后端服务');
+      expect(container.querySelector('.status-line')?.textContent || '').not.toContain('无法连接后端服务');
     } finally {
       if (root) await act(async () => root?.unmount());
       container.remove();

@@ -7,6 +7,7 @@ from typing import Any
 from app.services.smoke_diagnostics import (
     BASE_RETRIEVAL_REJECTION_CODES,
     BASE_RETRIEVAL_STATUSES,
+    PLANNER_ENHANCEMENT_TERMINATION_CODES,
     normalize_public_failure_reason,
 )
 
@@ -114,12 +115,12 @@ def build_ask_success_diagnostics(
     planner_repairs = _count(recorder_snapshot.get("planner_repair_attempts"))
     provider_calls = _count(recorder_snapshot.get("provider_logical_calls"))
     final_attempted = recorder_snapshot.get("final_answer_attempted") is True
-    final_repair_attempted = (
-        recorder_snapshot.get("final_answer_repair_attempted") is True
+    final_repair_attempted = _optional_bool(
+        recorder_snapshot.get("final_answer_repair_attempted")
     )
     if provider_calls == 0:
         provider_calls = (
-            planner_requests + int(final_attempted) + int(final_repair_attempted)
+            planner_requests + int(final_attempted) + int(final_repair_attempted is True)
         )
     diagnostics = {
         "request_id": _request_id(
@@ -151,16 +152,18 @@ def build_ask_success_diagnostics(
         ),
         "planner_logical_calls": max(0, planner_requests - planner_repairs),
         "planner_repair_calls": planner_repairs,
+        "planner_enhancement_termination_reason": _enum_or_none(
+            recorder_snapshot.get("planner_enhancement_termination_reason"),
+            PLANNER_ENHANCEMENT_TERMINATION_CODES,
+        ),
         "final_answer_attempted": final_attempted,
         "final_answer_repair_attempted": final_repair_attempted,
-        "final_answer_repair_protocol_succeeded": recorder_snapshot.get(
+        "final_answer_repair_protocol_succeeded": _optional_bool(recorder_snapshot.get(
             "final_answer_repair_protocol_succeeded"
-        )
-        is True,
-        "final_answer_repair_succeeded": recorder_snapshot.get(
+        )),
+        "final_answer_repair_succeeded": _optional_bool(recorder_snapshot.get(
             "final_answer_repair_succeeded"
-        )
-        is True,
+        )),
         "provider_logical_calls": _count(provider_calls),
         "provider_http_attempt_count": _count(
             recorder_snapshot.get("provider_http_attempt_count")
@@ -180,14 +183,14 @@ def build_ask_success_diagnostics(
             _count(recorder_snapshot.get("evidence_count")),
         ),
         "citation_count": _bounded_list_count(result.get("citations")),
-        "citation_validation_passed": (
-            recorder_snapshot.get("citation_validation_passed") is True
+        "citation_validation_passed": _optional_bool(
+            recorder_snapshot.get("citation_validation_passed")
         ),
-        "relation_validation_passed": (
-            recorder_snapshot.get("relation_validation_passed") is True
+        "relation_validation_passed": _optional_bool(
+            recorder_snapshot.get("relation_validation_passed")
         ),
-        "post_generation_validation_passed": (
-            recorder_snapshot.get("post_generation_validation_passed") is True
+        "post_generation_validation_passed": _optional_bool(
+            recorder_snapshot.get("post_generation_validation_passed")
         ),
         "elapsed_ms": _elapsed(
             budget.get("elapsed_ms", recorder_snapshot.get("elapsed_ms"))
@@ -284,8 +287,8 @@ def build_ask_failure_detail(
     planner_requests = _count(recorder_snapshot.get("planner_requests_attempted"))
     planner_repairs = _count(recorder_snapshot.get("planner_repair_attempts"))
     final_attempted = recorder_snapshot.get("final_answer_attempted") is True
-    final_repair_attempted = (
-        recorder_snapshot.get("final_answer_repair_attempted") is True
+    final_repair_attempted = _optional_bool(
+        recorder_snapshot.get("final_answer_repair_attempted")
     )
     provider_call_count = _count(recorder_snapshot.get("provider_logical_calls"))
     if provider_call_count == 0:
@@ -294,7 +297,7 @@ def build_ask_failure_detail(
         # Fake LLMs do not know about the recorder. These logical call sites are
         # still exact and deliberately exclude provider transport retries.
         provider_call_count = (
-            planner_requests + int(final_attempted) + int(final_repair_attempted)
+            planner_requests + int(final_attempted) + int(final_repair_attempted is True)
         )
 
     candidate_citations = recorder_snapshot.get("grounded_candidate_citation_count")
@@ -333,16 +336,18 @@ def build_ask_failure_detail(
         ),
         "planner_logical_calls": max(0, planner_requests - planner_repairs),
         "planner_repair_calls": planner_repairs,
+        "planner_enhancement_termination_reason": _enum_or_none(
+            recorder_snapshot.get("planner_enhancement_termination_reason"),
+            PLANNER_ENHANCEMENT_TERMINATION_CODES,
+        ),
         "final_answer_attempted": final_attempted,
         "final_answer_repair_attempted": final_repair_attempted,
-        "final_answer_repair_protocol_succeeded": recorder_snapshot.get(
+        "final_answer_repair_protocol_succeeded": _optional_bool(recorder_snapshot.get(
             "final_answer_repair_protocol_succeeded"
-        )
-        is True,
-        "final_answer_repair_succeeded": recorder_snapshot.get(
+        )),
+        "final_answer_repair_succeeded": _optional_bool(recorder_snapshot.get(
             "final_answer_repair_succeeded"
-        )
-        is True,
+        )),
         "provider_logical_calls": _count(provider_call_count),
         "evidence_count": max(
             _bounded_list_count(result.get("evidence")),
@@ -537,6 +542,10 @@ def _enum_or_none(value: Any, allowed: frozenset[str]) -> str | None:
     return value if isinstance(value, str) and value in allowed else None
 
 
+def _optional_bool(value: Any) -> bool | None:
+    return value if isinstance(value, bool) else None
+
+
 def _count(value: Any) -> int:
     if isinstance(value, int) and not isinstance(value, bool):
         return min(MAX_COUNTER, max(0, value))
@@ -658,7 +667,7 @@ def _safe_base_retrieval(value: Any) -> dict[str, Any] | None:
             count = raw_rejections.get(code)
             if isinstance(count, int) and not isinstance(count, bool) and count > 0:
                 rejection_code_counts[code] = _count(count)
-    return {
+    result = {
         "attempted": attempted,
         "status": status,
         "retrieval_hit_count": _count(value.get("retrieval_hit_count")),
@@ -670,6 +679,29 @@ def _safe_base_retrieval(value: Any) -> dict[str, Any] | None:
         "rejected_candidate_count": _count(value.get("rejected_candidate_count")),
         "rejection_code_counts": rejection_code_counts,
     }
+    detail = value.get("retrieval_detail")
+    if isinstance(detail, dict):
+        safe_detail: dict[str, Any] = {}
+        for key in (
+            "lexical_ms", "lexical_hit_count", "semantic_remaining_ms",
+            "semantic_wait_ms", "model_identity_ms", "model_load_ms",
+            "vector_read_ms", "query_encode_ms", "vector_score_ms", "revision_read_ms",
+            "fusion_ms", "promotion_ms",
+        ):
+            item = detail.get(key)
+            if isinstance(item, int) and not isinstance(item, bool) and item >= 0:
+                safe_detail[key] = _elapsed(item)
+        for key, allowed in (
+            ("model_state", {"unready", "loading", "ready", "failed", "unknown"}),
+            ("model_state_at_start", {"unready", "loading", "ready", "failed", "unknown"}),
+            ("semantic_status", {"completed", "skipped_budget", "timed_out", "capacity", "failed", "disabled"}),
+            ("retrieval_source", {"hybrid", "lexical", "lexical_symbol", "symbol"}),
+        ):
+            if detail.get(key) in allowed:
+                safe_detail[key] = detail[key]
+        if safe_detail:
+            result["retrieval_detail"] = safe_detail
+    return result
 
 
 def _safe_planner_attempts(value: Any) -> list[dict[str, Any]]:
@@ -911,6 +943,7 @@ def _bounded_payload(value: dict[str, Any]) -> dict[str, Any]:
         "tool_calls_used",
         "planner_logical_calls",
         "planner_repair_calls",
+        "planner_enhancement_termination_reason",
         "final_answer_attempted",
         "final_answer_repair_attempted",
         "final_answer_repair_protocol_succeeded",
@@ -978,12 +1011,7 @@ def _bounded_payload(value: dict[str, Any]) -> dict[str, Any]:
             }
             result["diagnostics_truncated"] = True
 
-    for key in (
-        "planner_attempts",
-        "final_answer_protocol_failure",
-        "final_answer_initial_failure",
-        "final_answer_repair_failure",
-    ):
+    for key in ("planner_attempts",):
         if not oversized():
             break
         result.pop(key, None)
@@ -1026,6 +1054,7 @@ def _minimal_ask_payload(value: dict[str, Any]) -> dict[str, Any]:
         "tool_calls_used",
         "planner_logical_calls",
         "planner_repair_calls",
+        "planner_enhancement_termination_reason",
         "final_answer_attempted",
         "final_answer_repair_attempted",
         "final_answer_repair_protocol_succeeded",
@@ -1045,6 +1074,14 @@ def _minimal_ask_payload(value: dict[str, Any]) -> dict[str, Any]:
         "base_retrieval",
     )
     result = {key: value[key] for key in keys if key in value}
+    for key in (
+        "final_answer_protocol_failure",
+        "final_answer_initial_failure",
+        "final_answer_repair_failure",
+    ):
+        detail = value.get(key)
+        if isinstance(detail, dict) and isinstance(detail.get("stable_code"), str):
+            result[key] = {"stable_code": detail["stable_code"]}
     result["diagnostics_truncated"] = True
     return result
 
@@ -1085,18 +1122,15 @@ def _absolute_minimal_ask_payload(value: dict[str, Any]) -> dict[str, Any]:
         "planner_logical_calls": _count(value.get("planner_logical_calls")),
         "planner_repair_calls": _count(value.get("planner_repair_calls")),
         "final_answer_attempted": value.get("final_answer_attempted") is True,
-        "final_answer_repair_attempted": value.get(
+        "final_answer_repair_attempted": _optional_bool(value.get(
             "final_answer_repair_attempted"
-        )
-        is True,
-        "final_answer_repair_protocol_succeeded": value.get(
+        )),
+        "final_answer_repair_protocol_succeeded": _optional_bool(value.get(
             "final_answer_repair_protocol_succeeded"
-        )
-        is True,
-        "final_answer_repair_succeeded": value.get(
+        )),
+        "final_answer_repair_succeeded": _optional_bool(value.get(
             "final_answer_repair_succeeded"
-        )
-        is True,
+        )),
         "provider_logical_calls": _count(value.get("provider_logical_calls")),
         "evidence_count": _count(value.get("evidence_count")),
         "citation_count": _count(value.get("citation_count")),
@@ -1110,6 +1144,16 @@ def _absolute_minimal_ask_payload(value: dict[str, Any]) -> dict[str, Any]:
         ),
         "elapsed_ms": _elapsed(value.get("elapsed_ms")),
         "diagnostics_truncated": True,
+        **{
+            key: {"stable_code": value[key]["stable_code"]}
+            for key in (
+                "final_answer_protocol_failure",
+                "final_answer_initial_failure",
+                "final_answer_repair_failure",
+            )
+            if isinstance(value.get(key), dict)
+            and isinstance(value[key].get("stable_code"), str)
+        },
     }
 
 

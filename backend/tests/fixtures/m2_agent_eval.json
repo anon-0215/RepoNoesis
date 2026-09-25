@@ -159,10 +159,10 @@
     "forbidden_tools": ["shell"],
     "expected_tool_sequence": [],
     "expected_evidence": ["src/auth.py"],
-    "expected_final_status": "degraded",
+    "expected_final_status": "completed",
     "maximum_steps": 1,
     "maximum_calls": 1,
-    "annotation_note": "两次无效决策进入 M1 确定性降级。"
+    "annotation_note": "BASE 已产生合法 Evidence；两次无效 Planner 决策结束增强，进入受验证 finalization。"
   },
   {
     "scenario_id": "M2-BUDGET-01",

@@ -310,7 +310,7 @@ class AgentDiagnosticsTests(unittest.TestCase):
             hashlib.sha256(rejected.encode("utf-8")).hexdigest(),
         )
 
-    def test_formal_product_repair_failure_short_circuits_final_provider(self):
+    def test_formal_product_repair_failure_with_base_evidence_finalizes(self):
         final_llm = _FinalLlm()
         planner = ScriptedPlanner(["bad", "still bad"])
         recorder = SmokeDiagnosticsRecorder()
@@ -325,19 +325,15 @@ class AgentDiagnosticsTests(unittest.TestCase):
             allow_planner_failure_fallback=False,
         )
         diagnostics = recorder.snapshot()
-        detail = build_ask_failure_detail(
-            result=result,
-            recorder_snapshot=diagnostics,
-            retrieval_version="v1",
-            hierarchy_mode="off",
-            relation_mode="off",
-        )
         self.assertEqual(planner.calls, 2)
-        self.assertEqual(final_llm.calls, 0)
+        self.assertEqual(final_llm.calls, 1)
         self.assertEqual(result["agent_mode"], "bounded")
-        self.assertEqual(result["agent_status"], "failed")
-        self.assertEqual(detail["code"], "planner_repair_failed")
-        self.assertFalse(detail["diagnostics"]["final_answer_attempted"])
+        self.assertEqual(result["agent_status"], "completed")
+        self.assertTrue(diagnostics["final_answer_attempted"])
+        self.assertEqual(
+            diagnostics["planner_enhancement_termination_reason"],
+            "planner_repair_failed",
+        )
         self.assertNotIn("fallback_reason_code", diagnostics)
 
     def test_adapter_truncation_has_safe_planner_stage_without_repair(self):
@@ -367,23 +363,28 @@ class AgentDiagnosticsTests(unittest.TestCase):
             "PRIVATE_TRUNCATED_PLANNER_BODY", json.dumps(recorder.snapshot())
         )
 
-    def test_planner_fallback_uses_fixed_reason_code(self):
+    def test_planner_repair_failure_with_base_evidence_uses_fixed_reason_code(self):
         result, diagnostics = self._run(ScriptedPlanner(["bad", "still bad"]))
-        self.assertEqual(result["agent_mode"], "deterministic_fallback")
-        self.assertEqual(diagnostics["fallback_reason_code"], "planner_validation_failed")
+        self.assertEqual(result["agent_mode"], "bounded")
+        self.assertEqual(result["agent_status"], "completed")
+        self.assertEqual(
+            diagnostics["planner_enhancement_termination_reason"],
+            "planner_repair_failed",
+        )
         self.assertFalse(diagnostics["planner_json_valid"])
 
     def test_planner_token_budget_exhaustion_survives_status_projection(self):
         result, diagnostics = self._run(
             ScriptedPlanner([decision("answer")], token_usage=10),
+            llm=_FinalLlm(),
             limits=replace(AgentLimits(), max_total_planner_output_tokens=1),
         )
+        self.assertEqual(result["agent_status"], "completed")
         self.assertEqual(
-            diagnostics["agent_failure_reason_code"], "planner_budget_exhausted"
+            diagnostics["planner_enhancement_termination_reason"],
+            "planner_budget_exhausted",
         )
-        self.assertEqual(
-            self._failure_code(result, diagnostics), "planner_budget_exhausted"
-        )
+        self.assertNotIn("agent_failure_reason_code", diagnostics)
 
     def test_deadline_exhaustion_survives_status_projection(self):
         result, diagnostics = self._run(
@@ -487,7 +488,7 @@ class AgentDiagnosticsTests(unittest.TestCase):
             result = run_bounded_agent(
                 "authenticate_user",
                 self.bundle,
-                NoLlm(),
+                _FinalLlm(),
                 self.database,
                 disabled_embedding_service(),
                 planner=planner,
@@ -503,10 +504,13 @@ class AgentDiagnosticsTests(unittest.TestCase):
         )
         self.assertEqual(planner.states[0][0]["deadline_monotonic"], 6.0)
         self.assertEqual(planner.states[0][0]["remaining_budget"]["time_ms"], 6000)
-        self.assertEqual(detail["code"], "planner_budget_exhausted")
-        self.assertEqual(ask_failure_http_status(detail), 503)
-        self.assertFalse(detail["diagnostics"]["request_deadline_reached"])
-        self.assertEqual(result["answer"], "")
+        self.assertEqual(result["agent_status"], "completed")
+        self.assertTrue(recorder.snapshot()["final_answer_attempted"])
+        self.assertEqual(
+            recorder.snapshot()["planner_enhancement_termination_reason"],
+            "planner_budget_exhausted",
+        )
+        self.assertFalse(recorder.snapshot()["request_deadline_reached"])
 
     def test_production_llm_planner_receives_work_cutoff_not_request_deadline(self):
         clock = _MutableClock()
@@ -837,7 +841,7 @@ class AgentDiagnosticsTests(unittest.TestCase):
             result = run_bounded_agent(
                 "authenticate_user",
                 self.bundle,
-                NoLlm(),
+                _FinalLlm(),
                 self.database,
                 disabled_embedding_service(),
                 planner=ScriptedPlanner(

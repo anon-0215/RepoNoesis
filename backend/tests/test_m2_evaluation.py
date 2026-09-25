@@ -11,6 +11,7 @@ from app.database import Database
 from app.services.agent_contracts import AgentLimits
 from app.services.agent_core import run_bounded_agent
 from app.services.evidence import CitationValidator, Evidence
+from app.services.smoke_diagnostics import SmokeDiagnosticsRecorder
 from tests.m1_helpers import disabled_embedding_service, make_project
 from tests.test_m2_agent import NoLlm, ScriptedPlanner, decision
 
@@ -92,6 +93,11 @@ class M2EvaluationTests(unittest.TestCase):
                         max_agent_steps=scenario["maximum_steps"],
                         max_tool_calls=scenario["maximum_calls"],
                     )
+                recorder = (
+                    SmokeDiagnosticsRecorder()
+                    if scenario["scenario_id"] == "M2-DEGRADE-02"
+                    else None
+                )
                 result = run_bounded_agent(
                     scenario["user_goal"],
                     self.bundle,
@@ -100,6 +106,7 @@ class M2EvaluationTests(unittest.TestCase):
                     disabled_embedding_service(),
                     planner=planner,
                     limits=limits,
+                    diagnostics_recorder=recorder,
                 )
                 actual_actions = [
                     step["action"]
@@ -140,6 +147,29 @@ class M2EvaluationTests(unittest.TestCase):
                         expected_path,
                         [item["path"] for item in result["evidence"]],
                     )
+                if scenario["scenario_id"] == "M2-DEGRADE-02":
+                    assert recorder is not None
+                    diagnostics = recorder.snapshot()
+                    self.assertGreaterEqual(
+                        diagnostics["base_retrieval"]["new_evidence_count"], 1
+                    )
+                    self.assertEqual(
+                        diagnostics["planner_enhancement_termination_reason"],
+                        "planner_repair_failed",
+                    )
+                    # This frozen scenario deliberately uses NoLlm: finalization
+                    # projects the retained canonical Evidence deterministically,
+                    # so no final-answer Provider call is attempted.
+                    self.assertEqual(result["answer_mode"], "deterministic")
+                    self.assertFalse(diagnostics["final_answer_attempted"])
+                    self.assertIsNone(diagnostics.get("citation_failure_reason_code"))
+                    self.assertIsNone(diagnostics.get("relation_failure_reason_code"))
+                    self.assertTrue(result["citations"])
+                    self.assertEqual(
+                        [item["path"] for item in result["citations"]],
+                        [item["path"] for item in result["evidence"]],
+                    )
+                    self.assertEqual(result["grounding_status"], "degraded")
 
         self.assertEqual(forbidden_call_count, 0)
         self.assertEqual(execution_count, 0)

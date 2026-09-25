@@ -15,10 +15,19 @@ import {
   Waypoints
 } from 'lucide-react';
 import { FormEvent, useEffect, useMemo, useRef, useState } from 'react';
+import { Workbench, type WorkbenchAnswer, type WorkbenchPage } from './workbench/Workbench';
+import './workbench/workbench.css';
+import './workbench/shell.css';
+import './workbench/interaction.css';
+import './workbench/ask-experience.css';
+import './workbench/reading.css';
+import './workbench/reading-fixes.css';
+import './workbench/evidence-summary.css';
+import './workbench/reading-theme.css';
 import {
   ApiError,
   analyzeProject,
-  askProject,
+  askProjectStream,
   checkWorkspaceRevision,
   deleteProject,
   getConfigStatus,
@@ -35,6 +44,7 @@ import {
   startWorkspaceRefresh
 } from './lib/api';
 import { createRequestGate, type RequestToken } from './lib/requestGate';
+import type { ExecutionMode } from './types';
 import {
   createConnectionStatusGate,
   type ConnectionProbeToken
@@ -59,29 +69,23 @@ import type {
   LearningStep,
   ProjectMap,
   ProjectResponse,
-  TreeNode,
   WorkspaceSummary,
   WorkspaceDetail,
   WorkspaceRevisionCheck,
   WorkspaceUpdateRun
 } from './types';
+import { ProjectMapView } from './workbench/ProjectMapView';
+import './workbench/project-map.css';
 
-type Tab = 'dashboard' | 'map' | 'learning' | 'ask' | 'report';
+type Tab = WorkbenchPage;
 
 interface LoadedProjectData {
   project: ProjectResponse;
-  projectMap: ProjectMap;
+  projectMap: ProjectMap | null;
+  mapError: string | null;
   learningSteps: LearningStep[];
   report: string;
 }
-
-const tabs: Array<{ id: Tab; label: string; icon: typeof LayoutDashboard }> = [
-  { id: 'dashboard', label: '概览', icon: LayoutDashboard },
-  { id: 'map', label: '项目地图', icon: Map },
-  { id: 'learning', label: '学习路线', icon: BookOpen },
-  { id: 'ask', label: '源码问答', icon: Search },
-  { id: 'report', label: '报告', icon: Clipboard }
-];
 
 export default function App() {
   const [sourceType, setSourceType] = useState<SourceType>('local');
@@ -97,11 +101,14 @@ export default function App() {
   const [continuity, setContinuity] = useState<LearningContinuity | null>(null);
   const [project, setProject] = useState<ProjectResponse | null>(null);
   const [projectMap, setProjectMap] = useState<ProjectMap | null>(null);
+  const [mapError, setMapError] = useState<string | null>(null);
   const [learningSteps, setLearningSteps] = useState<LearningStep[]>([]);
   const [report, setReport] = useState('');
-  const [activeTab, setActiveTab] = useState<Tab>('dashboard');
-  const [question, setQuestion] = useState('入口文件在哪？');
-  const [answers, setAnswers] = useState<Array<{ question: string; result: ChatAnswer }>>([]);
+  const [activeTab, setActiveTab] = useState<Tab>('ask');
+  const [question, setQuestion] = useState('');
+  const [answers, setAnswers] = useState<WorkbenchAnswer[]>([]);
+  const [executionMode, setExecutionMode] = useState<ExecutionMode>('agent');
+  const activeAskConnection = useRef<AbortController | null>(null);
   const [analysisLoading, setAnalysisLoading] = useState(false);
   const [workspaceLoading, setWorkspaceLoading] = useState(false);
   const [askLoading, setAskLoading] = useState(false);
@@ -111,6 +118,8 @@ export default function App() {
   const [message, setMessage] = useState('');
   const [connectionError, setConnectionError] = useState('');
   const [deletingProjectId, setDeletingProjectId] = useState('');
+
+  useEffect(() => () => { activeAskConnection.current?.abort(); }, [workspaceId, projectId, currentRevision]);
 
   const hasProject = Boolean(project && projectId);
   const updateState = workspaceUpdateState(revisionCheck, updateRun);
@@ -144,7 +153,7 @@ export default function App() {
 
   async function initializeWorkspace() {
     const initialGeneration = requestGate.current.getContext().generation;
-    await loadWorkspaceLibrary();
+    const library = await loadWorkspaceLibrary();
     if (requestGate.current.getContext().generation !== initialGeneration) return;
     const restore = selectWorkspaceToRestore(
       window.location.search,
@@ -157,26 +166,31 @@ export default function App() {
     }
     if (restore.workspaceId) {
       await openWorkspace(restore.workspaceId, restore.source);
+    } else {
+      const firstOpenable = library?.find((item) => item.openable);
+      if (firstOpenable) await openWorkspace(firstOpenable.workspace_id, 'selection');
     }
   }
 
-  async function loadWorkspaceLibrary(token?: RequestToken) {
-    if (token && !requestGate.current.isActive(token)) return;
+  async function loadWorkspaceLibrary(token?: RequestToken): Promise<WorkspaceSummary[] | null> {
+    if (token && !requestGate.current.isActive(token)) return null;
     setLibraryStatus(workspaceLibraryStatus('loading'));
     const probe = beginConnectionProbe();
     try {
       const result = await listWorkspaces();
-      if (token && !requestGate.current.isActive(token)) return;
+      if (token && !requestGate.current.isActive(token)) return null;
       settleConnectionProbe(probe);
       setWorkspaces(result.items);
       setLibraryStatus(workspaceLibraryStatus('success', result.items.length));
+      return result.items;
     } catch (error) {
-      if (token && !requestGate.current.isActive(token)) return;
+      if (token && !requestGate.current.isActive(token)) return null;
       settleConnectionProbe(probe, error);
       setLibraryStatus(workspaceLibraryStatus('error'));
       if (!(error instanceof ApiError && error.status === 0)) {
         setMessage(error instanceof Error ? error.message : '无法读取项目库');
       }
+      return null;
     }
   }
 
@@ -233,13 +247,14 @@ export default function App() {
   async function loadAll(nextProjectId: string): Promise<LoadedProjectData> {
     const [projectData, mapData, learningData, reportData] = await Promise.all([
       getProject(nextProjectId),
-      getProjectMap(nextProjectId),
+      getProjectMap(nextProjectId).then((value) => ({ value, error: null })).catch(() => ({ value: null, error: '地图接口不可用，请重试。' })),
       getLearningPath(nextProjectId),
       getReport(nextProjectId)
     ]);
     return {
       project: projectData,
-      projectMap: mapData,
+      projectMap: mapData.value,
+      mapError: mapData.error,
       learningSteps: learningData.steps,
       report: reportData.markdown
     };
@@ -253,7 +268,9 @@ export default function App() {
     setUpdateRun(workspace.latest_update_run);
     setContinuity(workspace.learning_continuity);
     setProject(loaded.project);
-    setProjectMap(loaded.projectMap);
+    const mapMatches = !loaded.projectMap || ((!loaded.projectMap.project_id || loaded.projectMap.project_id === workspace.active_snapshot.project_id) && (!loaded.projectMap.repository_revision || loaded.projectMap.repository_revision === workspace.active_snapshot.repository_revision));
+    setProjectMap(mapMatches ? loaded.projectMap : null);
+    setMapError(mapMatches ? loaded.mapError : '地图版本与当前项目不一致，请重试。');
     setLearningSteps(loaded.learningSteps);
     setReport(loaded.report);
     setAnswers([]);
@@ -271,7 +288,26 @@ export default function App() {
     setAskLoading(false);
     setAnswers([]);
     setAskError(null);
+    setProjectMap(null);
+    setMapError(null);
     return token;
+  }
+
+  async function retryMap() {
+    if (!projectId || !currentRevision) return;
+    const context = requestGate.current.getContext();
+    setMapError(null);
+    setProjectMap(null);
+    try {
+      const result = await getProjectMap(projectId);
+      const now = requestGate.current.getContext();
+      if (now.generation !== context.generation || now.projectId !== projectId || now.revision !== currentRevision) return;
+      if ((result.project_id && result.project_id !== projectId) || (result.repository_revision && result.repository_revision !== currentRevision)) throw new Error('map_context_mismatch');
+      setProjectMap(result);
+    } catch {
+      const now = requestGate.current.getContext();
+      if (now.generation === context.generation && now.projectId === projectId && now.revision === currentRevision) setMapError('地图接口不可用或版本不匹配，请重试。');
+    }
   }
 
   async function openWorkspace(
@@ -298,7 +334,7 @@ export default function App() {
       }
       applyWorkspace(workspace, loaded);
       settleConnectionProbe(probe);
-      if (resetActiveTab) setActiveTab('dashboard');
+      if (resetActiveTab) setActiveTab('ask');
       setMessage(successMessage);
       return true;
     } catch (error) {
@@ -494,7 +530,7 @@ export default function App() {
       }
       applyWorkspace(workspace, loaded);
       settleConnectionProbe(probe);
-      setActiveTab('dashboard');
+      setActiveTab('ask');
       await loadWorkspaceLibrary(token);
       if (requestGate.current.isActive(token)) {
         setMessage(result.import_action === 'reused' ? '已载入持久化项目和索引。' : '分析和本地索引完成。');
@@ -521,207 +557,85 @@ export default function App() {
     const token = requestGate.current.tryEnter('ask');
     if (!token) return;
     const submittedQuestion = question.trim();
+    const submittedMode = executionMode;
+    const connection = new AbortController();
+    activeAskConnection.current = connection;
+    const entryId = `${token.context.workspaceId}:${token.context.projectId}:${token.context.revision}:${token.requestId}`;
     setAskLoading(true);
     setAskError(null);
     setMessage('正在检索源码片段并生成回答...');
+    setAnswers((current) => [...current, {
+      id: entryId,
+      status: 'pending',
+      requestedMode: submittedMode,
+      progress: [],
+      question: submittedQuestion,
+      clientRequestId: token.requestId,
+      workspaceId: token.context.workspaceId,
+      projectId: token.context.projectId,
+      revision: token.context.revision
+    }]);
     try {
-      const result = await askProject(token.context.projectId, submittedQuestion);
+      const result = await askProjectStream(token.context.projectId, token.context.revision, submittedQuestion, submittedMode, String(token.requestId), (progress) => {
+        if (!requestGate.current.isCurrent(token)) return;
+        setAnswers((current) => current.map((entry) => entry.id === entryId && entry.status === 'pending'
+          ? { ...entry, progress: [...(entry.progress || []), progress].slice(-30) }
+          : entry));
+      }, connection.signal);
       if (!requestGate.current.isCurrent(token)) return;
-      setAnswers((current) => [{ question: submittedQuestion, result }, ...current]);
+      setAnswers((current) => current.map((entry) => entry.id === entryId
+        ? { ...entry, status: 'success', result }
+        : entry));
       setQuestion('');
       setMessage('回答已生成，注意查看引用文件。');
     } catch (error) {
       if (!requestGate.current.isCurrent(token)) return;
-      if (error instanceof ApiError && error.detail) setAskError(error.detail);
-      setMessage(error instanceof ApiError ? error.message : '问答失败');
+      const failure = error instanceof ApiError ? error.detail : null;
+      setAnswers((current) => current.map((entry) => entry.id === entryId
+        ? {
+          ...entry,
+          status: 'failure',
+          failure: failure ?? undefined,
+          errorMessage: error instanceof Error ? error.message : '问答失败，请检查服务后重试。'
+        }
+        : entry));
+      // A structured failure already has a persistent, request-owned card.
+      // A second transient banner sends the reader to a vague "diagnostic card".
+      setMessage(failure ? '' : error instanceof ApiError ? error.message : '问答失败');
     } finally {
+      if (activeAskConnection.current === connection) activeAskConnection.current = null;
       if (requestGate.current.finish(token, true)) setAskLoading(false);
     }
   }
 
   const activeContent = useMemo(() => {
-    if (!hasProject || !project) {
-      return <EmptyState />;
-    }
-    if (activeTab === 'dashboard') {
-      return <Dashboard project={project} />;
-    }
-    if (activeTab === 'map') {
-      return <MapView projectMap={projectMap} />;
-    }
-    if (activeTab === 'learning') {
-      return <LearningView steps={learningSteps} continuity={continuity} />;
-    }
-    if (activeTab === 'ask') {
-      return (
-        <AskView
-          question={question}
-          setQuestion={setQuestion}
-          answers={answers}
-          error={askError}
-          onSubmit={handleAsk}
-          loading={askLoading}
-        />
-      );
-    }
-    return <ReportView markdown={report} />;
-  }, [activeTab, answers, askError, askLoading, continuity, hasProject, learningSteps, project, projectMap, question, report]);
+    if (activeTab === 'manage') return <ManagementView
+      workspaces={workspaces} libraryStatus={libraryStatus} workspaceId={workspaceId}
+      currentRevision={currentRevision} updateState={updateState} revisionCheck={revisionCheck}
+      updateRun={updateRun} continuity={continuity} continuityState={continuityState}
+      sourceType={sourceType} source={source} configStatus={configStatus} analysisLoading={analysisLoading}
+      workspaceLoading={workspaceLoading} deletingProjectId={deletingProjectId}
+      onRefresh={() => void loadWorkspaceLibrary()} onOpenWorkspace={(id) => void openWorkspace(id)}
+      onDelete={(item) => void handleDeleteWorkspace(item)} onCheckRevision={() => void handleCheckRevision()}
+      onStartRefresh={() => void handleStartRefresh()} onRetryRefresh={() => void handleRetryRefresh()}
+      onRetryContinuity={() => void handleRetryContinuity()} onSourceType={setSourceType} onSourceChange={setSource}
+      onAnalyze={handleAnalyze}
+    />;
+    if (!hasProject || !project) return <EmptyState />;
+    if (activeTab === 'dashboard') return <Dashboard project={project} />;
+    if (activeTab === 'map') return <ProjectMapView key={`${workspaceId}:${projectId}:${currentRevision}`} projectId={projectId} revision={currentRevision} projectMap={projectMap} error={mapError} loading={workspaceLoading} onRetry={() => void retryMap()} />;
+    if (activeTab === 'learning') return <LearningView steps={learningSteps} continuity={continuity} />;
+    if (activeTab === 'report') return <ReportView markdown={report} />;
+    return null;
+  }, [activeTab, analysisLoading, configStatus, continuity, continuityState, currentRevision, deletingProjectId, hasProject, libraryStatus, mapError, project, projectId, projectMap, report, revisionCheck, source, sourceType, updateRun, updateState, workspaceId, workspaceLoading, workspaces]);
 
-  return (
-    <div className="app-shell">
-      <header className="topbar">
-        <div className="brand">
-          <GitBranch aria-hidden="true" />
-          <div>
-            <strong>源鉴 RepoNoesis</strong>
-            <span>源码证据驱动的项目学习工作台</span>
-          </div>
-        </div>
-        <div className="status-line">{connectionError || message || providerSummary(configStatus)}</div>
-      </header>
-
-      <main className="workspace">
-        <aside className="sidebar">
-          <section className="workspace-library" aria-label="项目库">
-            <div className="workspace-library-title">
-              <strong>项目库</strong>
-              <button type="button" onClick={() => void loadWorkspaceLibrary()} disabled={libraryStatus === 'loading'}>
-                <RefreshCw aria-hidden="true" />
-                <span>刷新列表</span>
-              </button>
-            </div>
-            {libraryStatus === 'loading' && <p>正在读取已有项目…</p>}
-            {libraryStatus === 'error' && <p className="library-error">项目库读取失败，可重试或使用下方新建分析。</p>}
-            {libraryStatus === 'empty' && <p>还没有已分析项目，请使用下方入口建立第一个项目。</p>}
-            {libraryStatus === 'ready' && (
-              <div className="workspace-list">
-                {workspaces.map((item) => (
-                  <div className="workspace-list-item" key={item.workspace_id}>
-                    <button
-                      type="button"
-                      className={workspaceId === item.workspace_id ? 'active' : ''}
-                      disabled={!item.openable || workspaceLoading || analysisLoading}
-                      onClick={() => void openWorkspace(item.workspace_id)}
-                    >
-                      <FolderOpen aria-hidden="true" />
-                      <span>
-                        <strong>{item.display_name}</strong>
-                        <small>{item.project_status} · {item.repository_revision.slice(0, 8) || 'no revision'}</small>
-                        <small>Embedding：{item.embedding_count ?? 0} / {item.total_chunks ?? 0}</small>
-                      </span>
-                    </button>
-                    <button
-                      type="button"
-                      className="workspace-delete"
-                      aria-label={`删除 ${item.display_name}`}
-                      disabled={!item.project_id || deletingProjectId === item.project_id || analysisLoading}
-                      onClick={() => void handleDeleteWorkspace(item)}
-                    >
-                      <Trash2 aria-hidden="true" />
-                    </button>
-                  </div>
-                ))}
-              </div>
-            )}
-          </section>
-
-          {workspaceId && (
-            <section className={`workspace-update-card ${updateState}`} aria-label="revision 更新">
-              <strong>Revision 更新</strong>
-              <span>当前：{currentRevision.slice(0, 12) || 'unknown'}</span>
-              {revisionCheck?.state === 'update_available' && (
-                <span>可用：{revisionCheck.available_revision.slice(0, 12)}</span>
-              )}
-              {updateState === 'updating' && <span>阶段：{updateRun?.phase}</span>}
-              {updateState === 'failed' && <span>{updateRun?.error_code || 'update_failed'}</span>}
-              <div className="workspace-update-actions">
-                <button type="button" onClick={() => void handleCheckRevision()} disabled={updateState === 'updating'}>
-                  检查更新
-                </button>
-                {updateState === 'update-available' && (
-                  <button type="button" onClick={() => void handleStartRefresh()}>确认更新</button>
-                )}
-                {updateState === 'failed' && updateRun?.retryable && (
-                  <button type="button" onClick={() => void handleRetryRefresh()}>安全重试</button>
-                )}
-              </div>
-            </section>
-          )}
-
-          {workspaceId && continuityState !== 'not-required' && continuity && (
-            <section className={`workspace-update-card continuity-${continuityState}`} aria-label="学习连续性">
-              <strong>跨版本学习连续性</strong>
-              <span>状态：{continuityState}</span>
-              {(continuityState === 'pending' || continuityState === 'running') && (
-                <span>学习状态正在保守映射；普通问答可继续使用新 revision。</span>
-              )}
-              {continuityState === 'succeeded' && (
-                <>
-                  <span>安全保留：{continuity.stats.retained}</span>
-                  <span>需要复习：{continuity.stats.needs_review}</span>
-                  <span>仅留历史：{continuity.stats.history_only}</span>
-                  <span>未自动继承：{continuity.stats.not_inherited}</span>
-                </>
-              )}
-              {continuityState === 'failed' && (
-                <span>{continuity.error_code || 'continuity_failed'}；旧 mastery 未用于当前 revision。</span>
-              )}
-              {continuityState === 'failed' && continuity.retryable && (
-                <div className="workspace-update-actions">
-                  <button type="button" onClick={() => void handleRetryContinuity()}>重试学习连续性</button>
-                </div>
-              )}
-            </section>
-          )}
-
-          <form className="analyze-form" onSubmit={handleAnalyze}>
-            <label htmlFor="repo-source">仓库来源</label>
-            <div className="source-toggle" role="group" aria-label="仓库来源">
-              <button type="button" className={sourceType === 'local' ? 'active' : ''} onClick={() => setSourceType('local')}>本地目录</button>
-              <button type="button" className={sourceType === 'git_url' ? 'active' : ''} onClick={() => setSourceType('git_url')}>公开 HTTPS Git</button>
-            </div>
-            <input
-              id="repo-source"
-              value={source}
-              onChange={(event) => setSource(event.target.value)}
-              placeholder={sourceType === 'local' ? 'D:\\Project\\my-python-repo' : 'https://host/owner/repo.git'}
-              required
-            />
-            <button type="submit" disabled={analysisLoading}>
-              {analysisLoading ? <RefreshCw className="spin" aria-hidden="true" /> : <GitBranch aria-hidden="true" />}
-              <span>{analysisLoading ? '分析中' : '开始分析'}</span>
-            </button>
-          </form>
-
-          <div className="provider-card">
-            <strong>{providerSummary(configStatus)}</strong>
-            <span>BGE-M3：{configStatus ? `${configStatus.embedding.model} / ${configStatus.embedding.device} / ${configStatus.embedding.offline ? 'offline' : 'online'}${configStatus.embedding.ready ? '' : `；缺少 ${configStatus.embedding.missing.join(', ')}`}` : '读取中'}</span>
-            <small>API Key 只保存在后端根目录 .env，不会发送到浏览器或写入项目数据库。</small>
-          </div>
-
-          <nav className="tabs" aria-label="结果导航">
-            {tabs.map((tab) => {
-              const Icon = tab.icon;
-              return (
-                <button
-                  key={tab.id}
-                  className={activeTab === tab.id ? 'active' : ''}
-                  onClick={() => setActiveTab(tab.id)}
-                  disabled={!hasProject}
-                  title={tab.label}
-                >
-                  <Icon aria-hidden="true" />
-                  <span>{tab.label}</span>
-                </button>
-              );
-            })}
-          </nav>
-        </aside>
-
-        <section className="content">{activeContent}</section>
-      </main>
-    </div>
-  );
+  return <Workbench project={project} workspaces={workspaces} workspaceId={workspaceId} revision={currentRevision} executionMode={executionMode} onExecutionModeChange={setExecutionMode}
+    question={question} answers={answers} error={askError} loading={askLoading}
+    libraryLoading={libraryStatus === 'loading'} projectLoading={workspaceLoading || analysisLoading}
+    statusMessage={connectionError || message} activePage={activeTab}
+    content={activeContent} onQuestionChange={setQuestion} onSubmit={handleAsk}
+    onOpenWorkspace={(id) => void openWorkspace(id, 'selection', '已切换项目；回答和引用已清空。', false)}
+    onRefreshLibrary={() => void loadWorkspaceLibrary()} onNavigate={setActiveTab} />;
 }
 
 function EmptyState() {
@@ -738,6 +652,35 @@ function EmptyState() {
       </div>
     </div>
   );
+}
+
+function ManagementView({
+  workspaces, libraryStatus, workspaceId, currentRevision, updateState, revisionCheck, updateRun,
+  continuity, continuityState, sourceType, source, configStatus, analysisLoading, workspaceLoading,
+  deletingProjectId, onRefresh, onOpenWorkspace, onDelete, onCheckRevision, onStartRefresh,
+  onRetryRefresh, onRetryContinuity, onSourceType, onSourceChange, onAnalyze
+}: {
+  workspaces: WorkspaceSummary[]; libraryStatus: WorkspaceLibraryStatus; workspaceId: string;
+  currentRevision: string; updateState: string; revisionCheck: WorkspaceRevisionCheck | null;
+  updateRun: WorkspaceUpdateRun | null; continuity: LearningContinuity | null; continuityState: string;
+  sourceType: SourceType; source: string; configStatus: ConfigStatus | null; analysisLoading: boolean;
+  workspaceLoading: boolean; deletingProjectId: string; onRefresh: () => void;
+  onOpenWorkspace: (id: string) => void; onDelete: (item: WorkspaceSummary) => void;
+  onCheckRevision: () => void; onStartRefresh: () => void; onRetryRefresh: () => void;
+  onRetryContinuity: () => void; onSourceType: (value: SourceType) => void;
+  onSourceChange: (value: string) => void; onAnalyze: (event: FormEvent) => void;
+}) {
+  return <div className="wb-page wb-management">
+    <section className="wb-page-heading"><p>项目管理</p><h1>已索引项目与本地分析</h1><span>来源和 revision 仅展示服务端已有记录；删除失败时会保留项目以便安全重试。</span></section>
+    <section className="wb-panel" aria-label="项目库"><div className="wb-panel-head"><h2>项目库</h2><button type="button" onClick={onRefresh} disabled={libraryStatus === 'loading'}><RefreshCw />刷新列表</button></div>
+      {libraryStatus === 'loading' && <p>正在读取已有项目…</p>}{libraryStatus === 'error' && <p className="wb-notice">项目库读取失败，可重试。</p>}{libraryStatus === 'empty' && <p>还没有已分析项目，请使用下方入口建立第一个项目。</p>}
+      {libraryStatus === 'ready' && <div className="wb-workspace-table">{workspaces.map((item) => <article key={item.workspace_id} className={item.workspace_id === workspaceId ? 'is-current' : ''}><div><strong>{item.display_name}</strong><span>{item.source_type === 'local' ? '本地来源' : item.source_type === 'git_url' ? 'URL 来源' : '来源信息未提供'}</span></div><div><span>状态：{item.project_status}</span><span title={item.repository_revision}>revision：{item.repository_revision ? item.repository_revision.slice(0, 12) : '未提供'}</span><span>向量记录：{item.embedding_count ?? 0} / {item.total_chunks ?? 0}</span></div><div className="wb-row-actions"><button type="button" disabled={!item.openable || workspaceLoading || analysisLoading} onClick={() => onOpenWorkspace(item.workspace_id)}>打开</button><button type="button" className="wb-danger" aria-label={`删除 ${item.display_name}`} disabled={!item.project_id || deletingProjectId === item.project_id || analysisLoading} onClick={() => onDelete(item)}><Trash2 />删除</button></div></article>)}</div>}
+    </section>
+    {workspaceId && <section className={`wb-panel wb-update ${updateState}`} aria-label="revision 更新"><h2>Revision 更新</h2><p>当前：{currentRevision.slice(0, 12) || 'unknown'}</p>{revisionCheck?.state === 'update_available' && <p>可用：{revisionCheck.available_revision.slice(0, 12)}</p>}{updateState === 'updating' && <p>阶段：{updateRun?.phase}</p>}{updateState === 'failed' && <p className="wb-notice">{updateRun?.error_code || 'update_failed'}</p>}<div className="wb-row-actions"><button type="button" onClick={onCheckRevision} disabled={updateState === 'updating'}>检查更新</button>{updateState === 'update-available' && <button type="button" onClick={onStartRefresh}>确认更新</button>}{updateState === 'failed' && updateRun?.retryable && <button type="button" onClick={onRetryRefresh}>安全重试</button>}</div></section>}
+    {workspaceId && continuityState !== 'not-required' && continuity && <section className="wb-panel" aria-label="学习连续性"><h2>跨版本学习连续性</h2><p>状态：{continuityState}</p>{continuityState === 'failed' && <p className="wb-notice">{continuity.error_code || 'continuity_failed'}；旧 mastery 未用于当前 revision。</p>}{continuityState === 'failed' && continuity.retryable && <button type="button" onClick={onRetryContinuity}>重试学习连续性</button>}</section>}
+    <section className="wb-panel"><h2>导入项目</h2><form className="analyze-form wb-import-form" onSubmit={onAnalyze}><label htmlFor="repo-source">仓库来源</label><div className="source-toggle" role="group" aria-label="仓库来源"><button type="button" className={sourceType === 'local' ? 'active' : ''} onClick={() => onSourceType('local')}>本地目录</button><button type="button" className={sourceType === 'git_url' ? 'active' : ''} onClick={() => onSourceType('git_url')}>公开 HTTPS Git</button></div><input id="repo-source" value={source} onChange={(event) => onSourceChange(event.target.value)} placeholder={sourceType === 'local' ? 'D:\\Project\\my-python-repo' : 'https://host/owner/repo.git'} required /><button type="submit" disabled={analysisLoading}>{analysisLoading ? <RefreshCw className="spin" /> : <GitBranch />}<span>{analysisLoading ? '分析中' : '开始分析'}</span></button></form></section>
+    <section className="wb-panel wb-provider"><strong>{providerSummary(configStatus)}</strong><span>BGE-M3：{configStatus ? `${configStatus.embedding.model} / ${configStatus.embedding.device} / ${configStatus.embedding.offline ? 'offline' : 'online'}${configStatus.embedding.ready ? '' : `；缺少 ${configStatus.embedding.missing.join(', ')}`}` : '读取中'}</span><small>API Key 只保存在后端根目录 .env，不会发送到浏览器或写入项目数据库。</small></section>
+  </div>;
 }
 
 function Dashboard({ project }: { project: ProjectResponse }) {
@@ -812,47 +755,6 @@ function Metric({ label, value, icon: Icon }: { label: string; value: number; ic
   );
 }
 
-function MapView({ projectMap }: { projectMap: ProjectMap | null }) {
-  if (!projectMap) return null;
-  return (
-    <div className="two-column">
-      <section className="panel">
-        <h2>目录树</h2>
-        <Tree node={projectMap.tree} />
-      </section>
-      <section className="panel">
-        <h2>模块关系</h2>
-        <div className="module-lanes">
-          {projectMap.modules.map((module) => (
-            <div className="lane" key={module.name}>
-              <div>
-                <strong>{module.name}</strong>
-                <span>{module.depends_on.length ? `依赖 ${module.depends_on.join(', ')}` : '独立模块'}</span>
-              </div>
-              <p>{module.responsibility}</p>
-            </div>
-          ))}
-        </div>
-      </section>
-    </div>
-  );
-}
-
-function Tree({ node }: { node: TreeNode }) {
-  return (
-    <div className={node.type === 'directory' ? 'tree-dir' : 'tree-file'}>
-      <span className={node.is_core ? 'core-node' : ''}>{node.name}</span>
-      {node.children && (
-        <div className="tree-children">
-          {node.children.map((child) => (
-            <Tree key={child.path} node={child} />
-          ))}
-        </div>
-      )}
-    </div>
-  );
-}
-
 function LearningView({ steps, continuity }: { steps: LearningStep[]; continuity: LearningContinuity | null }) {
   return (
     <div className="learning-list">
@@ -915,7 +817,7 @@ export function AskView({
 }: {
   question: string;
   setQuestion: (value: string) => void;
-  answers: Array<{ question: string; result: ChatAnswer }>;
+  answers: WorkbenchAnswer[];
   error: AskFailure | null;
   onSubmit: (event: FormEvent) => void;
   loading: boolean;
@@ -947,12 +849,12 @@ export function AskView({
         {answers.map((item, index) => (
           <article className="answer" key={`${item.question}-${index}`}>
              <h2>{item.question}</h2>
-             <p>{item.result.answer}</p>
+             <p>{item.result?.answer || '回答仍在处理中或未能生成。'}</p>
             <p className="citation-trust-note">
               源码引用已校验；生成解释仍可能有误，请结合引用核对。
             </p>
              <div className="citation-grid">
-              {item.result.citations.map((citation, citationIndex) => (
+              {(item.result?.citations || []).map((citation, citationIndex) => (
                 <details
                   key={`${citation.path}:${citation.start_line}-${citation.end_line}:${citation.qualified_name}:${citationIndex}`}
                   open

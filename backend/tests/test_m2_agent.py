@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 from dataclasses import replace
 import importlib
 import os
@@ -10,6 +11,8 @@ from unittest.mock import patch
 
 from app.database import Database, SCHEMA_VERSION
 from app.services.agent_contracts import AgentLimits, CancellationToken, PlannerDecision
+from app.services import agent_core
+from app.services import agent_finalization_phase
 from app.services.agent_core import run_bounded_agent
 from app.services.qa_agent import INSUFFICIENT_ANSWER
 from app.services.smoke_diagnostics import SmokeDiagnosticsRecorder
@@ -229,11 +232,11 @@ class M2AgentTests(unittest.TestCase):
         self.assertEqual(planner.calls, 3)
         self.assertIsNotNone(planner.repair_hints[1])
 
-    def test_failed_repair_uses_deterministic_m1_fallback(self):
+    def test_failed_repair_with_base_evidence_continues_to_finalization(self):
         planner = ScriptedPlanner(["bad", "still bad"])
         result = self._run(planner)
-        self.assertEqual(result["agent_mode"], "deterministic_fallback")
-        self.assertEqual(result["agent_status"], "degraded")
+        self.assertEqual(result["agent_mode"], "bounded")
+        self.assertEqual(result["agent_status"], "completed")
         self.assertTrue(result["evidence"])
         self.assertTrue(any("Planner decision failed" in item for item in result["warnings"]))
 
@@ -250,7 +253,7 @@ class M2AgentTests(unittest.TestCase):
             ]
         )
         result = self._run(planner)
-        self.assertEqual(result["agent_status"], "degraded")
+        self.assertEqual(result["agent_status"], "completed")
         self.assertTrue(result["evidence"])
         statuses = [
             step["tool_calls"][0]["status"]
@@ -355,6 +358,135 @@ class M2AgentTests(unittest.TestCase):
         self.assertEqual(result["retrieval_mode"], "lexical")
         self.assertTrue(result["evidence"])
 
+    def test_deterministic_fallback_delegates_finalization_with_one_request_state(self):
+        recorder = SmokeDiagnosticsRecorder()
+        with (
+            patch.object(
+                agent_core,
+                "_run_deterministic_fallback",
+                wraps=agent_core._run_deterministic_fallback,
+            ) as fallback,
+            patch.object(
+                agent_core,
+                "run_finalization_phase",
+                wraps=agent_core.run_finalization_phase,
+            ) as finalization,
+        ):
+            result = agent_core.run_bounded_agent(
+                "authenticate_user",
+                self.bundle,
+                NoLlm(),
+                self.db,
+                disabled_embedding_service(),
+                diagnostics_recorder=recorder,
+            )
+
+        fallback_state = fallback.call_args.kwargs["state"]
+        finalization_state = finalization.call_args.kwargs["state"]
+        self.assertIs(fallback_state, finalization_state)
+        self.assertIs(fallback_state.context, finalization_state.context)
+        self.assertIs(
+            fallback_state.context.evidence_store,
+            finalization_state.context.evidence_store,
+        )
+        self.assertIs(
+            fallback_state.context.candidate_pool,
+            finalization_state.context.candidate_pool,
+        )
+        self.assertIs(
+            fallback_state.context.diagnostics_recorder,
+            finalization_state.context.diagnostics_recorder,
+        )
+        self.assertIs(finalization_state.context.diagnostics_recorder, recorder)
+        self.assertEqual(finalization.call_args.kwargs["mode"], "deterministic_fallback")
+        self.assertEqual(result["agent_mode"], "deterministic_fallback")
+        self.assertEqual(result["agent_status"], "degraded")
+        self.assertTrue(result["evidence"])
+
+    def test_deterministic_relation_fallback_reuses_the_same_request_state(self):
+        with (
+            patch.object(
+                agent_core,
+                "_run_deterministic_fallback",
+                wraps=agent_core._run_deterministic_fallback,
+            ) as fallback,
+            patch.object(
+                agent_core,
+                "run_finalization_phase",
+                wraps=agent_core.run_finalization_phase,
+            ) as finalization,
+        ):
+            result = agent_core.run_bounded_agent(
+                "authenticate_user",
+                self.bundle,
+                NoLlm(),
+                self.db,
+                disabled_embedding_service(),
+                retrieval_version="v2",
+                relation_mode="expand_v1",
+            )
+
+        self.assertIs(
+            fallback.call_args.kwargs["state"],
+            finalization.call_args.kwargs["state"],
+        )
+        self.assertEqual(
+            finalization.call_args.kwargs["state"].context.relation_mode,
+            "expand_v1",
+        )
+        self.assertEqual(result["agent_mode"], "deterministic_fallback")
+        self.assertEqual(result["agent_status"], "degraded")
+
+    def test_finalization_ownership_is_phase_local_for_all_agent_paths(self):
+        core_tree = ast.parse(Path(agent_core.__file__).read_text(encoding="utf-8"))
+        phase_tree = ast.parse(
+            Path(agent_finalization_phase.__file__).read_text(encoding="utf-8")
+        )
+
+        def function(tree, name):
+            return next(
+                node
+                for node in ast.walk(tree)
+                if isinstance(node, ast.FunctionDef) and node.name == name
+            )
+
+        def direct_call_names(node):
+            return {
+                call.func.id
+                for call in ast.walk(node)
+                if isinstance(call, ast.Call) and isinstance(call.func, ast.Name)
+            }
+
+        forbidden = {
+            "answer_from_evidence",
+            "_validated_relation_context",
+            "_bounded_evidence_context",
+            "_finalization_rejection_response",
+        }
+        coordinator = function(core_tree, "_run_bounded_agent_stages")
+        fallback = function(core_tree, "_run_deterministic_fallback")
+        self.assertTrue(
+            {"run_finalization_phase"}.issubset(direct_call_names(coordinator))
+        )
+        self.assertTrue(
+            {"run_finalization_phase"}.issubset(direct_call_names(fallback))
+        )
+        self.assertFalse(direct_call_names(coordinator) & forbidden)
+        self.assertFalse(direct_call_names(fallback) & forbidden)
+        self.assertNotIn("AgentState", direct_call_names(fallback))
+
+        phase_owner = function(phase_tree, "run_finalization_phase")
+        phase_calls = {
+            call.func.attr
+            for call in ast.walk(phase_owner)
+            if isinstance(call, ast.Call) and isinstance(call.func, ast.Attribute)
+        }
+        self.assertTrue(
+            {"answer_from_evidence", "validated_relation_context"}.issubset(
+                phase_calls
+            )
+        )
+
     def test_agent_validation_cannot_be_skipped_and_detects_final_change(self):
         class MutatingPlanner(ScriptedPlanner):
             def decide(inner_self, state, *, repair_hint=None):
@@ -452,7 +584,7 @@ class M2AgentTests(unittest.TestCase):
             if step["tool_calls"]
         ]
         self.assertEqual(statuses, ["succeeded"])
-        self.assertEqual(result["agent_status"], "degraded")
+        self.assertEqual(result["agent_status"], "completed")
         self.assertEqual(result["budget_usage"]["limits"]["max_agent_steps"], 5)
         self.assertEqual([item["path"] for item in result["citations"]], ["README.md"])
         self.assertNotIn("shell", [step["action"] for step in result["agent_trace"]])

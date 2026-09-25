@@ -604,17 +604,20 @@ class F13AgentOrchestrationTests(unittest.TestCase):
         self.assertNotIn(raw_unknown, serialized)
         self.assertLessEqual(len(serialized.encode("utf-8")), 4_096)
 
-        provider = type(
-            "UnknownToolProvider",
-            (),
-            {
-                "available": True,
-                "require_available": lambda self: None,
-                "chat": lambda self, _messages, **_kwargs: json.dumps(
-                    decision("continue", raw_unknown, {})
-                ),
-            },
-        )()
+        class UnknownToolProvider:
+            available = True
+
+            def require_available(self):
+                return None
+
+            def chat(self, _messages, **kwargs):
+                if kwargs.get("purpose") == "planner":
+                    return json.dumps(decision("continue", raw_unknown, {}))
+                return json.dumps(
+                    {"parts": [{"text": "Grounded", "evidence_aliases": ["A1"]}]}
+                )
+
+        provider = UnknownToolProvider()
         captured = []
         with (
             patch.object(main, "db", self.database),
@@ -624,26 +627,18 @@ class F13AgentOrchestrationTests(unittest.TestCase):
             patch.object(main, "_bundle_or_404", return_value=self.bundle),
             patch.object(main, "_log_ask_failure", side_effect=captured.append),
         ):
-            with self.assertRaises(HTTPException) as raised:
-                main.ask_project(
-                    self.project_id,
-                    main.AskRequest(question="authenticate_user"),
-                )
-        detail = raised.exception.detail
-        self.assertIs(captured[0], detail)
-        self.assertEqual(captured[0]["diagnostics"], detail["diagnostics"])
+            response = main.ask_project(
+                self.project_id,
+                main.AskRequest(question="authenticate_user"),
+            )
+        self.assertEqual(captured, [])
+        self.assertEqual(response["agent_status"], "completed")
+        self.assertEqual(response["budget_usage"]["tool_calls_used"], 0)
         self.assertEqual(
-            json.loads(format_ask_failure_log(detail))["diagnostics"],
-            detail["diagnostics"],
+            [item["stable_code"] for item in diagnostics["planner_attempts"]],
+            ["semantic_invalid_tool_contract", "valid"],
         )
-        self.assertEqual(detail["code"], "planner_repair_failed")
-        self.assertEqual(detail["diagnostics"]["tool_executions"], [])
-        self.assertEqual(detail["diagnostics"]["tool_calls_used"], 0)
-        self.assertEqual(
-            [item["stable_code"] for item in detail["diagnostics"]["planner_attempts"]],
-            ["semantic_invalid_tool_contract", "semantic_invalid_tool_contract"],
-        )
-        self.assertNotIn(raw_unknown, json.dumps(detail))
+        self.assertNotIn(raw_unknown, json.dumps(response))
 
 
 if __name__ == "__main__":

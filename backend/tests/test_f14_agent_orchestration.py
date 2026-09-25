@@ -564,21 +564,12 @@ class F14AgentOrchestrationTests(unittest.TestCase):
                 failing_provider,
                 {"question": "authenticate_user", "evidence_count": 1},
             )
-        self.assertEqual(status, 502)
-        self.assertEqual(self._chat_count(), 1)
+        self.assertEqual(status, 200)
+        self.assertEqual(self._chat_count(), 2)
+        self.assertEqual(failing_provider.final_calls, 1)
+        self.assertEqual(captured_failures, [])
         self.assertNotIn(raw_unknown, json.dumps(body))
-        self.assertNotIn(raw_unknown, format_ask_failure_log(captured_failures[0]))
-        detail = body["detail"]
-        self.assertEqual(detail["code"], "planner_repair_failed")
-        self.assertEqual(detail["diagnostics"]["tool_calls_used"], 0)
-        self.assertEqual(detail["diagnostics"]["tool_executions"], [])
-        attempts = detail["diagnostics"]["planner_attempts"]
-        self.assertEqual(len(attempts), 2)
-        self.assertTrue(attempts[1]["repair_attempt"])
-        self.assertTrue(all(
-            item["stable_code"] == "semantic_invalid_tool_contract"
-            for item in attempts
-        ))
+        self.assertEqual(body["budget_usage"]["tool_calls_used"], 0)
 
     def test_partial_citation_rejection_and_count_mismatch_fail_before_provider(self):
         original_validate = CitationValidator.validate_all

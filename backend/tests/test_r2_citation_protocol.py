@@ -553,6 +553,44 @@ class CitationProtocolTests(unittest.TestCase):
 
 
 class DiagnosticsBoundaryTests(unittest.TestCase):
+    def test_missing_repair_state_stays_unknown_and_bounded_failure_keeps_subcodes(self):
+        result = {
+            "request_id": "request-diagnostic-projection",
+            "agent_mode": "bounded",
+            "agent_status": "final_answer_failed",
+            "answer_mode": "deterministic",
+            "evidence": [{}] * 5,
+        }
+        snapshot = {
+            "request_id": result["request_id"],
+            "final_answer_attempted": True,
+            "final_answer_initial_failure": {"stable_code": "citation_alias_unknown"},
+            "final_answer_protocol_failure": {"stable_code": "citation_alias_unknown"},
+        }
+        detail = ask_diagnostics.build_ask_failure_detail(
+            result=result, recorder_snapshot=snapshot, retrieval_version="v1",
+            hierarchy_mode="off", relation_mode="off",
+            terminal_reason="citation_format_invalid",
+        )["diagnostics"]
+        self.assertIsNone(detail["final_answer_repair_attempted"])
+        self.assertEqual(detail["final_answer_initial_failure"]["stable_code"], "citation_alias_unknown")
+
+        snapshot.update({
+            "final_answer_repair_attempted": True,
+            "final_answer_repair_protocol_succeeded": False,
+            "final_answer_repair_succeeded": False,
+            "final_answer_repair_failure": {"stable_code": "model_supplied_location_forbidden"},
+            "planner_attempts": self._planner_attempts(),
+            "provider_attempt_durations_ms": [86_400_000] * 100,
+        })
+        detail = ask_diagnostics.build_ask_failure_detail(
+            result=result, recorder_snapshot=snapshot, retrieval_version="v1",
+            hierarchy_mode="off", relation_mode="off",
+            terminal_reason="citation_format_invalid",
+        )["diagnostics"]
+        self._assert_safe_bounded(detail, ask_diagnostics.MAX_ASK_DIAGNOSTICS_BYTES)
+        self.assertEqual(detail["final_answer_initial_failure"]["stable_code"], "citation_alias_unknown")
+        self.assertEqual(detail["final_answer_repair_failure"]["stable_code"], "model_supplied_location_forbidden")
     _FORBIDDEN = (
         "TEST_API_KEY_SENTINEL",
         "Authorization_SENTINEL",

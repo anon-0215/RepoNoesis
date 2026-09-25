@@ -26,6 +26,14 @@ from app.services.agent_contracts import (
     normalize_repository_relative_path,
     utc_now,
 )
+from app.services.agent_planner_phase import (
+    PlannerPhaseOperations,
+    run_planner_enhancement,
+)
+from app.services.agent_finalization_phase import (
+    FinalizationPhaseOperations,
+    run_finalization_phase,
+)
 from app.services.agent_tools import (
     EvidenceStore,
     ToolContext,
@@ -108,6 +116,11 @@ class AgentState:
     analysis_mode: str = "retrieval_only"
     relation_edge_statuses: dict[str, str] = field(default_factory=dict)
     failure_reason: str | None = None
+    # Enhancement termination is observable but is deliberately not a terminal
+    # failure when request-owned canonical Evidence already exists.  Keeping it
+    # separate prevents a Planner-only outcome from overwriting the Evidence
+    # and finalization contracts.
+    enhancement_termination_reason: str | None = None
     final_answer_attempted: bool = False
     relation_summary: dict[str, Any] = field(
         default_factory=lambda: {
@@ -232,6 +245,7 @@ class LLMPlanner:
                 },
                 "project_and_revision": "server-bound",
                 "final_validation_required": True,
+                "tool_descriptions": planner_schema.get("x-tool-descriptions", {}),
             },
             "user_goal": state["user_goal"],
             "untrusted_observation_summaries": state["observations"],
@@ -254,7 +268,7 @@ class LLMPlanner:
                 {
                     "role": "system",
                     "content": (
-                        "Task: bounded_repository_planner. Prompt version: m3-v2. "
+                        "Task: bounded_repository_planner. Prompt version: rn-lwb-03-v1. "
                         "Follow the planner_json_schema supplied in the user payload. "
                         "Return only one JSON object: no Markdown fence, preface, suffix, "
                         "or explanation. Every field, type, enum, bound, extra-field rule, "
@@ -272,7 +286,15 @@ class LLMPlanner:
                         "get_learning_context is read-only, may be called at most once, "
                         "and can adjust explanation depth or next-step guidance only. "
                         "Learning state is never repository Evidence and cannot relax "
-                        "relation or citation validation."
+                        "relation or citation validation. BASE retrieval has already run "
+                        "before this planner. Search, lookup_symbol, and read_source are "
+                        "server-side Candidate-to-canonical-Evidence operations; their "
+                        "result_count is newly added Evidence, while raw, normalized, valid, "
+                        "and rejected counters are distinct. Duplicate and rejected calls make "
+                        "zero progress; validate_evidence creates no Evidence. Your role is "
+                        "only bounded supplementation or disambiguation. An answer action "
+                        "stops enhancement and never supplies the user answer; the server "
+                        "always performs final-answer and validation stages."
                     ),
                 },
                 {
@@ -292,7 +314,7 @@ class LLMPlanner:
         return response, _estimate_tokens(response)
 
 
-def run_bounded_agent(
+def _run_bounded_agent_stages(
     question: str,
     bundle: dict[str, Any],
     llm: LLMClient | None,
@@ -317,8 +339,11 @@ def run_bounded_agent(
     request_deadline_at: float | None = None,
     request_budget: RequestBudget | None = None,
     allow_planner_failure_fallback: bool = True,
+    execution_mode: str = "agent",
 ) -> dict[str, Any]:
     validate_non_blank_question(question)
+    if execution_mode not in {"agent", "rag"}:
+        raise ValueError("unsupported execution mode")
     retrieval_version = validate_retrieval_version(retrieval_version)
     hierarchy_mode = validate_hierarchy_mode(
         hierarchy_mode,
@@ -414,6 +439,10 @@ def run_bounded_agent(
             diagnostics_recorder,
             status="failed",
         )
+        if execution_mode == "rag":
+            # The legacy fallback has a separate retrieval/evidence path. RAG
+            # must fail closed when the canonical ToolContext cannot be bound.
+            raise
         fallback_now = time.monotonic()
         if request_budget.request_expired(fallback_now) or request_budget.work_expired(
             fallback_now
@@ -535,7 +564,6 @@ def run_bounded_agent(
         started_monotonic=started,
         budget=request_budget,
     )
-    planner_deadline_recovery_authorized = False
     default_search_arguments = {
         "query": question,
         **server_constraints.as_dict(),
@@ -545,6 +573,8 @@ def run_bounded_agent(
     normalized_question = question.strip()
     seed_budget_ms = state.budget.work_remaining_ms(time.monotonic())
     if seed_budget_ms > 0:
+        if diagnostics_recorder is not None and hasattr(diagnostics_recorder, "begin_base"):
+            diagnostics_recorder.begin_base()
         seed_spec = _resolve_tool_spec(registry, "search_code")
         context.candidate_provenance = "deterministic_base_retrieval"
         try:
@@ -580,579 +610,93 @@ def run_bounded_agent(
             state.completion_status = "budget_exhausted"
             state.failure_reason = "deadline_exceeded"
 
-    if planner is None:
+    if execution_mode == "rag":
+        planner_phase = None
+    elif planner is None:
         if not llm or not llm.available:
             if diagnostics_recorder is not None:
                 diagnostics_recorder.record_fallback("llm_unavailable")
             return _run_deterministic_fallback(
+                state=state,
                 question=question,
                 llm=llm,
                 database=database,
-                context=context,
                 registry=registry,
-                limits=limits,
-                started=started,
-                existing_steps=[],
-                existing_tool_calls=state.tool_call_count,
-                planner_tokens=0,
                 path=server_constraints.path,
                 language=server_constraints.language,
                 symbol=server_constraints.symbol,
                 evidence_count=evidence_count,
-                diagnostics_recorder=diagnostics_recorder,
             )
         planner = LLMPlanner(llm, registry, limits, diagnostics_recorder)
 
-    for ordinal in range(1, limits.max_agent_steps + 1):
-        if state.failure_reason is not None or state.completion_status == "cancelled":
-            break
-        stop_status = _pre_step_stop_status(state)
-        if stop_status:
-            state.completion_status = stop_status
-            if stop_status == "budget_exhausted":
-                now = time.monotonic()
-                state.failure_reason = (
-                    "deadline_exceeded"
-                    if state.budget.request_expired(now)
-                    else "final_answer_not_attempted"
-                    if state.budget.work_expired(now)
-                    else "planner_budget_exhausted"
-                )
-            if diagnostics_recorder is not None and state.failure_reason is not None:
-                diagnostics_recorder.record_agent_failure(state.failure_reason)
-            break
-        planner_started = time.monotonic()
-        try:
-            decision, decision_error = _get_valid_decision(
-                planner, state, registry, diagnostics_recorder
-            )
-        except ProviderError as exc:
-            now = time.monotonic()
-            if _planner_deadline_is_recoverable(
-                exc=exc,
-                state=state,
-                llm=llm,
-                now=now,
-            ):
-                state.completion_status = "budget_exhausted"
-                state.failure_reason = "planner_budget_exhausted"
-                planner_deadline_recovery_authorized = True
-                state.warnings.append(
-                    "Planner reached its work cutoff after valid Evidence was collected."
-                )
-                if diagnostics_recorder is not None:
-                    diagnostics_recorder.record_agent_failure(
-                        "planner_budget_exhausted"
-                    )
-                break
-            if diagnostics_recorder is not None:
-                diagnostics_recorder.record_evidence_count(
-                    len(evidence_store.all(request_id))
-                )
-                diagnostics_recorder.record_agent_progress(
-                    steps_used=len(state.steps),
-                    tool_calls_used=state.tool_call_count,
-                    elapsed_ms=int((time.monotonic() - started) * 1000),
-                )
-                diagnostics_recorder.record_agent_result(
-                    {"agent_mode": "bounded", "agent_status": "failed"}
-                )
-            raise
-        finally:
-            if diagnostics_recorder is not None:
-                diagnostics_recorder.record_stage_duration(
-                    "planner", int((time.monotonic() - planner_started) * 1000)
-                )
-        if decision is None:
-            if "budget exhausted" in decision_error:
-                state.completion_status = "budget_exhausted"
-                state.failure_reason = "planner_budget_exhausted"
-                state.warnings.append(decision_error)
-                if diagnostics_recorder is not None:
-                    diagnostics_recorder.record_agent_failure(
-                        "planner_budget_exhausted"
-                    )
-                break
-            if not allow_planner_failure_fallback:
-                if diagnostics_recorder is not None:
-                    diagnostics_recorder.record_agent_failure(
-                        "planner_repair_failed"
-                    )
-                return _planner_failure_response(
-                    state=state,
-                    started=started,
-                    diagnostics_recorder=diagnostics_recorder,
-                )
-            if diagnostics_recorder is not None:
-                diagnostics_recorder.record_fallback("planner_validation_failed")
-            return _run_deterministic_fallback(
-                question=question,
-                llm=llm,
-                database=database,
-                context=context,
-                registry=registry,
-                limits=limits,
-                started=started,
-                existing_steps=state.steps,
-                existing_tool_calls=state.tool_call_count,
-                planner_tokens=state.planner_token_usage,
-                path=server_constraints.path,
-                language=server_constraints.language,
-                symbol=server_constraints.symbol,
-                evidence_count=evidence_count,
-                warning=(
-                    "Planner decision failed validation; used deterministic "
-                    f"fallback: {decision_error}."
-                ),
-                diagnostics_recorder=diagnostics_recorder,
-            )
-
-        if state.context.cancellation.cancelled:
-            state.completion_status = "cancelled"
-            break
-        now = time.monotonic()
-        if state.budget.request_expired(now) or state.budget.work_expired(now):
-            state.completion_status = "budget_exhausted"
-            state.failure_reason = (
-                "deadline_exceeded"
-                if state.budget.request_expired(now)
-                else "planner_budget_exhausted"
-            )
-            if diagnostics_recorder is not None:
-                diagnostics_recorder.record_agent_failure(state.failure_reason)
-            state.warnings.append(
-                "The request or work cutoff was reached after planning; no tool was started."
-            )
-            break
-
-        step_id = f"S{ordinal}"
-        if decision.status != "continue":
-            state.completion_status = (
-                "completed"
-                if decision.status == "answer"
-                else "insufficient_evidence"
-            )
-            state.steps.append(
-                AgentStep(
-                    step_id=step_id,
-                    user_goal=question,
-                    action=decision.status,
-                    tool_calls=[],
-                    observations=[],
-                    decision_summary=decision.decision_summary,
-                    completion_status=state.completion_status,
-                    remaining_budget=state.remaining_budget(),
-                )
-            )
-            break
-
-        if state.remaining_budget()["tool_calls"] <= 0:
-            state.completion_status = "tool_budget_exhausted"
-            state.warnings.append(
-                "Agent tool budget was exhausted; continuing to bounded finalization."
-            )
-            if diagnostics_recorder is not None:
-                diagnostics_recorder.record_tool_budget_exhausted()
-            break
-
-        action = decision.action or ""
-        arguments = dict(decision.arguments)
-        if action == "search_code":
-            if not isinstance(arguments.get("query"), str) or not arguments["query"].strip():
-                arguments["query"] = question
-        tool_spec = _resolve_tool_spec(registry, action)
-        public_action = action if tool_spec is not None else "unknown_tool"
-        arguments = _merge_server_bound_constraints(
-            tool_spec, arguments, server_constraints
-        )
-        arguments = _apply_request_top_k_limit(
-            tool_spec,
-            arguments,
-            evidence_count=evidence_count,
-        )
-        tool_budget_ms = state.budget.work_remaining_ms(time.monotonic())
-        if tool_budget_ms <= 0:
-            state.completion_status = "budget_exhausted"
-            state.warnings.append(
-                "The next tool was not started because the final-answer reserve would be consumed."
-            )
-            if diagnostics_recorder is not None:
-                diagnostics_recorder.record_agent_failure("final_answer_not_attempted")
-            state.failure_reason = "final_answer_not_attempted"
-            break
-        call, observation = _execute_agent_tool(
-            state=state,
-            registry=registry,
-            action=public_action,
-            tool_spec=tool_spec,
-            arguments=arguments,
-            step_id=step_id,
-            phase="planner",
-            diagnostics_recorder=diagnostics_recorder,
-        )
-        step_status = "running"
-        state.steps.append(
-            AgentStep(
-                step_id=step_id,
-                user_goal=question,
-                action=call.tool_name,
-                tool_calls=[call],
-                observations=[observation],
-                decision_summary=(
-                    "Planner requested an unregistered tool; the call was rejected."
-                    if call.tool_name == "unknown_tool"
-                    else decision.decision_summary
-                ),
-                completion_status=step_status,
-                remaining_budget=state.remaining_budget(),
-            )
-        )
-        now = time.monotonic()
-        observation_code = (observation.error or {}).get("code")
-        if state.budget.request_expired(now) or observation_code == "deadline_exceeded":
-            state.completion_status = "budget_exhausted"
-            state.failure_reason = "deadline_exceeded"
-            if diagnostics_recorder is not None:
-                diagnostics_recorder.record_agent_failure("deadline_exceeded")
-            break
-        if observation_code in {"tool_timeout", "final_answer_not_attempted"}:
-            state.completion_status = "failed"
-            state.failure_reason = observation_code
-            if diagnostics_recorder is not None:
-                diagnostics_recorder.record_agent_failure(observation_code)
-            break
-        if observation.status == "cancelled":
-            state.completion_status = "cancelled"
-            break
-        if state.remaining_budget()["tool_calls"] <= 0:
-            state.completion_status = "tool_budget_exhausted"
-            state.warnings.append(
-                "Agent tool budget was exhausted; continuing to bounded finalization."
-            )
-            if diagnostics_recorder is not None:
-                diagnostics_recorder.record_tool_budget_exhausted()
-            break
-        if state.no_progress_count >= limits.max_no_progress_steps:
-            state.completion_status = (
-                "completed" if evidence_store.all(request_id) else "insufficient_evidence"
-            )
-            state.warnings.append("Agent stopped after consecutive no-progress steps.")
-            break
-    else:
-        state.completion_status = "budget_exhausted"
-
-    if state.completion_status == "running":
-        state.completion_status = "budget_exhausted"
-        state.failure_reason = "planner_budget_exhausted"
-    evidence = evidence_store.all(request_id)
-    _assert_evidence_capacity(state.context, evidence)
-    if diagnostics_recorder is not None:
-        diagnostics_recorder.record_evidence_count(len(evidence))
-    if (
-        evidence
-        and planner_deadline_recovery_authorized
-        and state.failure_reason == "planner_budget_exhausted"
-        and not state.budget.request_expired(time.monotonic())
-        and not cancellation.cancelled
-        and not state.final_answer_attempted
-        and limits.max_final_answer_tokens > 0
-    ):
-        recovered_reason = state.failure_reason
-        state.failure_reason = None
-        state.completion_status = "budget_exhausted"
-        state.warnings.append(
-            "Planner work ended after valid Evidence was collected; continued to bounded finalization."
-        )
-        if diagnostics_recorder is not None and recovered_reason is not None:
-            diagnostics_recorder.clear_agent_failure(recovered_reason)
-    if evidence and state.completion_status == "insufficient_evidence":
-        state.completion_status = "completed"
-        state.warnings.append(
-            "Planner stopped while valid Evidence was available; continued to bounded finalization."
-        )
-    if state.failure_reason is not None:
-        return _empty_budget_failure(
-            request_id=request_id,
-            mode="bounded",
-            started=started,
-            limits=limits,
-            steps=state.steps,
-            tool_calls=state.tool_call_count,
-            planner_tokens=state.planner_token_usage,
-            retrieval_mode=state.retrieval_mode,
-            learning_context=state.context.learning_context,
-            diagnostics_recorder=diagnostics_recorder,
-            deadline_at=state.context.deadline_monotonic,
-            evidence_count=len(evidence),
-            reason=state.failure_reason,
-        )
-    if time.monotonic() >= state.context.deadline_monotonic:
-        return _empty_budget_failure(
-            request_id=request_id,
-            mode="bounded",
-            started=started,
-            limits=limits,
-            steps=state.steps,
-            tool_calls=state.tool_call_count,
-            planner_tokens=state.planner_token_usage,
-            retrieval_mode=state.retrieval_mode,
-            learning_context=state.context.learning_context,
-            diagnostics_recorder=diagnostics_recorder,
-            deadline_at=state.context.deadline_monotonic,
-            evidence_count=len(evidence),
-            reason="deadline_exceeded",
-        )
-    if state.budget.work_expired(time.monotonic()) and not evidence:
-        return _empty_budget_failure(
-            request_id=request_id,
-            mode="bounded",
-            started=started,
-            limits=limits,
-            steps=state.steps,
-            tool_calls=state.tool_call_count,
-            planner_tokens=state.planner_token_usage,
-            retrieval_mode=state.retrieval_mode,
-            learning_context=state.context.learning_context,
-            diagnostics_recorder=diagnostics_recorder,
-            deadline_at=state.context.deadline_monotonic,
-            evidence_count=len(evidence),
-            reason="final_answer_not_attempted",
-        )
-    finalization_started = time.monotonic()
-    evidence, valid_chains, relation_warnings, citation_failure = _validated_relation_context(
-        state, evidence, diagnostics_recorder
-    )
-    state.warnings.extend(relation_warnings)
-    if citation_failure is not None:
-        return _finalization_rejection_response(
-            state=state,
-            evidence=evidence,
-            chains=valid_chains,
-            reason=citation_failure,
-            mode="bounded",
-            started=started,
-            tool_calls=state.tool_call_count,
-            planner_tokens=state.planner_token_usage,
-            planner_usage_mode=state.planner_usage_mode,
-            diagnostics_recorder=diagnostics_recorder,
-            finalization_started=finalization_started,
-        )
-    evidence, evidence_truncated = _bounded_evidence_context(
-        evidence,
-        limits.max_accumulated_evidence_context_bytes,
-    )
-    if evidence_truncated:
-        state.warnings.append(
-            "Accumulated Evidence context was truncated at the server byte limit."
-        )
-    if cancellation.cancelled:
-        state.completion_status = "cancelled"
-    final_llm = (
-        llm
-        if llm
-        and llm.available
-        and state.completion_status not in {"insufficient_evidence", "cancelled"}
-        and state.budget.request_remaining_ms(time.monotonic()) > 0
-        else None
-    )
-    if (
-        diagnostics_recorder is not None
-        and evidence
-        and llm
-        and llm.available
-        and state.completion_status not in {"insufficient_evidence", "cancelled"}
-        and state.budget.request_remaining_ms(time.monotonic()) <= 0
-    ):
-        diagnostics_recorder.record_final_answer_failure("deadline_exhausted")
-    try:
-        state.final_answer_attempted = True
-        final = answer_from_evidence(
-            question,
-            evidence,
-            final_llm,
-            database,
-            retrieval_mode=state.retrieval_mode,
-            warnings=state.warnings,
-            max_answer_tokens=limits.max_final_answer_tokens,
-            answer_timeout_seconds=max(
-                0.1,
-                state.budget.request_remaining_ms(time.monotonic()) / 1000,
-            ),
-            relation_context=_relation_answer_context(state, valid_chains),
-            learning_context=state.context.learning_context,
-            diagnostics_recorder=diagnostics_recorder,
-            request_deadline_at=state.context.deadline_monotonic,
-        )
-    except ProviderError as exc:
-        if exc.code == "deadline_exceeded":
-            if diagnostics_recorder is not None:
-                diagnostics_recorder.record_final_answer_failure("deadline_exhausted")
-                diagnostics_recorder.record_stage_duration(
-                    "finalization",
-                    int((time.monotonic() - finalization_started) * 1000),
-                )
-            return _empty_budget_failure(
-                request_id=request_id,
-                mode="bounded",
-                started=started,
-                limits=limits,
-                steps=state.steps,
-                tool_calls=state.tool_call_count,
-                planner_tokens=state.planner_token_usage,
-                retrieval_mode=state.retrieval_mode,
-                learning_context=state.context.learning_context,
-                diagnostics_recorder=diagnostics_recorder,
-                deadline_at=state.context.deadline_monotonic,
-                evidence_count=len(evidence),
-                reason="deadline_exceeded",
-            )
-        if diagnostics_recorder is not None:
-            if isinstance((exc.diagnostics or {}).get("http_status"), int):
-                diagnostics_recorder.record_final_answer_response()
-            diagnostics_recorder.record_final_answer_failure(
-                "response_empty"
-                if exc.code == "provider_empty_content"
-                else "provider_failed"
-            )
-            diagnostics_recorder.record_agent_result(
-                {
-                    "agent_mode": "bounded",
-                    "agent_status": "final_answer_failed",
-                    "evidence": evidence,
-                }
-            )
-            diagnostics_recorder.record_agent_progress(
-                steps_used=len(state.steps),
-                tool_calls_used=state.tool_call_count,
-                elapsed_ms=int((time.monotonic() - started) * 1000),
-            )
-        raise
-    if time.monotonic() >= state.context.deadline_monotonic:
-        if diagnostics_recorder is not None:
-            diagnostics_recorder.record_stage_duration(
-                "finalization", int((time.monotonic() - finalization_started) * 1000)
-            )
-        return _empty_budget_failure(
-            request_id=request_id,
-            mode="bounded",
-            started=started,
-            limits=limits,
-            steps=state.steps,
-            tool_calls=state.tool_call_count,
-            planner_tokens=state.planner_token_usage,
-            retrieval_mode=state.retrieval_mode,
-            learning_context=state.context.learning_context,
-            diagnostics_recorder=diagnostics_recorder,
-            deadline_at=state.context.deadline_monotonic,
-            evidence_count=len(evidence),
-            reason="deadline_exceeded",
-        )
-    post_evidence, post_chains, post_relation_warnings, post_citation_failure = _validated_relation_context(
-        state, evidence_store.all(request_id), diagnostics_recorder
-    )
-    state.warnings.extend(post_relation_warnings)
-    if post_citation_failure is not None:
-        return _finalization_rejection_response(
-            state=state,
-            evidence=post_evidence,
-            chains=post_chains,
-            reason=post_citation_failure,
-            mode="bounded",
-            started=started,
-            tool_calls=state.tool_call_count,
-            planner_tokens=state.planner_token_usage,
-            planner_usage_mode=state.planner_usage_mode,
-            diagnostics_recorder=diagnostics_recorder,
-            finalization_started=finalization_started,
-        )
-    if {item.chain_id for item in post_chains} != {
-        item.chain_id for item in valid_chains
-    }:
-        state.warnings.append(
-            "Relation data changed during answer generation; relation-dependent "
-            "generated text was discarded."
-        )
-        if diagnostics_recorder is not None:
-            diagnostics_recorder.record_grounded_answer_accepted(False)
-            diagnostics_recorder.record_final_answer_failure(
-                "relation_validation_failed"
-            )
-        return _finalization_rejection_response(
-            state=state,
-            evidence=post_evidence,
-            chains=post_chains,
-            reason="relation_validation_failed",
-            mode="bounded",
-            started=started,
-            tool_calls=state.tool_call_count,
-            planner_tokens=state.planner_token_usage,
-            planner_usage_mode=state.planner_usage_mode,
-            diagnostics_recorder=diagnostics_recorder,
-            finalization_started=finalization_started,
-        )
-    else:
-        valid_chains = post_chains
-    if state.completion_status == "cancelled":
-        pass
-    elif state.completion_status == "insufficient_evidence":
-        final["answer"] = INSUFFICIENT_ANSWER
-        final["citations"] = []
-        final["evidence"] = []
-        final["grounding_status"] = "insufficient_evidence"
-    elif (
-        not final["evidence"]
-        and not (
-            state.completion_status == "budget_exhausted"
-            and state.remaining_budget()["time_ms"] <= 0
-        )
-    ):
-        state.completion_status = "insufficient_evidence"
-    elif final.get("answer_mode") == "llm_grounded":
-        state.completion_status = "completed"
-    elif final_llm is not None:
-        state.completion_status = "final_answer_failed"
-    response = _attach_agent_fields(
-        final,
-        request_id=request_id,
-        mode="bounded",
-        status=state.completion_status,
-        steps=state.steps,
+    if execution_mode == "agent":
+        planner_phase = run_planner_enhancement(
+        planner=planner,
+        state=state,
+        registry=registry,
+        llm=llm,
+        question=question,
+        server_constraints=server_constraints,
+        evidence_count=evidence_count,
+        allow_planner_failure_fallback=allow_planner_failure_fallback,
+        diagnostics_recorder=diagnostics_recorder,
         started=started,
-        tool_calls=state.tool_call_count,
-        planner_tokens=state.planner_token_usage,
-        planner_usage_mode=state.planner_usage_mode,
-        limits=limits,
+        operations=PlannerPhaseOperations(
+            get_valid_decision=_get_valid_decision,
+            pre_step_stop_status=_pre_step_stop_status,
+            planner_deadline_is_recoverable=_planner_deadline_is_recoverable,
+            resolve_tool_spec=_resolve_tool_spec,
+            merge_server_bound_constraints=_merge_server_bound_constraints,
+            apply_request_top_k_limit=_apply_request_top_k_limit,
+            execute_agent_tool=_execute_agent_tool,
+        ),
+        )
+    if planner_phase is not None and planner_phase.status == "planner_failure_response_required":
+        return _planner_failure_response(
+            state=state,
+            started=started,
+            diagnostics_recorder=diagnostics_recorder,
+        )
+    if planner_phase is not None and planner_phase.status == "fallback_required":
+        return _run_deterministic_fallback(
+            state=state,
+            question=question,
+            llm=llm,
+            database=database,
+            registry=registry,
+            path=server_constraints.path,
+            language=server_constraints.language,
+            symbol=server_constraints.symbol,
+            evidence_count=evidence_count,
+            warning=(
+                "Planner decision failed validation; used deterministic fallback: "
+                f"{planner_phase.decision_error}."
+            ),
+        )
+    planner_deadline_recovery_authorized = planner_phase.deadline_recovery_authorized if planner_phase else False
+
+    finalization_phase = run_finalization_phase(
+        state=state,
+        question=question,
+        llm=llm,
+        database=database,
+        started=started,
+        planner_deadline_recovery_authorized=planner_deadline_recovery_authorized,
+        diagnostics_recorder=diagnostics_recorder,
+        operations=FinalizationPhaseOperations(
+            budget_failure=_empty_budget_failure,
+            assert_evidence_capacity=_assert_evidence_capacity,
+            validated_relation_context=_validated_relation_context,
+            bounded_evidence_context=_bounded_evidence_context,
+            relation_answer_context=_relation_answer_context,
+            finalization_rejection_response=_finalization_rejection_response,
+            answer_from_evidence=answer_from_evidence,
+            attach_agent_fields=_attach_agent_fields,
+            attach_relation_fields=_attach_relation_fields,
+            attach_learning_fields=_attach_learning_fields,
+        ),
     )
-    response = _attach_relation_fields(response, state, valid_chains)
-    response = _attach_learning_fields(response, state.context.learning_context)
-    _assert_evidence_capacity(state.context, response["evidence"])
-    if diagnostics_recorder is not None:
-        # Repair success describes a fully validated repaired answer.  The
-        # route's response-contract, deadline, and persistence gates remain
-        # separate request-level outcomes and must not rewrite this result.
-        diagnostics_recorder.record_final_answer_repair_result(
-            succeeded=(
-                state.completion_status == "completed"
-                and final.get("answer_mode") == "llm_grounded"
-            )
-        )
-        diagnostics_recorder.record_stage_duration(
-            "finalization", int((time.monotonic() - finalization_started) * 1000)
-        )
-        diagnostics_recorder.record_agent_elapsed(
-            int((time.monotonic() - started) * 1000)
-        )
-        diagnostics_recorder.record_deadline_state(
-            remaining_ms=max(
-                0,
-                int((state.context.deadline_monotonic - time.monotonic()) * 1000),
-            ),
-            overrun_ms=max(
-                0,
-                int((time.monotonic() - state.context.deadline_monotonic) * 1000),
-            ),
-        )
-        diagnostics_recorder.record_agent_result(response)
+    response = finalization_phase.response
     logger.info(
         "agent_run_completed",
         extra={
@@ -1167,6 +711,16 @@ def run_bounded_agent(
         },
     )
     return response
+
+def run_bounded_agent(*args: Any, **kwargs: Any) -> dict[str, Any]:
+    """Public five-stage coordinator for one request-owned agent run.
+
+    The staged implementation owns context binding, mandatory BASE retrieval,
+    optional enhancement, Evidence finalization, and terminal projection while
+    this boundary intentionally remains the stable production entry point.
+    """
+
+    return _run_bounded_agent_stages(*args, **kwargs)
 
 
 def _get_valid_decision(
@@ -1269,6 +823,9 @@ def build_planner_json_schema(registry: ToolRegistry) -> dict[str, Any]:
         item["name"]: item["input_schema"] for item in tools
     }
     schema["x-tool-versions"] = {item["name"]: item["version"] for item in tools}
+    schema["x-tool-descriptions"] = {
+        item["name"]: item["description"] for item in tools
+    }
     schema["x-semantic-constraints"] = {
         "continue": (
             "action must name one x-tool-input-schemas entry and arguments must "
@@ -1598,6 +1155,16 @@ def _planner_state(state: AgentState) -> dict[str, Any]:
                 )
     remaining_budget = state.remaining_budget()
     remaining_budget["time_ms"] = remaining_budget["work_time_ms"]
+    evidence_locators = [
+        {
+            "evidence_id": item.evidence_id,
+            "path": item.path,
+            "qualified_name": item.qualified_name,
+            "start_line": item.start_line,
+            "end_line": item.end_line,
+        }
+        for item in state.context.evidence_store.all(state.request_id)[:8]
+    ]
     return {
         "user_goal": state.user_goal,
         "remaining_budget": remaining_budget,
@@ -1606,6 +1173,9 @@ def _planner_state(state: AgentState) -> dict[str, Any]:
         "known_evidence_ids": [
             item.evidence_id for item in state.context.evidence_store.all(state.request_id)
         ],
+        "base_retrieval_completed": True,
+        "evidence_count": len(evidence_locators),
+        "evidence_locators": evidence_locators,
         "known_symbols": list(dict.fromkeys(value for value in symbols if value))[:20],
         "known_symbol_ids": list(
             dict.fromkeys(value for value in symbol_ids if value)
@@ -2432,9 +2002,13 @@ def _validated_relation_context(
     state: AgentState,
     evidence: list[Any],
     diagnostics_recorder: SmokeDiagnosticsRecorder | None = None,
+    *,
+    checkpoint: str = "initial_evidence",
 ) -> tuple[list[Any], list[EvidenceChain], list[str], str | None]:
     _ensure_finalization_active(state.context.deadline_monotonic)
     if diagnostics_recorder is not None:
+        if hasattr(diagnostics_recorder, "set_validation_checkpoint"):
+            diagnostics_recorder.set_validation_checkpoint(checkpoint)
         diagnostics_recorder.enter_stage("citation_validation")
     valid_evidence, evidence_warnings = CitationValidator(
         state.context.database
@@ -2453,6 +2027,8 @@ def _validated_relation_context(
     if diagnostics_recorder is not None:
         diagnostics_recorder.enter_stage("relation_validation")
     candidate_chains = state.context.chain_store.all(state.request_id)
+    if diagnostics_recorder is not None and hasattr(diagnostics_recorder, "set_relation_applicable"):
+        diagnostics_recorder.set_relation_applicable(bool(candidate_chains))
     _ensure_finalization_active(state.context.deadline_monotonic)
     chains, relation_warnings = RelationValidator(
         state.context.database
@@ -2703,35 +2279,36 @@ def _finalization_rejection_response(
 
 def _run_deterministic_fallback(
     *,
+    state: AgentState,
     question: str,
     llm: LLMClient | None,
     database: Database,
-    context: ToolContext,
     registry: ToolRegistry,
-    limits: AgentLimits,
-    started: float,
-    existing_steps: list[AgentStep],
-    existing_tool_calls: int,
-    planner_tokens: int,
     path: str | None,
     language: str | None,
     symbol: str | None,
     evidence_count: int,
     warning: str | None = None,
-    diagnostics_recorder: SmokeDiagnosticsRecorder | None = None,
 ) -> dict[str, Any]:
-    steps = list(existing_steps)
-    tool_calls = existing_tool_calls
-    warnings = [warning] if warning else []
-    retrieval_mode = "lexical"
+    """Run only fallback retrieval; phase-owned code finalizes the response.
+
+    The fallback deliberately reuses the one request-owned ``AgentState``.  It
+    can perform its established deterministic search, but Evidence validation,
+    answer generation and all post-generation checks are owned exclusively by
+    ``agent_finalization_phase``.
+    """
+
+    context = state.context
+    if warning:
+        state.warnings.append(warning)
     if (
-        tool_calls < limits.max_tool_calls
-        and len(steps) < limits.max_agent_steps
+        state.tool_call_count < state.limits.max_tool_calls
+        and len(state.steps) < state.limits.max_agent_steps
         and not context.cancellation.cancelled
         and time.monotonic() < context.work_deadline_monotonic
         and not context.evidence_store.all(context.request_id)
     ):
-        step_id = f"S{len(steps) + 1}"
+        step_id = f"S{len(state.steps) + 1}"
         arguments = {
             key: value
             for key, value in {
@@ -2739,28 +2316,32 @@ def _run_deterministic_fallback(
                 "path": path,
                 "language": language,
                 "symbol": symbol,
-                "top_k": _request_top_k(evidence_count, limits.max_search_results),
+                "top_k": _request_top_k(
+                    evidence_count, state.limits.max_search_results
+                ),
             }.items()
             if value is not None
         }
         call = ToolCall(
-            call_id=f"C{tool_calls + 1}",
+            call_id=f"C{state.tool_call_count + 1}",
             step_id=step_id,
             tool_name="search_code",
             tool_version=registry.get("search_code").version,
             parameters=arguments,
-            timeout_ms=limits.default_tool_timeout_ms,
+            timeout_ms=state.limits.default_tool_timeout_ms,
             budget={
-                "max_results": limits.max_search_results,
-                "max_bytes": limits.max_observation_bytes,
+                "max_results": state.limits.max_search_results,
+                "max_bytes": state.limits.max_observation_bytes,
             },
         )
-        if diagnostics_recorder is not None:
-            diagnostics_recorder.record_tool_attempt("search_code")
+        if context.diagnostics_recorder is not None:
+            context.diagnostics_recorder.record_tool_attempt("search_code")
         observation = registry.execute(context, call)
-        if diagnostics_recorder is not None:
-            diagnostics_recorder.record_tool_result("search_code", observation.status)
-        tool_calls += 1
+        if context.diagnostics_recorder is not None:
+            context.diagnostics_recorder.record_tool_result(
+                "search_code", observation.status
+            )
+        state.tool_call_count += 1
         logger.info(
             "agent_tool_call",
             extra={
@@ -2773,16 +2354,18 @@ def _run_deterministic_fallback(
                 "duration_ms": observation.metrics.get("duration_ms", 0),
                 "result_count": observation.metrics.get("result_count", 0),
                 "truncated": observation.truncated,
-                "tool_calls_used": tool_calls,
+                "tool_calls_used": state.tool_call_count,
                 "degraded": True,
             },
         )
         if isinstance(observation.structured_results, dict):
-            retrieval_mode = str(
-                observation.structured_results.get("retrieval_mode", retrieval_mode)
+            state.retrieval_mode = str(
+                observation.structured_results.get(
+                    "retrieval_mode", state.retrieval_mode
+                )
             )
-        warnings.extend(observation.warnings)
-        steps.append(
+        state.warnings.extend(observation.warnings)
+        state.steps.append(
             AgentStep(
                 step_id=step_id,
                 user_goal=question,
@@ -2792,10 +2375,14 @@ def _run_deterministic_fallback(
                 decision_summary="执行固定的单次证据检索降级链路。",
                 completion_status="degraded",
                 remaining_budget={
-                    "steps": max(0, limits.max_agent_steps - len(steps) - 1),
-                    "tool_calls": max(0, limits.max_tool_calls - tool_calls),
+                    "steps": max(0, state.limits.max_agent_steps - len(state.steps) - 1),
+                    "tool_calls": max(
+                        0, state.limits.max_tool_calls - state.tool_call_count
+                    ),
                     "planner_tokens": max(
-                        0, limits.max_total_planner_output_tokens - planner_tokens
+                        0,
+                        state.limits.max_total_planner_output_tokens
+                        - state.planner_token_usage,
                     ),
                     "time_ms": max(
                         0,
@@ -2815,245 +2402,50 @@ def _run_deterministic_fallback(
             return _empty_budget_failure(
                 request_id=context.request_id,
                 mode="deterministic_fallback",
-                started=started,
-                limits=limits,
-                steps=steps,
-                tool_calls=tool_calls,
-                planner_tokens=planner_tokens,
-                retrieval_mode=retrieval_mode,
+                started=state.started_monotonic,
+                limits=state.limits,
+                steps=state.steps,
+                tool_calls=state.tool_call_count,
+                planner_tokens=state.planner_token_usage,
+                retrieval_mode=state.retrieval_mode,
                 learning_context=context.learning_context,
-                diagnostics_recorder=diagnostics_recorder,
+                diagnostics_recorder=context.diagnostics_recorder,
                 deadline_at=context.deadline_monotonic,
                 evidence_count=len(context.evidence_store.all(context.request_id)),
                 reason=observation_code,
             )
-    raw_evidence = context.evidence_store.all(context.request_id)
-    _assert_evidence_capacity(context, raw_evidence)
-    if diagnostics_recorder is not None:
-        diagnostics_recorder.record_evidence_count(len(raw_evidence))
-    if time.monotonic() >= context.deadline_monotonic:
-        return _empty_budget_failure(
-            request_id=context.request_id,
-            mode="deterministic_fallback",
-            started=started,
-            limits=limits,
-            steps=steps,
-            tool_calls=tool_calls,
-            planner_tokens=planner_tokens,
-            retrieval_mode=retrieval_mode,
-            learning_context=context.learning_context,
-            diagnostics_recorder=diagnostics_recorder,
-            deadline_at=context.deadline_monotonic,
-            evidence_count=len(raw_evidence),
-            reason="deadline_exceeded",
-        )
-    if time.monotonic() >= context.work_deadline_monotonic:
-        return _empty_budget_failure(
-            request_id=context.request_id,
-            mode="deterministic_fallback",
-            started=started,
-            limits=limits,
-            steps=steps,
-            tool_calls=tool_calls,
-            planner_tokens=planner_tokens,
-            retrieval_mode=retrieval_mode,
-            learning_context=context.learning_context,
-            diagnostics_recorder=diagnostics_recorder,
-            deadline_at=context.deadline_monotonic,
-            evidence_count=len(raw_evidence),
-            reason="final_answer_not_attempted",
-        )
-    finalization_started = time.monotonic()
-    evidence, truncated = _bounded_evidence_context(
-        raw_evidence,
-        limits.max_accumulated_evidence_context_bytes,
-    )
-    if truncated:
-        warnings.append(
-            "Accumulated Evidence context was truncated at the server byte limit."
-        )
-    relation_state: AgentState | None = None
-    valid_chains: list[EvidenceChain] = []
-    if context.relation_mode == RELATION_MODE_EXPAND_V1:
-        relation_state = AgentState(
-            request_id=context.request_id,
-            user_goal=question,
-            context=context,
-            limits=limits,
-            started_monotonic=started,
-            budget=RequestBudget.from_deadline(
-                started_at=started,
-                deadline_at=context.deadline_monotonic,
-                final_answer_reserve_ms=max(
-                    0,
-                    round(
-                        (context.deadline_monotonic - context.work_deadline_monotonic)
-                        * 1000
-                    ),
-                ),
-            ),
-            steps=steps,
-            tool_call_count=tool_calls,
-            planner_token_usage=planner_tokens,
-        )
-        evidence, valid_chains, relation_warnings, citation_failure = _validated_relation_context(
-            relation_state, evidence, diagnostics_recorder
-        )
-        warnings.extend(relation_warnings)
-        if citation_failure is not None:
-            relation_state.warnings.extend(warnings)
-            return _finalization_rejection_response(
-                state=relation_state,
-                evidence=evidence,
-                chains=valid_chains,
-                reason=citation_failure,
-                mode="deterministic_fallback",
-                started=started,
-                tool_calls=tool_calls,
-                planner_tokens=planner_tokens,
-                planner_usage_mode="estimated",
-                diagnostics_recorder=diagnostics_recorder,
-                finalization_started=finalization_started,
-            )
-    final_llm = (
-        llm
-        if llm
-        and llm.available
-        and time.monotonic() < context.deadline_monotonic
-        and not context.cancellation.cancelled
-        else None
-    )
-    result = answer_from_evidence(
-        question,
-        evidence,
-        final_llm,
-        database,
-        retrieval_mode=retrieval_mode,
-        warnings=warnings,
-        max_answer_tokens=limits.max_final_answer_tokens,
-        answer_timeout_seconds=max(
-            0.1,
-            context.deadline_monotonic - time.monotonic(),
+    finalization_phase = run_finalization_phase(
+        state=state,
+        question=question,
+        llm=llm,
+        database=database,
+        started=state.started_monotonic,
+        planner_deadline_recovery_authorized=False,
+        diagnostics_recorder=context.diagnostics_recorder,
+        operations=FinalizationPhaseOperations(
+            budget_failure=_empty_budget_failure,
+            assert_evidence_capacity=_assert_evidence_capacity,
+            validated_relation_context=_validated_relation_context,
+            bounded_evidence_context=_bounded_evidence_context,
+            relation_answer_context=_relation_answer_context,
+            finalization_rejection_response=_finalization_rejection_response,
+            answer_from_evidence=answer_from_evidence,
+            attach_agent_fields=_attach_agent_fields,
+            attach_relation_fields=_attach_relation_fields,
+            attach_learning_fields=_attach_learning_fields,
         ),
-        learning_context=context.learning_context,
-        relation_context=(
-            _relation_answer_context(relation_state, valid_chains)
-            if relation_state is not None
-            else None
-        ),
-        diagnostics_recorder=diagnostics_recorder,
-        request_deadline_at=context.deadline_monotonic,
-    )
-    if time.monotonic() >= context.deadline_monotonic:
-        if diagnostics_recorder is not None:
-            diagnostics_recorder.record_stage_duration(
-                "finalization", int((time.monotonic() - finalization_started) * 1000)
-            )
-        return _empty_budget_failure(
-            request_id=context.request_id,
-            mode="deterministic_fallback",
-            started=started,
-            limits=limits,
-            steps=steps,
-            tool_calls=tool_calls,
-            planner_tokens=planner_tokens,
-            retrieval_mode=retrieval_mode,
-            learning_context=context.learning_context,
-            diagnostics_recorder=diagnostics_recorder,
-            deadline_at=context.deadline_monotonic,
-            evidence_count=len(raw_evidence),
-            reason="deadline_exceeded",
-        )
-    if relation_state is not None:
-        post_evidence, post_chains, relation_warnings, post_citation_failure = _validated_relation_context(
-            relation_state,
-            context.evidence_store.all(context.request_id),
-            diagnostics_recorder,
-        )
-        warnings.extend(relation_warnings)
-        if post_citation_failure is not None:
-            relation_state.warnings.extend(warnings)
-            return _finalization_rejection_response(
-                state=relation_state,
-                evidence=post_evidence,
-                chains=post_chains,
-                reason=post_citation_failure,
-                mode="deterministic_fallback",
-                started=started,
-                tool_calls=tool_calls,
-                planner_tokens=planner_tokens,
-                planner_usage_mode="estimated",
-                diagnostics_recorder=diagnostics_recorder,
-                finalization_started=finalization_started,
-            )
-        if {item.chain_id for item in post_chains} != {
-            item.chain_id for item in valid_chains
-        }:
-            relation_state.warnings.extend(warnings)
-            return _finalization_rejection_response(
-                state=relation_state,
-                evidence=post_evidence,
-                chains=post_chains,
-                reason="relation_validation_failed",
-                mode="deterministic_fallback",
-                started=started,
-                tool_calls=tool_calls,
-                planner_tokens=planner_tokens,
-                planner_usage_mode="estimated",
-                diagnostics_recorder=diagnostics_recorder,
-                finalization_started=finalization_started,
-            )
-        valid_chains = post_chains
-    if context.cancellation.cancelled:
-        status = "cancelled"
-    elif (
-        time.monotonic() >= context.deadline_monotonic
-        or tool_calls >= limits.max_tool_calls
-    ):
-        status = "budget_exhausted"
-    else:
-        status = "degraded"
-    response = _attach_agent_fields(
-        result,
-        request_id=context.request_id,
         mode="deterministic_fallback",
-        status=status,
-        steps=steps,
-        started=started,
-        tool_calls=tool_calls,
-        planner_tokens=planner_tokens,
-        planner_usage_mode="estimated",
-        limits=limits,
     )
-    if relation_state is not None:
-        response = _attach_relation_fields(response, relation_state, valid_chains)
-    response = _attach_learning_fields(response, context.learning_context)
-    _assert_evidence_capacity(context, response["evidence"])
-    if diagnostics_recorder is not None:
-        diagnostics_recorder.record_stage_duration(
-            "finalization", int((time.monotonic() - finalization_started) * 1000)
-        )
-        diagnostics_recorder.record_agent_elapsed(
-            int((time.monotonic() - started) * 1000)
-        )
-        diagnostics_recorder.record_deadline_state(
-            remaining_ms=max(
-                0, int((context.deadline_monotonic - time.monotonic()) * 1000)
-            ),
-            overrun_ms=max(
-                0, int((time.monotonic() - context.deadline_monotonic) * 1000)
-            ),
-        )
-        diagnostics_recorder.record_agent_result(response)
+    response = finalization_phase.response
     logger.info(
         "agent_run_completed",
         extra={
             "request_id": context.request_id,
-            "status": status,
+            "status": state.completion_status,
             "mode": "deterministic_fallback",
-            "steps_used": len(steps),
-            "tool_calls_used": tool_calls,
-            "planner_tokens": planner_tokens,
+            "steps_used": len(state.steps),
+            "tool_calls_used": state.tool_call_count,
+            "planner_tokens": state.planner_token_usage,
             "elapsed_ms": response["budget_usage"]["elapsed_ms"],
             "evidence_count": len(response["evidence"]),
         },

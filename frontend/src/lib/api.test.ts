@@ -92,6 +92,30 @@ function expectSafeResponseParseError(error: ApiError, status: number, marker: s
 }
 
 describe('structured ask errors', () => {
+  it('retains only safe final-answer subcodes and distinguishes missing repair state', async () => {
+    const failure = createValidStructuredFailure();
+    failure.detail.code = 'citation_format_invalid';
+    failure.detail.diagnostics.failure_stage = 'citation_validation';
+    failure.detail.diagnostics.failure_reason_code = 'citation_format_invalid';
+    const diagnostics = failure.detail.diagnostics as Record<string, unknown>;
+    diagnostics.final_answer_initial_failure = { stable_code: 'model_supplied_location_forbidden', violation_kind: 'evidence_marker', raw: 'PRIVATE_ANSWER' };
+    diagnostics.final_answer_protocol_failure = { stable_code: 'citation_alias_unknown', prompt: 'PRIVATE_PROMPT' };
+    diagnostics.final_answer_repair_failure = { stable_code: 'citation_alias_unknown', exception: 'PRIVATE_EXCEPTION' };
+    diagnostics.final_answer_repair_attempted = true;
+    diagnostics.final_answer_repair_protocol_succeeded = false;
+    diagnostics.final_answer_repair_succeeded = false;
+    stubJsonResponse(failure, 502);
+    const error = await captureApiError(askProject('project-1', 'where'));
+    expect(error.detail?.diagnostics.final_answer_initial_failure?.stable_code).toBe('model_supplied_location_forbidden');
+    expect(error.detail?.diagnostics.final_answer_repair_failure?.stable_code).toBe('citation_alias_unknown');
+    expect(error.detail?.diagnostics.final_answer_repair_attempted).toBe(true);
+    expect(error.detail?.diagnostics.final_answer_repair_protocol_succeeded).toBe(false);
+    expect(JSON.stringify(error.detail)).not.toContain('PRIVATE_');
+    const legacy = createValidStructuredFailure();
+    stubJsonResponse(legacy, 502);
+    const legacyError = await captureApiError(askProject('project-1', 'where'));
+    expect(legacyError.detail?.diagnostics.final_answer_repair_attempted).toBeUndefined();
+  });
   it('projects only safe diagnostic card fields into a detached object', async () => {
     const detail = {
       code: 'citation_unknown',

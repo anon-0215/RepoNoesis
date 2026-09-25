@@ -53,7 +53,7 @@ class ProductApiTests(unittest.TestCase):
         chunk = make_chunk("app.py", "answer", content, revision="a" * 40)
         self.database.save_analysis(
             self.project_id,
-            {"primary_language": "Python", "frameworks": [], "files": [file], "modules": []},
+            {"primary_language": "Python", "frameworks": [], "files": [file], "modules": [], "tree": {"name": "repo", "path": "", "type": "directory", "children": [{"name": "app.py", "path": "app.py", "type": "file", "children": None}]}},
             [file],
             [],
             [chunk],
@@ -72,6 +72,20 @@ class ProductApiTests(unittest.TestCase):
             )
         self.assertEqual(raised.exception.status_code, 503)
         self.assertEqual(raised.exception.detail["code"], "provider_not_configured")
+
+    def test_map_is_bound_to_stored_project_revision_and_analyzed_file_scope(self):
+        with patch.object(self.main, "db", self.database):
+            result = self.main.get_project_map(self.project_id)
+            with self.assertRaises(HTTPException) as missing:
+                self.main.get_project_map("missing-project")
+        self.assertEqual(missing.exception.status_code, 404)
+        self.assertEqual(result["project_id"], self.project_id)
+        self.assertEqual(result["repository_revision"], "a" * 40)
+        self.assertEqual(result["coverage"], "analyzed_files")
+        self.assertEqual(result["file_count"], 1)
+        self.assertEqual(result["tree"]["children"][0]["path"], "app.py")
+        self.assertNotIn("content", str(result))
+        self.assertNotIn(str(self.temporary.name), str(result))
 
     def test_configuration_status_never_exposes_api_key(self):
         status = self.main.configuration_status()

@@ -171,6 +171,8 @@ def answer_from_evidence(
     _raise_if_deadline_expired(request_deadline_at)
     validator = CitationValidator(database)
     if diagnostics_recorder is not None:
+        if hasattr(diagnostics_recorder, "set_validation_checkpoint"):
+            diagnostics_recorder.set_validation_checkpoint("generation_input")
         diagnostics_recorder.enter_stage("citation_validation")
     valid, validation_warnings = validator.validate_all(evidence)
     citation_failure = citation_validation_failure_reason(
@@ -469,6 +471,7 @@ def _m1_response(
 ) -> dict[str, Any]:
     citations = [
         {
+            "evidence_id": item.evidence_id,
             "path": item.path,
             "summary": item.qualified_name or item.symbol_name,
             "snippet": item.excerpt,

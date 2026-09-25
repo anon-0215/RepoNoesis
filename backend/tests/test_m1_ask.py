@@ -258,6 +258,14 @@ class M1AskTests(unittest.TestCase):
         self.assertEqual(result["retrieval_mode"], "lexical")
         self.assertEqual(result["evidence_schema_version"], 1)
         self.assertEqual(validated.evidence_schema_version, 1)
+        self.assertEqual(
+            [item["evidence_id"] for item in result["citations"]],
+            [item["evidence_id"] for item in result["evidence"]],
+        )
+        self.assertEqual(result["execution_summary"]["evidence_count"], len(result["evidence"]))
+        self.assertEqual(result["execution_summary"]["citation_count"], len(result["citations"]))
+        self.assertIn("base_retrieval", result["execution_summary"])
+        self.assertIsNone(main_module.CitationResponse.model_validate({"path": "x", "summary": "", "snippet": ""}).evidence_id)
         with route_db.connect() as conn:
             self.assertEqual(
                 conn.execute("SELECT COUNT(*) FROM chat_answers").fetchone()[0],

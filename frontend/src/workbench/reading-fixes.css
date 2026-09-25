@@ -1,0 +1,12 @@
+/* The legacy global pre rule owns the height of ordinary answer code blocks.
+   Drawer and modal viewers already provide their own flex scroll host. */
+.wb-drawer .wb-code-pane pre,
+.wb-code-modal .wb-code-pane pre {
+  max-height: none;
+  overflow: visible;
+}
+
+.wb-drawer .wb-code-pane,
+.wb-code-modal .wb-code-pane {
+  min-height: 0;
+}
