@@ -2,10 +2,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import math
+import time
 from typing import Any, Callable, Literal
 
 from app.database import Database
-from app.services.embedding_service import EmbeddingService
+from app.services.embedding_service import EmbeddingError, EmbeddingService
 from app.services.hierarchy_normalization import (
     HIERARCHY_MODE_OFF,
     HIERARCHY_MODE_NORMALIZE_V1,
@@ -14,7 +15,7 @@ from app.services.hierarchy_normalization import (
     normalize_hierarchy_candidates,
     validate_hierarchy_mode,
 )
-from app.services.hybrid_retriever import HybridRetriever, HybridSearchResult
+from app.services.hybrid_retriever import HybridRetriever, HybridSearchResult, run_bounded_semantic
 from app.services.lexical_retriever import LexicalRetriever, LexicalSearchResult
 from app.services.query_analyzer import QueryAnalysis, QueryAnalyzer
 from app.services.relation_retrieval import (
@@ -24,7 +25,7 @@ from app.services.relation_retrieval import (
     select_relation_aware_candidates,
     validate_relation_mode,
 )
-from app.services.semantic_retriever import SemanticRetriever, SemanticSearchResult
+from app.services.semantic_retriever import SemanticDataError, SemanticRetriever, SemanticSearchResult
 from app.services.symbol_retriever import SymbolRetriever, SymbolSearchResult
 from app.services.smoke_diagnostics import SmokeDiagnosticsRecorder
 
@@ -308,6 +309,7 @@ class RetrievalV2Orchestrator:
         relation_mode: str = RELATION_MODE_OFF,
         check_active: Callable[[], None] | None = None,
         diagnostics_recorder: SmokeDiagnosticsRecorder | None = None,
+        semantic_deadline_at: float | None = None,
     ) -> RetrievalExecutionOutcome:
         _check(check_active)
         if not str(query).strip():
@@ -334,6 +336,7 @@ class RetrievalV2Orchestrator:
                 "deterministically truncated."
             )
 
+        lexical_started = time.monotonic()
         lexical = self.lexical_retriever.search(
             project_id,
             query,
@@ -343,6 +346,11 @@ class RetrievalV2Orchestrator:
             symbol=symbol,
         )
         _check(check_active)
+        retrieval_detail: dict[str, Any] = {
+            "lexical_ms": int((time.monotonic() - lexical_started) * 1000),
+            "lexical_hit_count": len(lexical),
+            "model_state_at_start": getattr(self.embedding_service, "model_load_state", "unknown"),
+        }
         lexical = sorted(lexical, key=_lexical_sort_key)[: budgets["lexical"]]
         source_candidates.extend(_adapt_lexical(item) for item in lexical)
         source_audit["lexical"] = {
@@ -353,29 +361,55 @@ class RetrievalV2Orchestrator:
 
         dense: list[SemanticSearchResult] = []
         if self.embedding_service.settings.enabled:
+            phase_timings: dict[str, int] = {}
             try:
-                dense_outcome = self.semantic_retriever.search(
-                    project_id,
-                    query,
-                    top_k=budgets["dense"],
-                    path=path,
-                    language=language,
-                    symbol=symbol,
-                    local_files_only=True,
-                    check_active=check_active,
-                    diagnostics_recorder=diagnostics_recorder,
-                )
+                def semantic_work() -> Any:
+                    return self.semantic_retriever.search(
+                        project_id,
+                        query,
+                        top_k=budgets["dense"],
+                        path=path,
+                        language=language,
+                        symbol=symbol,
+                        local_files_only=True,
+                        check_active=None if semantic_deadline_at is not None else check_active,
+                        diagnostics_recorder=None if semantic_deadline_at is not None else diagnostics_recorder,
+                        phase_timings=phase_timings,
+                    )
+                if semantic_deadline_at is None:
+                    dense_outcome = semantic_work()
+                    semantic_status = "completed"
+                else:
+                    retrieval_detail["semantic_remaining_ms"] = max(
+                        0, int((semantic_deadline_at - time.monotonic()) * 1000)
+                    )
+                    semantic_status, dense_outcome, wait_ms = run_bounded_semantic(
+                        self.embedding_service, semantic_work,
+                        deadline_at=semantic_deadline_at, check_active=check_active,
+                    )
+                    if wait_ms is not None:
+                        retrieval_detail["semantic_wait_ms"] = wait_ms
+                retrieval_detail["semantic_status"] = semantic_status
                 _check(check_active)
-                dense = list(dense_outcome.results)[: budgets["dense"]]
-                warnings.extend(dense_outcome.warnings)
-                source_audit["dense"] = {
-                    "status": dense_outcome.status if not dense else "ok",
-                    "budget": budgets["dense"],
-                    "candidate_count": len(dense),
-                    "model_name": dense_outcome.model_name,
-                }
+                if dense_outcome is None:
+                    warnings.append("Dense retrieval did not complete; continuing with lexical and symbol candidates.")
+                    source_audit["dense"] = {
+                        "status": semantic_status, "budget": budgets["dense"], "candidate_count": 0,
+                    }
+                else:
+                    dense = list(dense_outcome.results)[: budgets["dense"]]
+                    warnings.extend(dense_outcome.warnings)
+                    source_audit["dense"] = {
+                        "status": dense_outcome.status if not dense else "ok",
+                        "budget": budgets["dense"],
+                        "candidate_count": len(dense),
+                        "model_name": dense_outcome.model_name,
+                    }
             except Exception as exc:
                 _check(check_active)
+                if semantic_deadline_at is not None and not isinstance(exc, (EmbeddingError, SemanticDataError, OSError)):
+                    raise
+                retrieval_detail["semantic_status"] = "failed"
                 warnings.append(
                     "Dense retrieval unavailable; continuing with the other v2 "
                     f"sources: {type(exc).__name__}."
@@ -386,7 +420,11 @@ class RetrievalV2Orchestrator:
                     "candidate_count": 0,
                     "error_type": type(exc).__name__,
                 }
+            retrieval_detail.update(dict(phase_timings))
+            if retrieval_detail["model_state_at_start"] != "ready" and "model_identity_ms" in retrieval_detail:
+                retrieval_detail["model_load_ms"] = retrieval_detail["model_identity_ms"]
         else:
+            retrieval_detail["semantic_status"] = "disabled"
             warnings.append(
                 "Embeddings are disabled; the dense v2 source is controlled-unavailable."
             )
@@ -420,11 +458,13 @@ class RetrievalV2Orchestrator:
             "hints_truncated": len(symbol_hints) < len(all_symbol_hints),
         }
 
+        fusion_started = time.monotonic()
         merged = _merge_and_fuse(
             source_candidates,
             weights=weights,
             config=self.config,
         )
+        retrieval_detail["fusion_ms"] = int((time.monotonic() - fusion_started) * 1000)
         _check(check_active)
         limit = min(
             self.config.max_final_top_k,
@@ -523,13 +563,21 @@ class RetrievalV2Orchestrator:
                     "unexpected_error": type(exc).__name__,
                     "warnings": [warning],
                 }
+        mode = (
+            "hybrid" if any("dense" in item.source_records for item in selected) else "lexical"
+        )
+        selected_sources = {source for item in selected for source in item.source_records}
+        retrieval_detail["retrieval_source"] = (
+            "hybrid" if "dense" in selected_sources else
+            "lexical_symbol" if {"lexical", "symbol"} <= selected_sources else
+            "symbol" if "symbol" in selected_sources else "lexical"
+        )
+        retrieval_detail["model_state"] = getattr(self.embedding_service, "model_load_state", "unknown")
+        if diagnostics_recorder is not None:
+            diagnostics_recorder.record_retrieval_detail(retrieval_detail)
         return RetrievalExecutionOutcome(
             results=final_results,
-            retrieval_mode=(
-                "hybrid"
-                if any("dense" in item.source_records for item in selected)
-                else "lexical"
-            ),
+            retrieval_mode=mode,
             warnings=_deduplicate(warnings),
             retrieval_version=RETRIEVAL_VERSION_V2,
             retrieval_strategy_version=self.config.fusion_version,
@@ -597,6 +645,7 @@ def retrieve_code(
     relation_mode: str = RELATION_MODE_OFF,
     check_active: Callable[[], None] | None = None,
     diagnostics_recorder: SmokeDiagnosticsRecorder | None = None,
+    semantic_deadline_at: float | None = None,
 ) -> RetrievalExecutionOutcome:
     _check(check_active)
     version = validate_retrieval_version(retrieval_version)
@@ -618,6 +667,7 @@ def retrieve_code(
             symbol=symbol,
             check_active=check_active,
             diagnostics_recorder=diagnostics_recorder,
+            semantic_deadline_at=semantic_deadline_at,
         )
         return RetrievalExecutionOutcome(
             results=outcome.results,
@@ -637,6 +687,7 @@ def retrieve_code(
         relation_mode=relation_mode,
         check_active=check_active,
         diagnostics_recorder=diagnostics_recorder,
+        semantic_deadline_at=semantic_deadline_at,
     )
 
 

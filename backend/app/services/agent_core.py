@@ -339,8 +339,11 @@ def _run_bounded_agent_stages(
     request_deadline_at: float | None = None,
     request_budget: RequestBudget | None = None,
     allow_planner_failure_fallback: bool = True,
+    execution_mode: str = "agent",
 ) -> dict[str, Any]:
     validate_non_blank_question(question)
+    if execution_mode not in {"agent", "rag"}:
+        raise ValueError("unsupported execution mode")
     retrieval_version = validate_retrieval_version(retrieval_version)
     hierarchy_mode = validate_hierarchy_mode(
         hierarchy_mode,
@@ -436,6 +439,10 @@ def _run_bounded_agent_stages(
             diagnostics_recorder,
             status="failed",
         )
+        if execution_mode == "rag":
+            # The legacy fallback has a separate retrieval/evidence path. RAG
+            # must fail closed when the canonical ToolContext cannot be bound.
+            raise
         fallback_now = time.monotonic()
         if request_budget.request_expired(fallback_now) or request_budget.work_expired(
             fallback_now
@@ -566,6 +573,8 @@ def _run_bounded_agent_stages(
     normalized_question = question.strip()
     seed_budget_ms = state.budget.work_remaining_ms(time.monotonic())
     if seed_budget_ms > 0:
+        if diagnostics_recorder is not None and hasattr(diagnostics_recorder, "begin_base"):
+            diagnostics_recorder.begin_base()
         seed_spec = _resolve_tool_spec(registry, "search_code")
         context.candidate_provenance = "deterministic_base_retrieval"
         try:
@@ -601,7 +610,9 @@ def _run_bounded_agent_stages(
             state.completion_status = "budget_exhausted"
             state.failure_reason = "deadline_exceeded"
 
-    if planner is None:
+    if execution_mode == "rag":
+        planner_phase = None
+    elif planner is None:
         if not llm or not llm.available:
             if diagnostics_recorder is not None:
                 diagnostics_recorder.record_fallback("llm_unavailable")
@@ -618,7 +629,8 @@ def _run_bounded_agent_stages(
             )
         planner = LLMPlanner(llm, registry, limits, diagnostics_recorder)
 
-    planner_phase = run_planner_enhancement(
+    if execution_mode == "agent":
+        planner_phase = run_planner_enhancement(
         planner=planner,
         state=state,
         registry=registry,
@@ -638,14 +650,14 @@ def _run_bounded_agent_stages(
             apply_request_top_k_limit=_apply_request_top_k_limit,
             execute_agent_tool=_execute_agent_tool,
         ),
-    )
-    if planner_phase.status == "planner_failure_response_required":
+        )
+    if planner_phase is not None and planner_phase.status == "planner_failure_response_required":
         return _planner_failure_response(
             state=state,
             started=started,
             diagnostics_recorder=diagnostics_recorder,
         )
-    if planner_phase.status == "fallback_required":
+    if planner_phase is not None and planner_phase.status == "fallback_required":
         return _run_deterministic_fallback(
             state=state,
             question=question,
@@ -661,7 +673,7 @@ def _run_bounded_agent_stages(
                 f"{planner_phase.decision_error}."
             ),
         )
-    planner_deadline_recovery_authorized = planner_phase.deadline_recovery_authorized
+    planner_deadline_recovery_authorized = planner_phase.deadline_recovery_authorized if planner_phase else False
 
     finalization_phase = run_finalization_phase(
         state=state,
@@ -669,7 +681,7 @@ def _run_bounded_agent_stages(
         llm=llm,
         database=database,
         started=started,
-        planner_deadline_recovery_authorized=planner_phase.deadline_recovery_authorized,
+        planner_deadline_recovery_authorized=planner_deadline_recovery_authorized,
         diagnostics_recorder=diagnostics_recorder,
         operations=FinalizationPhaseOperations(
             budget_failure=_empty_budget_failure,
@@ -1990,9 +2002,13 @@ def _validated_relation_context(
     state: AgentState,
     evidence: list[Any],
     diagnostics_recorder: SmokeDiagnosticsRecorder | None = None,
+    *,
+    checkpoint: str = "initial_evidence",
 ) -> tuple[list[Any], list[EvidenceChain], list[str], str | None]:
     _ensure_finalization_active(state.context.deadline_monotonic)
     if diagnostics_recorder is not None:
+        if hasattr(diagnostics_recorder, "set_validation_checkpoint"):
+            diagnostics_recorder.set_validation_checkpoint(checkpoint)
         diagnostics_recorder.enter_stage("citation_validation")
     valid_evidence, evidence_warnings = CitationValidator(
         state.context.database
@@ -2011,6 +2027,8 @@ def _validated_relation_context(
     if diagnostics_recorder is not None:
         diagnostics_recorder.enter_stage("relation_validation")
     candidate_chains = state.context.chain_store.all(state.request_id)
+    if diagnostics_recorder is not None and hasattr(diagnostics_recorder, "set_relation_applicable"):
+        diagnostics_recorder.set_relation_applicable(bool(candidate_chains))
     _ensure_finalization_active(state.context.deadline_monotonic)
     chains, relation_warnings = RelationValidator(
         state.context.database

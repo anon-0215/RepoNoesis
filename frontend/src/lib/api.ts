@@ -1,6 +1,8 @@
 import type {
   AskFailure,
+  AskProgressEvent,
   ChatAnswer,
+  ExecutionMode,
   ConfigStatus,
   LearningStep,
   LearningContinuity,
@@ -83,6 +85,34 @@ const ASK_CITATION_FAILURE_REASONS = new Set(
   [...ASK_FAILURE_REASONS].filter((code) => code.startsWith('citation_'))
 );
 const ASK_RELATION_FAILURE_REASONS = new Set(['relation_validation_failed']);
+const ASK_FINAL_ANSWER_PROTOCOL_CODES = new Set([
+  'final_answer_invalid_json', 'final_answer_schema_invalid', 'model_supplied_location_forbidden',
+  'citation_alias_missing', 'citation_alias_unknown', 'citation_alias_invalid_type',
+  'citation_alias_limit_exceeded', 'canonical_render_failed', 'citation_format_invalid',
+  'citation_binding_failed'
+]);
+const ASK_FINAL_ANSWER_REPAIR_CODES = new Set([
+  ...ASK_FINAL_ANSWER_PROTOCOL_CODES, 'response_empty', 'answer_token_budget_exceeded',
+  'citation_missing', 'citation_unknown', 'citation_validation_failed',
+  'citation_location_missing', 'citation_path_mismatch', 'citation_line_range_mismatch',
+  'citation_evidence_binding_failed', 'relation_validation_failed',
+  'post_generation_validation_failed', 'provider_failed', 'deadline_exhausted',
+  'unknown_safe_failure'
+]);
+const ASK_CITATION_VIOLATION_KINDS = new Set(['evidence_marker', 'path', 'revision', 'content_hash', 'chunk_identity']);
+
+function safeFinalAnswerFailure(value: unknown, codes: Set<string>) {
+  if (!isRecord(value) || typeof value.stable_code !== 'string' || !codes.has(value.stable_code)) return undefined;
+  return {
+    stable_code: value.stable_code,
+    ...(typeof value.violation_kind === 'string' && ASK_CITATION_VIOLATION_KINDS.has(value.violation_kind)
+      ? { violation_kind: value.violation_kind } : {})
+  };
+}
+
+function optionalBoolean(value: unknown): boolean | undefined {
+  return typeof value === 'boolean' ? value : undefined;
+}
 const SAFE_LEGACY_ERROR_MESSAGES: Readonly<Record<string, string>> = Object.freeze({
   git_executable_unavailable: '后端未找到 Git 客户端，请安装或配置 Git 后重试。',
   git_dns_failed: '无法解析公开 Git 主机，请检查 DNS 或网络设置。',
@@ -279,6 +309,20 @@ function projectAskFailure(value: unknown): AskFailure | null {
   ) {
     return null;
   }
+  const base = diagnostics.base_retrieval;
+  const baseStatuses = new Set(['succeeded', 'zero_hit', 'all_rejected', 'failed', 'rejected', 'timed_out', 'cancelled', 'deadline_exceeded']);
+  const safeBase = isRecord(base) && typeof base.attempted === 'boolean' &&
+    typeof base.status === 'string' && baseStatuses.has(base.status) &&
+    isBoundedInteger(base.retrieval_hit_count) && isBoundedInteger(base.normalized_candidate_count) &&
+    isBoundedInteger(base.valid_candidate_count) && isBoundedInteger(base.new_evidence_count) &&
+    isBoundedInteger(base.rejected_candidate_count) ? {
+      attempted: base.attempted, status: base.status,
+      retrieval_hit_count: base.retrieval_hit_count,
+      normalized_candidate_count: base.normalized_candidate_count,
+      valid_candidate_count: base.valid_candidate_count,
+      new_evidence_count: base.new_evidence_count,
+      rejected_candidate_count: base.rejected_candidate_count
+    } : undefined;
   return {
     code: value.code,
     message: SAFE_STRUCTURED_ASK_MESSAGE,
@@ -299,12 +343,19 @@ function projectAskFailure(value: unknown): AskFailure | null {
       planner_logical_calls: diagnostics.planner_logical_calls,
       planner_repair_calls: diagnostics.planner_repair_calls,
       final_answer_attempted: diagnostics.final_answer_attempted,
+      final_answer_repair_attempted: optionalBoolean(diagnostics.final_answer_repair_attempted),
+      final_answer_repair_protocol_succeeded: optionalBoolean(diagnostics.final_answer_repair_protocol_succeeded),
+      final_answer_repair_succeeded: optionalBoolean(diagnostics.final_answer_repair_succeeded),
+      final_answer_initial_failure: safeFinalAnswerFailure(diagnostics.final_answer_initial_failure, ASK_FINAL_ANSWER_REPAIR_CODES),
+      final_answer_protocol_failure: safeFinalAnswerFailure(diagnostics.final_answer_protocol_failure, ASK_FINAL_ANSWER_PROTOCOL_CODES),
+      final_answer_repair_failure: safeFinalAnswerFailure(diagnostics.final_answer_repair_failure, ASK_FINAL_ANSWER_REPAIR_CODES),
       provider_logical_calls: diagnostics.provider_logical_calls,
       evidence_count: diagnostics.evidence_count,
       citation_count: diagnostics.citation_count,
       citation_failure_reason_code: diagnostics.citation_failure_reason_code,
       relation_failure_reason_code: diagnostics.relation_failure_reason_code,
-      elapsed_ms: diagnostics.elapsed_ms
+      elapsed_ms: diagnostics.elapsed_ms,
+      base_retrieval: safeBase
     }
   };
 }
@@ -421,6 +472,77 @@ export async function askProject(projectId: string, question: string): Promise<C
     method: 'POST',
     body: JSON.stringify({ question })
   });
+}
+
+export async function askProjectStream(
+  projectId: string, revision: string, question: string, mode: ExecutionMode,
+  clientRequestId: string, onProgress: (event: AskProgressEvent) => void,
+  signal?: AbortSignal
+): Promise<ChatAnswer> {
+  let response: Response;
+  try {
+    response = await fetch(`${API_BASE}/api/projects/${encodeURIComponent(projectId)}/ask/stream`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, signal,
+      body: JSON.stringify({ question, execution_mode: mode, client_request_id: clientRequestId, repository_revision: revision })
+    });
+  } catch {
+    throw new ApiError('连接中断，最终状态未知；请检查问答记录后决定是否重新提问。', 0);
+  }
+  if (!response.ok || !response.body) throw new ApiError(`进度连接失败（HTTP ${response.status}）。`, response.status);
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let lastSequence = 0;
+  let serverRequestId: string | null = null;
+  let terminal = false;
+  const parseLine = (line: string): ChatAnswer | null => {
+    let value: unknown;
+    try { value = JSON.parse(line); } catch { throw new ApiError('进度数据无效，最终状态未知。', 0); }
+    if (!isRecord(value) || typeof value.request_id !== 'string' ||
+        value.client_request_id !== clientRequestId || value.project_id !== projectId ||
+        value.repository_revision !== revision || !Number.isInteger(value.sequence) ||
+        (value.sequence as number) < 1) throw new ApiError('进度上下文不匹配，最终状态未知。', 0);
+    if (serverRequestId && value.request_id !== serverRequestId) throw new ApiError('请求身份不匹配，最终状态未知。', 0);
+    serverRequestId = value.request_id;
+    if ((value.sequence as number) <= lastSequence || terminal) return null;
+    lastSequence = value.sequence as number;
+    if (value.type === 'completed') {
+      terminal = true;
+      if (!isRecord(value.result) || value.result.execution_mode !== mode) throw new ApiError('服务端执行模式与提交模式不一致，答案未展示。', 0);
+      return value.result as unknown as ChatAnswer;
+    }
+    if (value.type === 'failed') {
+      terminal = true;
+      const failure = projectAskFailure(value.failure);
+      throw new ApiError(failure ? SAFE_STRUCTURED_ASK_MESSAGE : '问答失败，最终答案未生成。', typeof value.status === 'number' ? value.status : 0, failure);
+    }
+    const known = new Set(['request_received', 'base_started', 'base_completed', 'planner_started', 'planner_stopped', 'tool_completed', 'answer_started', 'citation_checked', 'relation_checked']);
+    if (typeof value.type === 'string' && known.has(value.type)) onProgress(value as unknown as AskProgressEvent);
+    return null;
+  };
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      if (buffer.length > 1_000_000) throw new ApiError('进度数据过大，最终状态未知。', 0);
+      let newline: number;
+      while ((newline = buffer.indexOf('\n')) >= 0) {
+        const line = buffer.slice(0, newline).trim(); buffer = buffer.slice(newline + 1);
+        if (!line) continue;
+        const result = parseLine(line);
+        if (result) return result;
+      }
+    }
+    buffer += decoder.decode();
+    if (buffer.trim()) {
+      const result = parseLine(buffer.trim());
+      if (result) return result;
+    }
+    throw new ApiError('连接已结束，但未收到最终状态；实际结果未知。', 0);
+  } finally {
+    await reader.cancel().catch(() => undefined);
+  }
 }
 
 export async function getReport(projectId: string): Promise<{ markdown: string }> {

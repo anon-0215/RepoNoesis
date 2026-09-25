@@ -112,7 +112,7 @@ def run_finalization_phase(
     if relation_enabled:
         evidence, valid_chains, relation_warnings, citation_failure = (
             operations.validated_relation_context(
-                state, evidence, diagnostics_recorder
+                state, evidence, diagnostics_recorder, checkpoint="initial_evidence"
             )
         )
         state.warnings.extend(relation_warnings)
@@ -176,7 +176,8 @@ def run_finalization_phase(
     if relation_enabled:
         post_evidence, post_chains, post_warnings, post_failure = (
             operations.validated_relation_context(
-                state, evidence_store.all(state.request_id), diagnostics_recorder
+                state, evidence_store.all(state.request_id), diagnostics_recorder,
+                checkpoint="post_answer_evidence"
             )
         )
         state.warnings.extend(post_warnings)

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 import math
+import time
 from typing import Any, Callable
 
 from app.database import Database
@@ -15,6 +16,10 @@ from app.services.smoke_diagnostics import SmokeDiagnosticsRecorder
 
 DEFAULT_TOP_K = 5
 MAX_TOP_K = 50
+
+
+class SemanticDataError(ValueError):
+    """A project embedding or query vector failed semantic data checks."""
 
 
 @dataclass(frozen=True)
@@ -69,6 +74,7 @@ class SemanticRetriever:
         local_files_only: bool = False,
         check_active: Callable[[], None] | None = None,
         diagnostics_recorder: SmokeDiagnosticsRecorder | None = None,
+        phase_timings: dict[str, int] | None = None,
     ) -> SemanticSearchOutcome:
         _check(check_active)
         cleaned_query = query.strip()
@@ -77,12 +83,16 @@ class SemanticRetriever:
         limit = _bounded_top_k(top_k)
         if diagnostics_recorder is not None:
             diagnostics_recorder.record_embedding_stage("model_load")
+        phase_started = time.monotonic()
         identity = self.embedding_service.ensure_effective_embedding_identity(
             local_files_only=local_files_only,
             check_active=check_active,
         )
+        if phase_timings is not None:
+            phase_timings["model_identity_ms"] = int((time.monotonic() - phase_started) * 1000)
         _check(check_active)
         embedding_config_hash = identity.embedding_config_hash
+        phase_started = time.monotonic()
         candidates = self.database.get_code_chunk_embeddings_for_project(
             project_id,
             identity.model_name,
@@ -105,6 +115,8 @@ class SemanticRetriever:
                 self.embedding_service.settings,
             )
         ]
+        if phase_timings is not None:
+            phase_timings["vector_read_ms"] = int((time.monotonic() - phase_started) * 1000)
         _check(check_active)
         if not candidates:
             return SemanticSearchOutcome(
@@ -118,25 +130,29 @@ class SemanticRetriever:
         dimension = int(candidates[0]["embedding_dimension"])
         for candidate in candidates:
             if int(candidate["embedding_dimension"]) != dimension:
-                raise ValueError(
+                raise SemanticDataError(
                     f"embedding dimension mismatch in project {project_id} for "
                     f"model {identity.model_name}"
                 )
 
         if diagnostics_recorder is not None:
             diagnostics_recorder.record_embedding_stage("query_encode")
+        phase_started = time.monotonic()
         query_vector = self.embedding_service.encode_query(
             cleaned_query,
             local_files_only=local_files_only,
             check_active=check_active,
         )
+        if phase_timings is not None:
+            phase_timings["query_encode_ms"] = int((time.monotonic() - phase_started) * 1000)
         _check(check_active)
         if len(query_vector) != dimension:
-            raise ValueError(
+            raise SemanticDataError(
                 f"query embedding dimension {len(query_vector)} does not match "
                 f"cached dimension {dimension} for project {project_id}"
             )
 
+        phase_started = time.monotonic()
         scored = [
             (
                 _dot(query_vector, candidate["vector"]),
@@ -146,7 +162,7 @@ class SemanticRetriever:
         ]
         _check(check_active)
         if any(not _is_finite(score) for score, _candidate in scored):
-            raise ValueError("semantic score must be finite")
+            raise SemanticDataError("semantic score must be finite")
         scored.sort(
             key=lambda item: (
                 -item[0],
@@ -174,6 +190,8 @@ class SemanticRetriever:
             )
             for score, candidate in scored[:limit]
         ]
+        if phase_timings is not None:
+            phase_timings["vector_score_ms"] = int((time.monotonic() - phase_started) * 1000)
         return SemanticSearchOutcome(
             status="ok",
             results=results,
@@ -198,7 +216,7 @@ def _bounded_top_k(top_k: int) -> int:
 
 def _dot(left: list[float], right: list[float]) -> float:
     if len(left) != len(right):
-        raise ValueError("embedding vectors must have the same dimension")
+        raise SemanticDataError("embedding vectors must have the same dimension")
     return sum(a * b for a, b in zip(left, right))
 
 

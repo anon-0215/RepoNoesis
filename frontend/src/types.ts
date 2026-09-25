@@ -55,6 +55,10 @@ export interface TreeNode {
 }
 
 export interface ProjectMap {
+  project_id?: string;
+  repository_revision?: string;
+  coverage?: 'analyzed_files';
+  file_count?: number;
   tree: TreeNode;
   modules: ModuleSummary[];
   dependency_edges: Array<{ from: string; to: string }>;
@@ -71,6 +75,7 @@ export interface LearningStep {
 }
 
 export interface Citation {
+  evidence_id?: string | null;
   path: string;
   summary: string;
   snippet: string;
@@ -80,11 +85,43 @@ export interface Citation {
 }
 
 export interface ChatAnswer {
+  execution_mode?: 'rag' | 'agent';
   answer: string;
   citations: Citation[];
   answer_mode: 'llm_grounded' | 'deterministic';
   grounding_status: 'grounded' | 'insufficient_evidence' | 'degraded';
   warnings: string[];
+  evidence?: Array<{ evidence_id: string; project_id: string; repository_revision: string; path: string; qualified_name: string; symbol_name?: string; start_line: number; end_line: number }>;
+  execution_summary?: {
+    status?: string | null; answer_mode?: string | null; evidence_count?: number | null; citation_count?: number | null;
+    base_retrieval?: { attempted: boolean; status: string; new_evidence_count: number; retrieval_detail?: RetrievalDetail | null } | null;
+    planner_requests_attempted?: number | null; planner_repair_attempts?: number | null;
+    provider_logical_calls?: number | null; provider_http_attempt_count?: number | null;
+    tool_calls_attempted?: number | null; tool_calls_succeeded?: number | null; tool_calls_failed?: number | null;
+    steps_used?: number | null; tool_calls_used?: number | null; agent_elapsed_ms?: number | null;
+    planner_duration_ms?: number | null; tool_duration_ms?: number | null; finalization_duration_ms?: number | null;
+    planner_termination_reason?: string | null; citation_validation_passed?: boolean | null;
+    relation_validation_passed?: boolean | null; post_generation_validation_passed?: boolean | null;
+    diagnostics_truncated?: boolean | null;
+  } | null;
+}
+
+export type ExecutionMode = 'rag' | 'agent';
+export interface AskProgressEvent {
+  request_id: string;
+  client_request_id: string | null;
+  project_id: string;
+  repository_revision: string;
+  sequence: number;
+  type: string;
+  status?: string;
+  tool?: string;
+  reason?: string;
+  new_evidence_count?: number;
+  evidence_added?: number;
+  passed?: boolean;
+    phase?: 'before_answer' | 'after_answer';
+    checkpoint?: 'initial_evidence' | 'generation_input' | 'post_answer_evidence';
 }
 
 export interface AskFailureDiagnostics {
@@ -102,12 +139,39 @@ export interface AskFailureDiagnostics {
   planner_logical_calls: number;
   planner_repair_calls: number;
   final_answer_attempted: boolean;
+  final_answer_repair_attempted?: boolean | null;
+  final_answer_repair_protocol_succeeded?: boolean | null;
+  final_answer_repair_succeeded?: boolean | null;
+  final_answer_initial_failure?: { stable_code: string; violation_kind?: string } | null;
+  final_answer_protocol_failure?: { stable_code: string; violation_kind?: string } | null;
+  final_answer_repair_failure?: { stable_code: string; violation_kind?: string } | null;
   provider_logical_calls: number;
   evidence_count: number;
   citation_count: number;
   citation_failure_reason_code: string | null;
   relation_failure_reason_code: string | null;
   elapsed_ms: number;
+  base_retrieval?: {
+    attempted: boolean;
+    status: string;
+    retrieval_hit_count: number;
+    normalized_candidate_count: number;
+    valid_candidate_count: number;
+    new_evidence_count: number;
+    rejected_candidate_count: number;
+    retrieval_detail?: RetrievalDetail | null;
+  };
+}
+
+export interface RetrievalDetail {
+  lexical_ms?: number; lexical_hit_count?: number; semantic_remaining_ms?: number;
+  semantic_wait_ms?: number; model_identity_ms?: number; model_load_ms?: number;
+  vector_read_ms?: number; query_encode_ms?: number; vector_score_ms?: number; revision_read_ms?: number;
+  fusion_ms?: number; promotion_ms?: number;
+  model_state?: 'unready' | 'loading' | 'ready' | 'failed' | 'unknown';
+  model_state_at_start?: 'unready' | 'loading' | 'ready' | 'failed' | 'unknown';
+  semantic_status?: 'completed' | 'skipped_budget' | 'timed_out' | 'capacity' | 'failed' | 'disabled';
+  retrieval_source?: 'hybrid' | 'lexical' | 'lexical_symbol' | 'symbol';
 }
 
 export interface AskFailure {

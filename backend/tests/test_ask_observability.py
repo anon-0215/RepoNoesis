@@ -1255,6 +1255,40 @@ class AskRouteSafetyTests(unittest.TestCase):
         self.assertEqual(body["evidence"][0]["semantic_score"], 0.5)
         self.assertEqual(body["evidence"][0]["fusion_score"], 1.25)
 
+    def test_public_execution_summary_uses_request_aggregates_when_detail_is_trimmed(self):
+        result = _result(answer_mode="llm_grounded", agent_mode="bounded", agent_status="completed")
+        first = self.main._ask_execution_summary(result, {
+            "planner_requests_attempted": 5,
+            "provider_logical_calls": 6,
+            "provider_http_attempt_count": 9,
+            "diagnostics_truncated": True,
+            "planner_enhancement_termination_reason": "planner_repair_failed",
+            "base_retrieval": {"attempted": True, "status": "succeeded", "new_evidence_count": 1},
+            "citation_validation_completed": True,
+            "citation_validation_passed": True,
+            "provider_calls": [{"purpose": "final_answer"}],
+            "tool_executions": [],
+            "unsafe_raw_response": "SECRET",
+        })
+        second = self.main._ask_execution_summary(result, {})
+        self.assertEqual(first["planner_requests_attempted"], 5)
+        self.assertEqual(first["provider_http_attempt_count"], 9)
+        self.assertTrue(first["diagnostics_truncated"])
+        self.assertTrue(first["citation_validation_passed"])
+        self.assertNotIn("provider_calls", first)
+        self.assertNotIn("unsafe_raw_response", first)
+        self.assertNotIn("planner_requests_attempted", second)
+        self.assertNotIn("citation_validation_passed", second)
+
+    def test_invalid_public_binding_fails_before_persistence(self):
+        candidate = _result(answer_mode="llm_grounded", agent_mode="bounded", agent_status="completed")
+        candidate["citations"][0]["evidence_id"] = "E999"
+        with patch.object(self.database, "save_chat_answer", wraps=self.database.save_chat_answer) as saved:
+            status, body = self._asgi_call(candidate)
+        self.assertEqual(status, 500)
+        self.assertEqual(body["detail"]["code"], "response_contract_invalid")
+        saved.assert_not_called()
+
     def test_provider_failures_use_one_canonical_code_across_http_log_and_diagnostics(self):
         class NotConfiguredLlm:
             def require_available(self):
@@ -1725,6 +1759,27 @@ class AskRouteSafetyTests(unittest.TestCase):
 
 
 class RecorderSafetyTests(unittest.TestCase):
+    def test_success_projection_keeps_unprovided_validation_unknown(self):
+        result = _result(
+            request_id="request-success",
+            answer_mode="llm_grounded",
+            agent_mode="bounded",
+            agent_status="completed",
+        )
+        diagnostics = build_ask_success_diagnostics(
+            result=result,
+            recorder_snapshot={
+                "citation_validation_passed": True,
+                "post_generation_validation_passed": False,
+            },
+            retrieval_version="v1",
+            hierarchy_mode="off",
+            relation_mode="off",
+        )
+        self.assertIs(diagnostics["citation_validation_passed"], True)
+        self.assertIsNone(diagnostics["relation_validation_passed"])
+        self.assertIs(diagnostics["post_generation_validation_passed"], False)
+
     def test_success_projection_rejects_free_text_and_stays_bounded(self):
         recorder = SmokeDiagnosticsRecorder()
         recorder.begin_request(deadline_budget_ms=60_000, remaining_ms=60_000)

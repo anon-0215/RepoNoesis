@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
+from concurrent.futures import TimeoutError as FutureTimeout
+import time
 from typing import Any, Callable
 
 from app.database import Database
-from app.services.embedding_service import EmbeddingService
+from app.services.embedding_service import EmbeddingError, EmbeddingService, SemanticCapacityUnavailable
 from app.services.lexical_retriever import LexicalRetriever
-from app.services.semantic_retriever import SemanticRetriever
+from app.services.semantic_retriever import SemanticDataError, SemanticRetriever
 from app.services.smoke_diagnostics import SmokeDiagnosticsRecorder
 
 
@@ -85,9 +87,11 @@ class HybridRetriever:
         symbol: str | None = None,
         check_active: Callable[[], None] | None = None,
         diagnostics_recorder: SmokeDiagnosticsRecorder | None = None,
+        semantic_deadline_at: float | None = None,
     ) -> HybridSearchOutcome:
         _check(check_active)
         limit = min(MAXIMUM_EVIDENCE_COUNT, max(1, int(evidence_count)))
+        lexical_started = time.monotonic()
         lexical = self.lexical_retriever.search(
             project_id,
             query,
@@ -97,11 +101,25 @@ class HybridRetriever:
             symbol=symbol,
         )
         _check(check_active)
+        detail: dict[str, Any] = {
+            "lexical_ms": int((time.monotonic() - lexical_started) * 1000),
+            "lexical_hit_count": len(lexical),
+            "model_state": getattr(self.embedding_service, "model_load_state", "unknown"),
+        }
+        detail["model_state_at_start"] = detail["model_state"]
         warnings: list[str] = []
         semantic = []
         if self.embedding_service.settings.enabled:
-            try:
-                semantic_outcome = self.semantic_retriever.search(
+            # Keep part of the existing tool window for fusion, canonical
+            # reread and EvidenceStore admission. The request deadline itself
+            # is never extended.
+            remaining = None if semantic_deadline_at is None else semantic_deadline_at - time.monotonic()
+            if remaining is not None:
+                detail["semantic_remaining_ms"] = max(0, int(remaining * 1000))
+            phase_timings: dict[str, int] = {}
+
+            def semantic_work() -> Any:
+                return self.semantic_retriever.search(
                     project_id,
                     query,
                     top_k=SEMANTIC_CANDIDATE_COUNT,
@@ -109,28 +127,56 @@ class HybridRetriever:
                     language=language,
                     symbol=symbol,
                     local_files_only=True,
-                    check_active=check_active,
-                    diagnostics_recorder=diagnostics_recorder,
+                    # Native model work cannot be interrupted reliably. It
+                    # must never mutate the request recorder or EvidenceStore.
+                    check_active=None if semantic_deadline_at is not None else check_active,
+                    diagnostics_recorder=None if semantic_deadline_at is not None else diagnostics_recorder,
+                    phase_timings=phase_timings,
                 )
+
+            try:
+                if semantic_deadline_at is None:
+                    semantic_outcome = semantic_work()
+                    semantic = semantic_outcome.results
+                    warnings.extend(semantic_outcome.warnings)
+                    detail["semantic_status"] = "completed"
+                else:
+                    status, semantic_outcome, wait_ms = run_bounded_semantic(
+                        self.embedding_service, semantic_work,
+                        deadline_at=semantic_deadline_at, check_active=check_active,
+                    )
+                    detail["semantic_status"] = status
+                    if wait_ms is not None:
+                        detail["semantic_wait_ms"] = wait_ms
+                    if semantic_outcome is not None:
+                        semantic = semantic_outcome.results
+                        warnings.extend(semantic_outcome.warnings)
                 _check(check_active)
-                semantic = semantic_outcome.results
-                warnings.extend(semantic_outcome.warnings)
-            except Exception as exc:
+            except SemanticCapacityUnavailable:
+                detail["semantic_status"] = "capacity"
+            except (EmbeddingError, SemanticDataError, OSError):
                 _check(check_active)
-                warnings.append(
-                    f"Semantic retrieval unavailable; using lexical code-chunk search: "
-                    f"{type(exc).__name__}."
-                )
+                detail["semantic_status"] = "failed"
+            detail.update(dict(phase_timings))
+            if detail["model_state"] != "ready" and "model_identity_ms" in detail:
+                detail["model_load_ms"] = detail["model_identity_ms"]
+            detail["model_state"] = getattr(self.embedding_service, "model_load_state", "unknown")
+            if detail.get("semantic_status") != "completed":
+                warnings.append("Semantic retrieval did not complete; continuing with lexical code-chunk candidates.")
         else:
+            detail["semantic_status"] = "disabled"
             warnings.append(
                 "Embeddings are disabled; using lexical code-chunk search."
             )
 
+        revision_read_started = time.monotonic()
         current_revisions = {
             str(chunk["repository_revision"])
             for chunk in self.database.get_code_chunks(project_id)
         }
+        detail["revision_read_ms"] = int((time.monotonic() - revision_read_started) * 1000)
         _check(check_active)
+        fusion_started = time.monotonic()
         valid_semantic = []
         for item in semantic:
             if (
@@ -212,6 +258,10 @@ class HybridRetriever:
         for rank, result in enumerate(results, start=1):
             result.fusion_rank = rank
         mode = "hybrid" if valid_semantic else "lexical"
+        detail["fusion_ms"] = int((time.monotonic() - fusion_started) * 1000)
+        detail["retrieval_source"] = mode
+        if diagnostics_recorder is not None:
+            diagnostics_recorder.record_retrieval_detail(detail)
         return HybridSearchOutcome(
             results=results[:limit],
             retrieval_mode=mode,
@@ -222,6 +272,45 @@ class HybridRetriever:
 def _check(callback: Callable[[], None] | None) -> None:
     if callback is not None:
         callback()
+
+
+def run_bounded_semantic(
+    embedding_service: EmbeddingService,
+    work: Callable[[], Any],
+    *,
+    deadline_at: float,
+    check_active: Callable[[], None] | None,
+) -> tuple[str, Any | None, int | None]:
+    """Stop waiting before the tool cutoff; native work may finish later."""
+    _check(check_active)
+    remaining = deadline_at - time.monotonic()
+    reserve = min(1.0, max(0.02, remaining * 0.1))
+    if remaining <= reserve:
+        return "skipped_budget", None, None
+    if not hasattr(embedding_service, "submit_semantic_work"):
+        return "capacity", None, None
+    try:
+        future = embedding_service.submit_semantic_work(work)
+    except SemanticCapacityUnavailable:
+        return "capacity", None, None
+    cutoff = deadline_at - reserve
+    started = time.monotonic()
+    while True:
+        _check(check_active)
+        left = cutoff - time.monotonic()
+        if left <= 0:
+            return "timed_out", None, int((time.monotonic() - started) * 1000)
+        try:
+            outcome = future.result(timeout=min(0.05, left))
+        except FutureTimeout:
+            if future.done():
+                raise
+            continue
+        _check(check_active)
+        waited = int((time.monotonic() - started) * 1000)
+        if time.monotonic() >= cutoff:
+            return "timed_out", None, waited
+        return "completed", outcome, waited
 
 
 def _identity(item: Any) -> tuple[Any, ...]:

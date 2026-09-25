@@ -5,6 +5,7 @@ from pathlib import Path
 
 from app.database import Database
 from app.services.hybrid_retriever import HybridRetriever, RRF_K
+from app.services.embedding_service import EmbeddingModelLoadError
 from app.services.semantic_retriever import SemanticSearchOutcome, SemanticSearchResult
 from tests.m1_helpers import disabled_embedding_service, make_project
 
@@ -114,10 +115,18 @@ class HybridRetrieverTests(unittest.TestCase):
         failed = HybridRetriever(
             self.db,
             self.enabled_service,
-            semantic_retriever=FakeSemanticRetriever(error=RuntimeError("boom")),
+            semantic_retriever=FakeSemanticRetriever(error=EmbeddingModelLoadError("unavailable")),
         ).search(self.project_id, "authenticate_user")
         self.assertEqual(failed.retrieval_mode, "lexical")
-        self.assertIn("RuntimeError", failed.warnings[0])
+        self.assertIn("Semantic retrieval did not complete", failed.warnings[0])
+
+    def test_unexpected_semantic_programming_error_is_not_silenced(self):
+        retriever = HybridRetriever(
+            self.db, self.enabled_service,
+            semantic_retriever=FakeSemanticRetriever(error=RuntimeError("unexpected")),
+        )
+        with self.assertRaises(RuntimeError):
+            retriever.search(self.project_id, "authenticate_user")
 
     def test_wrong_project_or_revision_semantic_result_is_rejected(self):
         wrong = semantic_result(self.chunks["upload_file"], "other-project", 1.0)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+import asyncio
 from collections.abc import Iterator, Mapping, Sequence, Set
 import json
 import logging
@@ -12,6 +13,7 @@ from typing import Any, Callable, Literal
 import uuid
 
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Query
+from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import (
     BaseModel,
@@ -32,6 +34,7 @@ from app.config import (
 from app.database import Database, SCHEMA_VERSION
 from app.services.analyzer import analyze_snapshot
 from app.services.agent_core import run_bounded_agent, validate_non_blank_question
+from app.services.ask_progress import ProgressRecorder
 from app.services.agent_contracts import (
     RequestBudget,
     normalize_repository_relative_path,
@@ -228,6 +231,50 @@ def _prepare_ask_success_diagnostics(
         }
 
 
+def _ask_execution_summary(result: dict[str, Any], snapshot: dict[str, Any]) -> dict[str, Any]:
+    """Small request-local public projection; never derive counts from trimmed detail lists."""
+    summary: dict[str, Any] = {
+        "status": result["agent_status"],
+        "answer_mode": result["answer_mode"],
+        "evidence_count": len(result["evidence"]),
+        "citation_count": len(result["citations"]),
+    }
+    for key in (
+        "planner_requests_attempted", "planner_repair_attempts",
+        "provider_logical_calls", "provider_http_attempt_count",
+        "tool_calls_attempted", "tool_calls_succeeded", "tool_calls_failed",
+        "planner_duration_ms", "tool_duration_ms", "finalization_duration_ms",
+    ):
+        value = snapshot.get(key)
+        if isinstance(value, int) and not isinstance(value, bool) and 0 <= value <= 1_000_000:
+            summary[key] = value
+    budget = result.get("budget_usage")
+    if isinstance(budget, dict):
+        for source, target in (("steps_used", "steps_used"), ("tool_calls_used", "tool_calls_used"), ("elapsed_ms", "agent_elapsed_ms")):
+            value = budget.get(source)
+            if isinstance(value, int) and not isinstance(value, bool) and 0 <= value <= 1_000_000:
+                summary[target] = value
+    base = snapshot.get("base_retrieval")
+    if isinstance(base, dict) and isinstance(base.get("attempted"), bool) and isinstance(base.get("status"), str):
+        summary["base_retrieval"] = {
+            "attempted": base["attempted"], "status": base["status"],
+            "new_evidence_count": base["new_evidence_count"],
+        }
+        if isinstance(base.get("retrieval_detail"), dict):
+            summary["base_retrieval"]["retrieval_detail"] = base["retrieval_detail"]
+    reason = snapshot.get("planner_enhancement_termination_reason")
+    if isinstance(reason, str):
+        summary["planner_termination_reason"] = reason
+    for key in ("citation_validation_passed", "relation_validation_passed", "post_generation_validation_passed"):
+        if key == "relation_validation_passed" and not result.get("evidence_chains"):
+            continue
+        if snapshot.get(f"{key.removesuffix('_passed')}_completed") is True and isinstance(snapshot.get(key), bool):
+            summary[key] = snapshot[key]
+    if snapshot.get("diagnostics_truncated") is True:
+        summary["diagnostics_truncated"] = True
+    return summary
+
+
 @asynccontextmanager
 async def app_lifespan(_app: FastAPI):
     database = _initialize_runtime_value(db)
@@ -263,6 +310,9 @@ class AnalyzeRequest(BaseModel):
 
 class AskRequest(BaseModel):
     question: str = Field(..., min_length=1)
+    execution_mode: Literal["rag", "agent"] = "agent"
+    client_request_id: str | None = Field(default=None, min_length=1, max_length=64)
+    repository_revision: str | None = None
     path: str | None = None
     language: str | None = None
     symbol: str | None = None
@@ -297,6 +347,7 @@ class AskRequest(BaseModel):
 
 
 class CitationResponse(BaseModel):
+    evidence_id: str | None = None
     path: str
     summary: str
     snippet: str
@@ -345,12 +396,49 @@ class EvidenceChainResponse(BaseModel):
     truncated: bool
 
 
+class BaseRetrievalSummaryResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    attempted: bool
+    status: str
+    new_evidence_count: int = Field(ge=0)
+    retrieval_detail: dict[str, int | str] | None = None
+
+
+class ExecutionSummaryResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    status: str
+    answer_mode: str
+    evidence_count: int = Field(ge=0)
+    citation_count: int = Field(ge=0)
+    base_retrieval: BaseRetrievalSummaryResponse | None = None
+    planner_requests_attempted: int | None = Field(default=None, ge=0)
+    planner_repair_attempts: int | None = Field(default=None, ge=0)
+    provider_logical_calls: int | None = Field(default=None, ge=0)
+    provider_http_attempt_count: int | None = Field(default=None, ge=0)
+    tool_calls_attempted: int | None = Field(default=None, ge=0)
+    tool_calls_succeeded: int | None = Field(default=None, ge=0)
+    tool_calls_failed: int | None = Field(default=None, ge=0)
+    steps_used: int | None = Field(default=None, ge=0)
+    tool_calls_used: int | None = Field(default=None, ge=0)
+    agent_elapsed_ms: int | None = Field(default=None, ge=0)
+    planner_duration_ms: int | None = Field(default=None, ge=0)
+    tool_duration_ms: int | None = Field(default=None, ge=0)
+    finalization_duration_ms: int | None = Field(default=None, ge=0)
+    planner_termination_reason: str | None = None
+    citation_validation_passed: bool | None = None
+    relation_validation_passed: bool | None = None
+    post_generation_validation_passed: bool | None = None
+    diagnostics_truncated: bool | None = None
+
+
 class AskResponse(BaseModel):
     model_config = ConfigDict(hide_input_in_errors=True)
 
     request_id: str = Field(..., min_length=1, max_length=64)
+    execution_mode: Literal["rag", "agent"] = "agent"
     answer: str
     citations: list[CitationResponse]
+    execution_summary: ExecutionSummaryResponse | None = None
     evidence_schema_version: Literal[1]
     evidence: list[EvidenceResponse]
     grounding_status: Literal["grounded", "insufficient_evidence", "degraded"]
@@ -381,6 +469,25 @@ class AskResponse(BaseModel):
     recommended_next_action: dict[str, Any] | None
     learning_warnings: list[str]
     answer_mode: Literal["llm_grounded", "deterministic"]
+
+    @model_validator(mode="after")
+    def validate_public_citation_binding(self) -> "AskResponse":
+        by_id = {item.evidence_id: item for item in self.evidence}
+        for citation in self.citations:
+            if citation.evidence_id is None:
+                continue  # Old response shape remains readable.
+            item = by_id.get(citation.evidence_id)
+            if (
+                item is None
+                or citation.path != item.path
+                or citation.qualified_name != (item.qualified_name or item.symbol_name)
+                or citation.start_line < item.start_line
+                or citation.end_line > item.end_line
+                or citation.start_line < 1
+                or citation.end_line < citation.start_line
+            ):
+                raise ValueError("public citation Evidence binding is invalid")
+        return self
 
     @model_validator(mode="before")
     @classmethod
@@ -1105,11 +1212,19 @@ def get_project(project_id: str) -> dict[str, Any]:
 def get_project_map(project_id: str) -> dict[str, Any]:
     bundle = _bundle_or_404(project_id)
     analysis = bundle.get("analysis", {})
+    project = bundle["project"]
     return {
+        "project_id": project["id"],
+        "repository_revision": project.get("repository_revision", ""),
+        "coverage": "analyzed_files",
+        "file_count": len(bundle.get("files", [])),
         "tree": analysis.get("tree", {}),
         "modules": bundle.get("modules", []),
         "dependency_edges": analysis.get("dependency_edges", []),
-        "core_files": [file for file in bundle.get("files", []) if file.get("is_core")],
+        "core_files": [
+            {key: file.get(key) for key in ("path", "extension", "language", "size", "summary", "importance", "is_core", "imports", "exports", "symbols")}
+            for file in bundle.get("files", []) if file.get("is_core")
+        ],
     }
 
 
@@ -1121,15 +1236,27 @@ def get_learning_path(project_id: str) -> dict[str, Any]:
 
 @app.post("/api/projects/{project_id}/ask", response_model=AskResponse)
 def ask_project(project_id: str, request: AskRequest) -> dict[str, Any]:
+    return _execute_ask(project_id, request)
+
+
+def _execute_ask(
+    project_id: str,
+    request: AskRequest,
+    *,
+    recorder: SmokeDiagnosticsRecorder | None = None,
+    request_id: str | None = None,
+) -> dict[str, Any]:
     started = time.monotonic()
-    request_id = str(uuid.uuid4())
-    recorder = SmokeDiagnosticsRecorder()
+    request_id = request_id or str(uuid.uuid4())
+    recorder = recorder or SmokeDiagnosticsRecorder()
     request_budget = RequestBudget.create(started_at=started, limits=agent_limits)
     recorder.begin_request(
         deadline_budget_ms=request_budget.total_budget_ms,
         remaining_ms=request_budget.request_remaining_ms(started),
     )
     bundle = _bundle_or_404(project_id)
+    if request.repository_revision is not None and bundle["project"].get("repository_revision") != request.repository_revision:
+        raise HTTPException(status_code=409, detail="项目版本已变化，请重新打开项目。")
     product_project = bundle["project"].get("source_type") in {"local", "git_url"}
     if product_project:
         try:
@@ -1189,6 +1316,7 @@ def ask_project(project_id: str, request: AskRequest) -> dict[str, Any]:
             request_id=request_id,
             request_budget=request_budget,
             allow_planner_failure_fallback=not product_project,
+            execution_mode=request.execution_mode,
         )
     except ProviderError as exc:
         now = time.monotonic()
@@ -1240,6 +1368,18 @@ def ask_project(project_id: str, request: AskRequest) -> dict[str, Any]:
             ),
             detail=detail,
         ) from exc
+    except ValueError as exc:
+        recorder.record_route_elapsed(int((time.monotonic() - started) * 1000))
+        detail = build_ask_failure_detail(
+            result={"request_id": request_id},
+            recorder_snapshot=recorder.snapshot(),
+            retrieval_version=request.retrieval_version,
+            hierarchy_mode=request.hierarchy_mode,
+            relation_mode=request.relation_mode,
+            terminal_reason="response_contract_invalid",
+        )
+        _log_ask_failure(detail)
+        raise HTTPException(status_code=500, detail=detail) from exc
     recorder.record_route_elapsed(int((time.monotonic() - started) * 1000))
     recorder_snapshot = recorder.snapshot()
     if ask_result_is_failure(
@@ -1259,6 +1399,10 @@ def ask_project(project_id: str, request: AskRequest) -> dict[str, Any]:
         raise HTTPException(status_code=status_code, detail=detail)
     response_candidate = dict(result)
     response_candidate["request_id"] = request_id
+    response_candidate["execution_mode"] = request.execution_mode
+    response_candidate["execution_summary"] = _ask_execution_summary(
+        result, recorder_snapshot
+    )
     try:
         initially_validated_response = AskResponse.model_validate(response_candidate)
         serialized_response = initially_validated_response.model_dump_json()
@@ -1350,6 +1494,63 @@ def ask_project(project_id: str, request: AskRequest) -> dict[str, Any]:
         # filters, formatters, and serializers are best-effort after it.
         pass
     return validated_payload
+
+
+@app.post("/api/projects/{project_id}/ask/stream")
+async def ask_project_stream(project_id: str, request: AskRequest) -> StreamingResponse:
+    """One execution, with request-private safe NDJSON progress frames."""
+    loop = asyncio.get_running_loop()
+    events: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    connected = True
+    sequence = 0
+    server_request_id = str(uuid.uuid4())
+    project = db.get_project(project_id)
+    revision = project.get("repository_revision", "") if project else ""
+
+    def emit(kind: str, details: dict[str, Any]) -> None:
+        nonlocal sequence
+        if not connected:
+            return
+        sequence += 1
+        frame = {
+            "request_id": server_request_id,
+            "client_request_id": request.client_request_id,
+            "project_id": project_id,
+            "repository_revision": revision,
+            "sequence": sequence,
+            "type": kind,
+            **details,
+        }
+        loop.call_soon_threadsafe(events.put_nowait, frame)
+
+    def run() -> None:
+        recorder = ProgressRecorder(emit)
+        emit("request_received", {})
+        try:
+            result = _execute_ask(project_id, request, recorder=recorder, request_id=server_request_id)
+            emit("completed", {"result": result})
+        except HTTPException as exc:
+            detail = exc.detail if isinstance(exc.detail, dict) else None
+            emit("failed", {"failure": detail, "status": exc.status_code})
+        except Exception:
+            emit("failed", {"failure": None, "status": 500})
+
+    async def frames():
+        nonlocal connected
+        worker = asyncio.create_task(asyncio.to_thread(run))
+        try:
+            while True:
+                event = await events.get()
+                yield json.dumps(event, ensure_ascii=False, separators=(",", ":")) + "\n"
+                if event["type"] in {"completed", "failed"}:
+                    break
+        finally:
+            connected = False
+            # A disconnected browser cannot prove cancellation of a running Provider call.
+            # The worker owns the original request and is allowed to finish once.
+            worker.add_done_callback(lambda done: done.exception() if not done.cancelled() else None)
+
+    return StreamingResponse(frames(), media_type="application/x-ndjson", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
 @app.post(

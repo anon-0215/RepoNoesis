@@ -5,9 +5,10 @@ import importlib.util
 import json
 import math
 import re
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
-from threading import RLock
+from threading import BoundedSemaphore, RLock
 from typing import Any, Callable, Protocol, Sequence
 
 from app.config import EmbeddingSettings, clamp_embedding_max_length, get_embedding_settings
@@ -37,6 +38,10 @@ class EmbeddingModelLoadError(EmbeddingError):
 
 
 class EmbeddingEncodeError(EmbeddingError):
+    pass
+
+
+class SemanticCapacityUnavailable(EmbeddingError):
     pass
 
 
@@ -233,6 +238,38 @@ class EmbeddingService:
         self._identity: EmbeddingModelIdentity | None = None
         self._dimension: int | None = None
         self._lock = RLock()
+        # A timed-out native load/encode may keep running. Slots remain held
+        # until that work really exits; no request-owned results are shared.
+        self._semantic_slots = BoundedSemaphore(2)
+        self._semantic_executor: ThreadPoolExecutor | None = None
+        self._semantic_executor_lock = RLock()
+        self._load_state = "unready"
+
+    @property
+    def model_load_state(self) -> str:
+        return self._load_state
+
+    def submit_semantic_work(self, work: Callable[[], Any]) -> Future[Any]:
+        if not self._semantic_slots.acquire(blocking=False):
+            raise SemanticCapacityUnavailable("semantic workers are occupied")
+        try:
+            with self._semantic_executor_lock:
+                if self._semantic_executor is None:
+                    self._semantic_executor = ThreadPoolExecutor(
+                        max_workers=2, thread_name_prefix="rn-semantic"
+                    )
+                executor = self._semantic_executor
+
+            def run() -> Any:
+                try:
+                    return work()
+                finally:
+                    self._semantic_slots.release()
+
+            return executor.submit(run)
+        except BaseException:
+            self._semantic_slots.release()
+            raise
 
     def load_model(
         self,
@@ -258,11 +295,12 @@ class EmbeddingService:
                 device,
                 self.settings.model_revision,
             )
-            backend = self._backend_factory()
-            if isinstance(backend, SentenceTransformerEmbeddingBackend):
-                backend.local_files_only = local_files_only
             try:
                 _check_active(check_active)
+                self._load_state = "loading"
+                backend = self._backend_factory()
+                if isinstance(backend, SentenceTransformerEmbeddingBackend):
+                    backend.local_files_only = local_files_only
                 backend.load_model(
                     self.settings.model_name_or_path,
                     device,
@@ -271,8 +309,10 @@ class EmbeddingService:
                     self.settings.model_revision,
                 )
             except EmbeddingError:
+                self._load_state = "failed"
                 raise
             except Exception as exc:
+                self._load_state = "failed"
                 suffix = (
                     "; offline mode is enabled, so place BGE-M3 in the configured local path or cache"
                     if local_files_only
@@ -287,16 +327,17 @@ class EmbeddingService:
             configured_commit = _normalize_commit_sha(identity.configured_revision)
             if backend_revision is not None:
                 if configured_commit is not None and backend_revision != configured_commit:
+                    self._load_state = "failed"
                     raise EmbeddingModelLoadError(
                         "loaded embedding revision does not match configured revision"
                     )
                 if resolved_revision is not None and backend_revision != resolved_revision:
+                    self._load_state = "failed"
                     raise EmbeddingModelLoadError(
                         "loaded embedding revision does not match verified local snapshot"
                     )
                 resolved_revision = backend_revision
-            self._backend = backend
-            self._identity = EmbeddingModelIdentity(
+            loaded_identity = EmbeddingModelIdentity(
                 identity.model_name,
                 _compose_model_identity(
                     identity.model_name,
@@ -309,7 +350,15 @@ class EmbeddingService:
                 resolved_revision,
                 identity.local_snapshot_identity,
             )
-            self._dimension = backend.get_embedding_dimension()
+            try:
+                dimension = backend.get_embedding_dimension()
+            except Exception as exc:
+                self._load_state = "failed"
+                raise EmbeddingModelLoadError("embedding dimension is unavailable") from exc
+            self._identity = loaded_identity
+            self._dimension = dimension
+            self._backend = backend
+            self._load_state = "ready"
 
     def encode_documents(
         self,
@@ -432,6 +481,7 @@ class EmbeddingService:
             self._backend = None
             self._identity = None
             self._dimension = None
+            self._load_state = "unready"
 
     def is_available(self) -> bool:
         if not self.settings.enabled:

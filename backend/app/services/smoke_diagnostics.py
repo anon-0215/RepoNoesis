@@ -261,6 +261,7 @@ class SmokeDiagnosticsRecorder:
         self._tool_calls: dict[str, dict[str, int | str]] = {}
         self._tool_executions: list[dict[str, Any]] = []
         self._base_retrieval: dict[str, Any] | None = None
+        self._retrieval_detail: dict[str, Any] = {}
         self._planner_enhancement_termination: str | None = None
         self._planner_attempts: list[dict[str, Any]] = []
         self._final_answer_protocol_failure: dict[str, Any] | None = None
@@ -525,11 +526,18 @@ class SmokeDiagnosticsRecorder:
                 "new_evidence_count": new_evidence_count,
                 "rejected_candidate_count": rejected_candidate_count,
                 "rejection_code_counts": rejection_code_counts,
+                "retrieval_detail": self._retrieval_detail,
             }
         )
         if safe is None:
             raise ValueError("unsupported base retrieval diagnostics")
         self._base_retrieval = safe
+
+    def record_retrieval_detail(self, detail: dict[str, Any]) -> None:
+        self._retrieval_detail = _safe_retrieval_detail(detail)
+
+    def record_evidence_promotion_ms(self, duration_ms: int) -> None:
+        self._retrieval_detail["promotion_ms"] = _bounded_duration(duration_ms)
 
     def record_planner_enhancement_termination(self, reason: str) -> None:
         """Record a fixed, content-free optional-enhancement stop reason."""
@@ -587,6 +595,7 @@ class SmokeDiagnosticsRecorder:
     def record_final_answer_attempt(self) -> None:
         self.enter_stage("final_answer")
         self._agent["final_answer_attempted"] = True
+        self._agent["final_answer_repair_attempted"] = False
 
     def record_final_answer_protocol_failure(self, value: dict[str, Any]) -> None:
         """Record one content-free structured-answer rejection."""
@@ -1186,7 +1195,7 @@ def _safe_base_retrieval(value: Any) -> dict[str, Any] | None:
             count = rejection_counts.get(code)
             if isinstance(count, int) and not isinstance(count, bool) and count > 0:
                 safe_rejections[code] = _bounded_count(count)
-    return {
+    result = {
         "attempted": attempted,
         "status": status,
         "retrieval_hit_count": _bounded_count(value.get("retrieval_hit_count")),
@@ -1200,6 +1209,34 @@ def _safe_base_retrieval(value: Any) -> dict[str, Any] | None:
         ),
         "rejection_code_counts": safe_rejections,
     }
+    detail = _safe_retrieval_detail(value.get("retrieval_detail"))
+    if detail:
+        result["retrieval_detail"] = detail
+    return result
+
+
+def _safe_retrieval_detail(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    result: dict[str, Any] = {}
+    for key in (
+        "lexical_ms", "lexical_hit_count", "semantic_remaining_ms",
+        "semantic_wait_ms", "model_identity_ms", "model_load_ms",
+        "vector_read_ms", "query_encode_ms", "vector_score_ms", "revision_read_ms",
+        "fusion_ms", "promotion_ms",
+    ):
+        item = value.get(key)
+        if isinstance(item, int) and not isinstance(item, bool) and item >= 0:
+            result[key] = _bounded_duration(item)
+    for key, allowed in (
+        ("model_state", {"unready", "loading", "ready", "failed", "unknown"}),
+        ("model_state_at_start", {"unready", "loading", "ready", "failed", "unknown"}),
+        ("semantic_status", {"completed", "skipped_budget", "timed_out", "capacity", "failed", "disabled"}),
+        ("retrieval_source", {"hybrid", "lexical", "lexical_symbol", "symbol"}),
+    ):
+        if value.get(key) in allowed:
+            result[key] = value[key]
+    return result
 
 
 def _safe_provider_metadata(value: Any) -> dict[str, Any]:
