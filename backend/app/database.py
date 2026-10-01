@@ -14,7 +14,7 @@ from app.config import get_database_path, get_env_value
 from app.learning_schema import LEARNING_SCHEMA_STATEMENTS
 
 
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 12
 CODE_CHUNKER_VERSION = "python_ast_chunks_v1@1"
 LEARNING_CONTINUITY_CONFIG_IDENTITY = "learning-continuity-v1@1"
 LOCAL_CONTINUITY_LEARNER_ID = "learner-local-single-user-v1"
@@ -112,6 +112,8 @@ CREATE TABLE IF NOT EXISTS chat_answers (
     answer TEXT NOT NULL,
     citations_json TEXT DEFAULT '[]',
     created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    repository_revision TEXT,
+    recovery_metadata_json TEXT,
     FOREIGN KEY(project_id) REFERENCES projects(id)
 );
 
@@ -310,6 +312,11 @@ class Database:
                 conn.commit()
 
     def _migrate_schema(self, conn: sqlite3.Connection) -> None:
+        chat_columns = {row["name"] for row in conn.execute("PRAGMA table_info(chat_answers)")}
+        for column in ("repository_revision", "recovery_metadata_json"):
+            if column not in chat_columns:
+                conn.execute(f"ALTER TABLE chat_answers ADD COLUMN {column} TEXT")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_chat_answers_project_id ON chat_answers(project_id, id DESC)")
         project_columns = {
             row["name"]
             for row in conn.execute("PRAGMA table_info(projects)").fetchall()
@@ -2712,15 +2719,85 @@ class Database:
         question: str,
         answer: str,
         citations: list[dict[str, Any]],
-    ) -> None:
+        *,
+        repository_revision: str | None = None,
+        recovery_metadata: dict[str, Any] | None = None,
+    ) -> dict[str, str]:
+        from app.services.chat_history import RecoveryMetadata, bindings_match
+
+        metadata_json = None
+        if recovery_metadata is not None:
+            metadata = RecoveryMetadata.model_validate(recovery_metadata)
+            if not bindings_match(metadata, citations, project_id, repository_revision):
+                raise ValueError("saved citation binding is invalid")
+            metadata_json = metadata.model_dump_json()
+        citations_json = json.dumps(citations, ensure_ascii=False, allow_nan=False)
         with self.connect() as conn:
-            conn.execute(
+            cursor = conn.execute(
                 """
-                INSERT INTO chat_answers (project_id, question, answer, citations_json)
-                VALUES (?, ?, ?, ?)
+                INSERT INTO chat_answers (project_id, question, answer, citations_json,
+                                          repository_revision, recovery_metadata_json)
+                VALUES (?, ?, ?, ?, ?, ?)
                 """,
-                (project_id, question, answer, json.dumps(citations, ensure_ascii=False)),
+                (project_id, question, answer, citations_json, repository_revision, metadata_json),
             )
+            row = conn.execute("SELECT id, created_at FROM chat_answers WHERE id=?", (cursor.lastrowid,)).fetchone()
+            identity = {"record_id": str(row["id"]), "created_at": row["created_at"]}
+        return identity
+
+    def read_chat_history(self, workspace_id: str, active_project_id: str, revision: str,
+                          *, limit: int = 20, cursor: str | None = None,
+                          activation_version: int | None = None) -> dict[str, Any]:
+        from app.services.chat_history import ChatHistoryError, HistoryCursor, project_history_record
+
+        if not 1 <= limit <= 50:
+            raise ChatHistoryError("history_pagination_invalid", 422)
+        page_cursor = HistoryCursor.decode(cursor) if cursor is not None else None
+        with self.connect() as conn:
+            conn.execute("PRAGMA query_only = ON")
+            conn.execute("BEGIN")
+            context = conn.execute("""
+                SELECT w.active_project_id, w.activation_version, p.repository_revision,
+                       p.status, wr.repository_revision AS linked_revision, wr.activation_status
+                FROM repository_workspaces w
+                LEFT JOIN projects p ON p.id=w.active_project_id
+                LEFT JOIN workspace_revisions wr ON wr.workspace_id=w.id AND wr.project_id=w.active_project_id
+                WHERE w.id=?""", (workspace_id,)).fetchone()
+            if context is None:
+                raise ChatHistoryError("history_workspace_not_found", 404)
+            if (context["active_project_id"] != active_project_id or context["repository_revision"] != revision
+                    or activation_version is not None and context["activation_version"] != activation_version):
+                raise ChatHistoryError("history_context_changed", 409)
+            if (context["status"] != "done" or context["activation_status"] != "active"
+                    or context["linked_revision"] != revision):
+                raise ChatHistoryError("history_workspace_unavailable", 409)
+            scope = {
+                "workspace_id": workspace_id, "active_project_id": active_project_id,
+                "repository_revision": revision, "activation_version": context["activation_version"],
+            }
+            if page_cursor and any(getattr(page_cursor, key) != value for key, value in scope.items()):
+                raise ChatHistoryError("history_cursor_context_mismatch", 422)
+            # Every page repeats this exact ownership/status scope. The cursor never grants access.
+            query = """FROM chat_answers ca
+                       JOIN projects p ON p.id=ca.project_id
+                       JOIN workspace_revisions wr ON wr.project_id=p.id
+                       WHERE wr.workspace_id=? AND wr.activation_status IN ('active','superseded')
+                             AND p.status='done'"""
+            if page_cursor:
+                anchor, before = int(page_cursor.anchor_id), int(page_cursor.before_id)
+            else:
+                anchor = conn.execute("SELECT COALESCE(MAX(ca.id),0) " + query, (workspace_id,)).fetchone()[0]
+                before = None
+            rows = conn.execute(
+                "SELECT ca.*, p.repository_revision AS project_revision, wr.repository_revision AS linked_revision, "
+                "wr.activation_status " + query + " AND ca.id<=?" + (" AND ca.id<?" if before is not None else "")
+                + " ORDER BY ca.id DESC LIMIT ?",
+                (workspace_id, anchor, *((before,) if before is not None else ()), limit + 1),
+            ).fetchall()
+            items = [project_history_record(dict(row), active_project_id) for row in rows[:limit]]
+            next_cursor = (HistoryCursor(**scope, anchor_id=str(anchor), before_id=str(rows[limit - 1]["id"])).encode()
+                           if len(rows) > limit else None)
+            return {**scope, "items": items, "next_cursor": next_cursor}
 
     @staticmethod
     def _json(value: str, fallback: Any) -> Any:

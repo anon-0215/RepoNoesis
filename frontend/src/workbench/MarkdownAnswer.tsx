@@ -61,7 +61,7 @@ export function MarkdownAnswer({ text, onExpandCode, bindings, selectedEvidenceI
             if (!binding || !onEvidence) return <span>{children}</span>;
             const citation = binding.citations[0];
             const hint = binding.citations.length > 1 ? `${id} · ${binding.citations.length} 个片段，请选择` : `${id} · ${citation.path} · ${citation.qualified_name} · 行 ${citation.start_line}–${citation.end_line}`;
-            return <button className="wb-evidence-marker" type="button" title={hint} aria-label={`查看证据 ${id}${binding.citations.length > 1 ? `，${binding.citations.length} 个片段` : ''}`} aria-pressed={selectedEvidenceId === id} onClick={(event) => onEvidence(id, event.currentTarget)}>{children}</button>;
+            return <button className="wb-evidence-marker" type="button" title={hint} aria-label={`${binding.source === 'saved_binding' ? '查看保存引用' : '查看证据'} ${id}${binding.citations.length > 1 ? `，${binding.citations.length} 个片段` : ''}`} aria-pressed={selectedEvidenceId === id} onClick={(event) => onEvidence(id, event.currentTarget)}>{children}</button>;
           }
           const safe = safeHref(href);
           return safe ? <a href={safe} target="_blank" rel="noreferrer">{children}</a> : <span>{children}</span>;

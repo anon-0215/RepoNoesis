@@ -1,0 +1,9 @@
+.wb-history-controls{display:flex;align-items:center;flex-wrap:wrap;gap:10px;padding:12px 0;color:var(--wb-muted);font-size:12px;overflow-anchor:none}
+.wb-history-controls p{flex-basis:100%;margin:0}
+.wb-history-controls button{padding:6px 12px;border:1px solid var(--wb-line);border-radius:7px;background:var(--wb-surface);color:var(--wb-accent);cursor:pointer}
+.wb-history-controls button:disabled{opacity:.6;cursor:default}
+.wb-history-meta{display:grid;gap:5px;margin:10px 0;color:var(--wb-muted);font-size:12px;overflow-wrap:anywhere}
+.wb-history-meta p{margin:0}
+.wb-scroll{overflow-anchor:none}
+.wb-drawer-actions button:disabled{opacity:.55;cursor:default}
+.wb-drawer-actions p{font-size:12px;color:var(--wb-muted);line-height:1.6}

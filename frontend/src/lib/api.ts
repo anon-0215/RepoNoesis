@@ -2,6 +2,7 @@ import type {
   AskFailure,
   AskProgressEvent,
   ChatAnswer,
+  ChatHistoryPage,
   ExecutionMode,
   ConfigStatus,
   LearningStep,
@@ -16,6 +17,7 @@ import type {
 } from '../types';
 import { buildAnalyzePayload, type SourceType } from './product';
 import { sourceLines } from './sourceLines';
+import { compareRecordIds, isRecordId } from './chatHistory';
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL ?? 'http://127.0.0.1:8000';
 const SAFE_NETWORK_ERROR_MESSAGE = '无法连接后端服务。请确认后端已启动后重试。';
@@ -116,6 +118,12 @@ function optionalBoolean(value: unknown): boolean | undefined {
   return typeof value === 'boolean' ? value : undefined;
 }
 const SAFE_LEGACY_ERROR_MESSAGES: Readonly<Record<string, string>> = Object.freeze({
+  history_workspace_not_found: '历史所属项目不存在。',
+  history_context_changed: '项目版本已变化，请重新打开项目后加载历史。',
+  history_workspace_unavailable: '项目版本关联不可用，请重新打开项目。',
+  history_cursor_context_mismatch: '历史分页版本已变化，请重新打开项目。',
+  history_cursor_invalid: '历史分页信息无效，请重新打开项目。',
+  history_pagination_invalid: '历史分页参数无效。',
   source_path_invalid: '文件路径无效，无法读取。',
   source_revision_required: '缺少可靠的版本身份，无法读取。',
   source_project_not_found: '已保存项目不存在。',
@@ -474,6 +482,37 @@ export async function getProjectMap(projectId: string): Promise<ProjectMap> {
   return request(`/api/projects/${projectId}/map`);
 }
 
+export async function getChatHistory(workspaceId: string, projectId: string, revision: string,
+  cursor: string | null = null, activationVersion?: number, signal?: AbortSignal): Promise<ChatHistoryPage> {
+  const query = new URLSearchParams({ active_project_id: projectId, revision, limit: '20' });
+  if (cursor !== null) query.set('cursor', cursor);
+  if (activationVersion !== undefined) query.set('activation_version', String(activationVersion));
+  const page = await request<ChatHistoryPage>(`/api/workspaces/${encodeURIComponent(workspaceId)}/chat-history?${query}`, { signal });
+  if (!page || page.workspace_id !== workspaceId || page.active_project_id !== projectId || page.repository_revision !== revision ||
+      !Number.isInteger(page.activation_version) || page.activation_version < 1 ||
+      activationVersion !== undefined && page.activation_version !== activationVersion ||
+      !Array.isArray(page.items) || page.items.length > 20 ||
+      !(page.next_cursor === null || typeof page.next_cursor === 'string')) {
+    throw new ApiError('历史响应的项目或版本身份不一致，未展示。', 0);
+  }
+  for (let index = 0; index < page.items.length; index++) {
+    const item = page.items[index];
+    if (!isRecord(item) || !isRecordId(item.record_id) || typeof item.project_id !== 'string' ||
+        typeof item.question !== 'string' || typeof item.answer !== 'string' || !Array.isArray(item.citations) ||
+        !(item.repository_revision === null || typeof item.repository_revision === 'string') ||
+        !(item.created_at === null || typeof item.created_at === 'string') ||
+        !['reliable', 'missing', 'conflict'].includes(item.identity_status) ||
+        !['active', 'superseded'].includes(item.snapshot_status) ||
+        typeof item.is_current_snapshot !== 'boolean' || typeof item.full_file_available !== 'boolean' ||
+        item.is_current_snapshot && (item.project_id !== projectId || item.snapshot_status !== 'active') ||
+        item.full_file_available && (!item.is_current_snapshot || item.identity_status !== 'reliable' || item.repository_revision !== revision) ||
+        index > 0 && compareRecordIds(page.items[index - 1].record_id, item.record_id) <= 0) {
+      throw new ApiError('历史记录身份或排序无效，未展示。', 0);
+    }
+  }
+  return page;
+}
+
 export async function getSourceFile(projectId: string, revision: string, path: string, workspaceId: string, signal?: AbortSignal): Promise<SourceFile> {
   const query = new URLSearchParams({ revision, path });
   const result = await request<SourceFile>(`/api/projects/${encodeURIComponent(projectId)}/source-file?${query}`, { signal });
@@ -534,6 +573,7 @@ export async function askProjectStream(
     if (value.type === 'completed') {
       terminal = true;
       if (!isRecord(value.result) || value.result.execution_mode !== mode) throw new ApiError('服务端执行模式与提交模式不一致，答案未展示。', 0);
+      if (value.result.record_id != null && !isRecordId(value.result.record_id)) throw new ApiError('保存记录身份无效，最终状态未知。', 0);
       return value.result as unknown as ChatAnswer;
     }
     if (value.type === 'failed') {

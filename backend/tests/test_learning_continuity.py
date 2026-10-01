@@ -179,7 +179,7 @@ class LearningContinuityTests(unittest.TestCase):
         )
 
     def test_schema_v11_is_additive_and_keeps_immutable_event_triggers(self) -> None:
-        self.assertEqual(SCHEMA_VERSION, 11)
+        self.assertEqual(SCHEMA_VERSION, 12)
         with self.database.connect() as conn:
             tables = {row[0] for row in conn.execute(
                 "SELECT name FROM sqlite_master WHERE type='table'"
@@ -212,7 +212,7 @@ class LearningContinuityTests(unittest.TestCase):
         with migrated.connect() as conn:
             self.assertEqual(conn.execute(
                 "SELECT version FROM schema_versions WHERE key='database'"
-            ).fetchone()[0], 11)
+            ).fetchone()[0], 12)
             self.assertEqual(conn.execute(
                 "SELECT COUNT(*) FROM learning_continuity_transitions"
             ).fetchone()[0], 0)

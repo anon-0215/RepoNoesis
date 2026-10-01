@@ -35,6 +35,13 @@ from app.database import Database, SCHEMA_VERSION, SourceFileError
 from app.services.analyzer import analyze_snapshot
 from app.services.agent_core import run_bounded_agent, validate_non_blank_question
 from app.services.ask_progress import ProgressRecorder
+from app.services.chat_history import (
+    BaseRetrievalSummaryResponse,
+    ChatHistoryError,
+    ChatHistoryPage,
+    ExecutionSummaryResponse,
+    prepare_recovery_metadata,
+)
 from app.services.agent_contracts import (
     RequestBudget,
     normalize_repository_relative_path,
@@ -396,45 +403,12 @@ class EvidenceChainResponse(BaseModel):
     truncated: bool
 
 
-class BaseRetrievalSummaryResponse(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    attempted: bool
-    status: str
-    new_evidence_count: int = Field(ge=0)
-    retrieval_detail: dict[str, int | str] | None = None
-
-
-class ExecutionSummaryResponse(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    status: str
-    answer_mode: str
-    evidence_count: int = Field(ge=0)
-    citation_count: int = Field(ge=0)
-    base_retrieval: BaseRetrievalSummaryResponse | None = None
-    planner_requests_attempted: int | None = Field(default=None, ge=0)
-    planner_repair_attempts: int | None = Field(default=None, ge=0)
-    provider_logical_calls: int | None = Field(default=None, ge=0)
-    provider_http_attempt_count: int | None = Field(default=None, ge=0)
-    tool_calls_attempted: int | None = Field(default=None, ge=0)
-    tool_calls_succeeded: int | None = Field(default=None, ge=0)
-    tool_calls_failed: int | None = Field(default=None, ge=0)
-    steps_used: int | None = Field(default=None, ge=0)
-    tool_calls_used: int | None = Field(default=None, ge=0)
-    agent_elapsed_ms: int | None = Field(default=None, ge=0)
-    planner_duration_ms: int | None = Field(default=None, ge=0)
-    tool_duration_ms: int | None = Field(default=None, ge=0)
-    finalization_duration_ms: int | None = Field(default=None, ge=0)
-    planner_termination_reason: str | None = None
-    citation_validation_passed: bool | None = None
-    relation_validation_passed: bool | None = None
-    post_generation_validation_passed: bool | None = None
-    diagnostics_truncated: bool | None = None
-
-
 class AskResponse(BaseModel):
     model_config = ConfigDict(hide_input_in_errors=True)
 
     request_id: str = Field(..., min_length=1, max_length=64)
+    record_id: str | None = Field(default=None, pattern=r"^[1-9]\d*$")
+    created_at: str | None = None
     execution_mode: Literal["rag", "agent"] = "agent"
     answer: str
     citations: list[CitationResponse]
@@ -729,6 +703,24 @@ def get_workspace(workspace_id: str) -> dict[str, Any]:
                 "retryable": False,
             },
         ) from exc
+
+
+@app.get("/api/workspaces/{workspace_id}/chat-history", response_model=ChatHistoryPage)
+def get_chat_history(
+    workspace_id: str,
+    active_project_id: str = Query(..., min_length=1),
+    revision: str = Query(...),
+    activation_version: int | None = Query(default=None, ge=1),
+    limit: int = Query(default=20, ge=1, le=50),
+    cursor: str | None = Query(default=None, max_length=2048),
+) -> dict[str, Any]:
+    try:
+        return db.read_chat_history(workspace_id, active_project_id, revision, limit=limit,
+                                    cursor=cursor, activation_version=activation_version)
+    except ChatHistoryError as exc:
+        raise HTTPException(status_code=exc.status_code, detail={
+            "code": exc.code, "message": "Saved answer history is unavailable.", "retryable": False,
+        }) from exc
 
 
 def _update_service() -> WorkspaceUpdateService:
@@ -1280,6 +1272,8 @@ def _execute_ask(
     bundle = _bundle_or_404(project_id)
     if request.repository_revision is not None and bundle["project"].get("repository_revision") != request.repository_revision:
         raise HTTPException(status_code=409, detail="项目版本已变化，请重新打开项目。")
+    # Freeze this execution's original snapshot. Never re-read the active revision at save time.
+    saved_revision = bundle["project"].get("repository_revision", "")
     product_project = bundle["project"].get("source_type") in {"local", "git_url"}
     if product_project:
         try:
@@ -1431,6 +1425,7 @@ def _execute_ask(
         serialized_response = initially_validated_response.model_dump_json()
         validated_response = AskResponse.model_validate_json(serialized_response)
         validated_payload = json.loads(validated_response.model_dump_json())
+        recovery_metadata = prepare_recovery_metadata(validated_payload, project_id, saved_revision)
     except Exception as exc:
         now = time.monotonic()
         recorder.record_route_elapsed(int((now - started) * 1000))
@@ -1492,11 +1487,13 @@ def _execute_ask(
         _log_ask_failure(detail)
         raise HTTPException(status_code=504, detail=detail)
     try:
-        db.save_chat_answer(
+        saved_identity = db.save_chat_answer(
             project_id,
             request.question,
             validated_payload["answer"],
             validated_payload["citations"],
+            repository_revision=saved_revision,
+            recovery_metadata=recovery_metadata,
         )
     except Exception as exc:
         recorder.record_route_elapsed(int((time.monotonic() - started) * 1000))
@@ -1516,6 +1513,8 @@ def _execute_ask(
         # Persistence is the business terminal boundary. Logging handlers,
         # filters, formatters, and serializers are best-effort after it.
         pass
+    # Trusted SQLite primitives only. All fallible recovery validation happened before the INSERT.
+    validated_payload.update(saved_identity)
     return validated_payload
 
 

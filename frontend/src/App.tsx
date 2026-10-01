@@ -23,6 +23,7 @@ import './workbench/ask-experience.css';
 import './workbench/reading.css';
 import './workbench/reading-fixes.css';
 import './workbench/evidence-summary.css';
+import './workbench/history.css';
 import './workbench/reading-theme.css';
 import {
   ApiError,
@@ -44,6 +45,8 @@ import {
   startWorkspaceRefresh
 } from './lib/api';
 import { createRequestGate, type RequestToken } from './lib/requestGate';
+import { useChatHistory } from './lib/useChatHistory';
+import { historyAnswers, isRecordId } from './lib/chatHistory';
 import type { ExecutionMode } from './types';
 import {
   createConnectionStatusGate,
@@ -122,6 +125,9 @@ export default function App() {
   useEffect(() => () => { activeAskConnection.current?.abort(); }, [workspaceId, projectId, currentRevision]);
 
   const hasProject = Boolean(project && projectId);
+  const history = useChatHistory(requestGate.current.getContext(), askLoading,
+    () => activeAskConnection.current !== null);
+  const displayedAnswers = useMemo(() => historyAnswers(history.items, answers, workspaceId), [history.items, answers, workspaceId]);
   const updateState = workspaceUpdateState(revisionCheck, updateRun);
   const continuityState = learningContinuityState(continuity);
 
@@ -584,7 +590,8 @@ export default function App() {
       }, connection.signal);
       if (!requestGate.current.isCurrent(token)) return;
       setAnswers((current) => current.map((entry) => entry.id === entryId
-        ? { ...entry, status: 'success', result }
+        ? { ...entry, status: 'success', result, recordId: isRecordId(result.record_id) ? result.record_id : undefined,
+            createdAt: result.created_at ?? undefined }
         : entry));
       setQuestion('');
       setMessage('回答已生成，注意查看引用文件。');
@@ -630,7 +637,7 @@ export default function App() {
   }, [activeTab, analysisLoading, configStatus, continuity, continuityState, currentRevision, deletingProjectId, hasProject, libraryStatus, mapError, project, projectId, projectMap, report, revisionCheck, source, sourceType, updateRun, updateState, workspaceId, workspaceLoading, workspaces]);
 
   return <Workbench contextGeneration={requestGate.current.getContext().generation} project={project} workspaces={workspaces} workspaceId={workspaceId} revision={currentRevision} executionMode={executionMode} onExecutionModeChange={setExecutionMode}
-    question={question} answers={answers} error={askError} loading={askLoading}
+    question={question} answers={displayedAnswers} history={history} error={askError} loading={askLoading}
     libraryLoading={libraryStatus === 'loading'} projectLoading={workspaceLoading || analysisLoading}
     statusMessage={connectionError || message} activePage={activeTab}
     content={activeContent} onQuestionChange={setQuestion} onSubmit={handleAsk}

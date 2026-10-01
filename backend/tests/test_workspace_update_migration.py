@@ -93,10 +93,10 @@ class WorkspaceUpdateMigrationTests(unittest.TestCase):
         first = Database(self.path)
         second = Database(self.path)
         with second.connect() as conn:
-            self.assertEqual(SCHEMA_VERSION, 11)
+            self.assertEqual(SCHEMA_VERSION, 12)
             self.assertEqual(
                 conn.execute("SELECT version FROM schema_versions WHERE key='database'").fetchone()[0],
-                11,
+                12,
             )
             revision = conn.execute(
                 "SELECT activation_status, parent_project_id, manifest_hash, chunker_version "

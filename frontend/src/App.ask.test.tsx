@@ -14,6 +14,9 @@ vi.mock('./lib/api', async () => {
     checkWorkspaceRevision: vi.fn(),
     deleteProject: vi.fn(),
     getConfigStatus: vi.fn(),
+    getChatHistory: vi.fn((workspace_id, active_project_id, repository_revision) => Promise.resolve({
+      workspace_id, active_project_id, repository_revision, activation_version: 1, items: [], next_cursor: null,
+    })),
     getLearningContinuity: vi.fn(),
     getLearningPath: vi.fn(),
     getProject: vi.fn(),
