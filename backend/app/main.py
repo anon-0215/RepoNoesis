@@ -31,7 +31,7 @@ from app.config import (
     get_product_config_status,
     get_repository_settings,
 )
-from app.database import Database, SCHEMA_VERSION
+from app.database import Database, SCHEMA_VERSION, SourceFileError
 from app.services.analyzer import analyze_snapshot
 from app.services.agent_core import run_bounded_agent, validate_non_blank_question
 from app.services.ask_progress import ProgressRecorder
@@ -1226,6 +1226,29 @@ def get_project_map(project_id: str) -> dict[str, Any]:
             for file in bundle.get("files", []) if file.get("is_core")
         ],
     }
+
+
+class SourceFileResponse(BaseModel):
+    project_id: str
+    revision: str
+    path: str
+    workspace_id: str
+    activation_version: int
+    content: str
+    total_lines: int
+    complete: Literal[True]
+    content_sha256: str
+    utf8_bytes: int
+
+
+@app.get("/api/projects/{project_id}/source-file", response_model=SourceFileResponse)
+def get_source_file(project_id: str, revision: str = Query(...), path: str = Query(...)) -> dict[str, Any]:
+    try:
+        return db.read_source_file(project_id, revision, path)
+    except SourceFileError as exc:
+        raise HTTPException(status_code=exc.status_code, detail={
+            "code": exc.code, "message": "Saved snapshot source is unavailable.", "retryable": False,
+        }) from exc
 
 
 @app.get("/api/projects/{project_id}/learning-path")

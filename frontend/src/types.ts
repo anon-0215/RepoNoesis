@@ -84,6 +84,19 @@ export interface Citation {
   end_line: number;
 }
 
+export interface SourceFile {
+  project_id: string;
+  revision: string;
+  path: string;
+  workspace_id: string;
+  activation_version: number;
+  content: string;
+  total_lines: number;
+  complete: true;
+  content_sha256: string;
+  utf8_bytes: number;
+}
+
 export interface ChatAnswer {
   execution_mode?: 'rag' | 'agent';
   answer: string;

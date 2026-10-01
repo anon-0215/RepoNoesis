@@ -1,4 +1,50 @@
-# RN-FE-01 前端源码问答工作台
+# 前端源码问答工作台（RN-FE-01 / RN-FE-02）
+
+## RN-FE-02 已分析文件全文阅读（2026-10-01）
+
+**当前状态：READY_FOR_COMMIT。** 实现、隔离验证及提交前聚焦差异审查已完成；主要流程人工验收通过，未发现阻塞使用的问题。分支为 `feature/source-file-reader`，提交前重新核验 HEAD 仍为 `022d6cbd930c8d6ae0ab2a13cb3804ce136d600d`，暂存区为空，没有 stage、commit、push、创建 PR、合并或部署。初次实现交付时的状态为 `READY_FOR_MANUAL_UAT`，后续人工确认及本次收口边界见下。
+
+**既有合并状态。** RN-FE-01 已由 PR #7 合并，merge commit 为 `97b7fe92a173da29f0a5c1abcfb9081d6c84a739`。依赖安全修复已由 PR #8 合并，merge commit 为 `022d6cbd930c8d6ae0ab2a13cb3804ce136d600d`。复用该修复批次的既有验证记录：Vitest 及其内部包 `4.1.11`、PostCSS `8.5.23`、nanoid `3.3.18`，Vite 保持 `8.0.16`；`npm ci --no-audit --no-fund`、168 项完整前端测试、build、隔离浏览器检查通过，全量及 omit-dev audit 的 total 均为 0。本轮没有重新联网 audit 或升级依赖。下方 2026-09-24 的“四项 audit 待办”等段落是修复前的历史记录；不是当前未修复项。Phase 2 未确认的真实 Gate、历史引用失败根因未知等结论保持各自适用范围，不因 PR 合并或 RN-FE-02 验证而改为通过。历史“真实慢语义回退尚未观察到”仅描述当时的验证范围；2026-10-01 已有独立用户现场观察，见下，但专项慢语义回退验收仍未完成。
+
+**产品入口。** 项目地图的文件详情增加“打开源码”，从首行打开；原引用片段增加“查看完整文件”，依据该回答请求绑定的 project/workspace/revision 与服务端 citation 起止行打开。两者使用同一个只读阅读器：桌面侧栏、800px 及以下全屏，显示精确路径、完整 revision、绝对行号、加载/失败/空文件状态，支持关闭、Escape、焦点恢复、折行、复制全文和同面板放大。引用片段仍保留原 snippet 和原放大方式；全文不替代 Evidence，不产生新 Evidence。阅读范围为“已保存快照中的已分析文件”，不承诺完整仓库或原始文件字节。
+
+**读取合同。** `GET /api/projects/{project_id}/source-file?revision=...&path=...` 必须提供请求 revision 和精确仓库相对路径。数据库显式 `PRAGMA query_only=ON` + `BEGIN`，在同一读取视图中核验项目 `done` 状态、workspace 的 active project、revision 关联及 activation_status，然后以参数化查询精确读取 `repo_files.content`；无需 Python chunk。路径复用现有相对路径安全校验，拒绝绝对路径、drive/root、空段、`.`/`..`、NUL 等，不把规范化结果用作另一文件的查询键；合法已存反斜杠路径也按原键精确匹配。没有 checkout/服务器文件系统/GitHub/其他 revision 回退，没有数据库迁移、重索引、Provider 或 Agent 预算接入。
+
+响应包含 `project_id`、`revision`、`path`、`workspace_id`、`activation_version`、`content`、`total_lines`、`complete=true`、`content_sha256`、`utf8_bytes`。单文件上限是 **1,048,576 UTF-8 字节（含边界）**；超限返回 413，不截断。`content_sha256` 仅为本次返回正文按 UTF-8 编码后的 SHA-256，区别于 Git blob、原文件字节和 Evidence 摘录哈希。保存的文本和换行保持原样。
+
+行号沿用现有源码引用链的 Python `str.splitlines()` 规则：空文本 0 行；`a\r\nb\r\n` 为 2 行，CRLF 视为一个行分隔符，末尾分隔符不额外产生空行；`a\n\n` 为 2 行，保留实际空行；同时兼容 `\r`、VT、FF、文件/组/记录分隔符、NEL、Unicode LS/PS。前端使用相同分隔规则仅生成展示行，复制仍直接传入原 `content`。
+
+| HTTP | 稳定错误码 | 含义 |
+| --- | --- | --- |
+| 422 | `source_path_invalid` / `source_revision_required` | 路径非法 / 空 revision；缺失必填参数沿用 FastAPI 422 |
+| 404 | `source_project_not_found` / `source_file_not_found` | 项目 / 精确快照文件不存在 |
+| 409 | `source_project_unavailable` | 项目未完成或处于删除清理状态 |
+| 409 | `source_revision_mismatch` / `source_snapshot_inactive` | 版本不符 / 已非当前激活快照或关联损坏 |
+| 409 | `source_file_invalid` | 正文记录缺失文本或路径记录不唯一 |
+| 413 | `source_file_too_large` | 超过全文读取上限 |
+
+**前端身份和长文件。** 打开请求具有独立 open ID/AbortController，响应核验 project、revision、精确 path、workspace、activation_version、完整性标识、字节数与实际行数。工作台沿用 requestGate generation 变化关闭旧阅读器；快速打开、关闭、项目/revision/加载上下文变化使旧请求失效。引用采用回答原有请求身份；缺少可靠身份或身份已旧时明确说明并拒绝读取，不以当前身份替代。引用行非法、倒置、非整数或超出正文时显示“无法定位该范围”，不夹取或搜索 snippet。全文统一采用纯文本、每段最多 300 行的分段阅读，提供首段/末段、上一段/下一段及按绝对行号跳转；引用起始行所在段先渲染，再在 layout effect 中滚动，范围跨段时相应各段均按原范围高亮。折行仅改变展示，五位及更长行号保持不折行。复制成功/失败反馈不挤压阅读区；原答案代码放大或重新选引用会关闭全文面板，避免叠加阅读弹窗。
+
+**实际验证。** 最终后端命令（项目 Python 环境，隔离临时数据库）：`python -B -m unittest tests.test_source_file_api tests.test_product_api tests.test_workspace_api tests.test_workspace_update_api tests.test_workspace_update_service`，45 项通过，其中新增全文 API 测试 9 项。覆盖 Python/非 Python 无 chunk、空/CRLF/特殊分隔符、恰好上限及 UTF-8 多字节超限、精确路径/缺失/非法路径/revision/删除状态、重复记录、安全错误、正文/哈希/行数及 GET 只读。并在 WAL fixture 中于身份查询和正文查询之间调用真实 `activate_workspace_snapshot`（切至新 project/revision），验证在途读取仍来自同一旧读取视图、后续旧快照拒绝、新快照内容及 activation_version=2 正确。LLM、问答编排、保存均设调用断言；没有 Provider HTTP 请求。首次尝试 FastAPI TestClient 因现有环境缺少 httpx 未能运行，改用无需新依赖的 ASGI 请求覆盖真实路由与 Schema，未安装依赖。
+
+最终前端 `npm.cmd test` 为 13 个测试文件、200 项通过；`npm.cmd run build`（含 TypeScript）通过，`git diff --check` 通过。新增测试覆盖两个入口、请求/响应绑定、片段保留、首末段/折行/完整复制、非法引用范围、身份未知/旧引用、快速换文件、关闭/项目/revision/generation 变化后的迟到结果、重试/空文件及阅读面板互斥。没有追加无具体风险依据的全后端/Provider 回归。
+
+**浏览器隔离证据。** 命名 Chromium 会话访问独立 Vite `127.0.0.1:18761` 和临时数据库后端 `127.0.0.1:18762`；页面访问前注册 API 守卫，其他 API origin 和非 GET 请求拒绝，问答流仅在浏览器返回受控 fixture。后端禁用 Provider，非 GET/OPTIONS 请求另行阻断，lifespan 关闭；Vite envDir 指向仓库外。没有读取正式项目数据、提交正式问答或调用 Provider。真实新 GET 验证 12,000 行/408,000 字节文件、1,048,515 字节近上限文件、1,048,576 字节单行文件、空文件、1,048,577 字节拒绝；核对末行物理可见、引用滚动/高亮、折行、完整复制和真实响应 UTF-8 SHA-256。复制检查捕获 `clipboard.writeText` 的原始参数，不改变系统剪贴板，也不声称验证所有浏览器的系统剪贴板权限。
+
+1440×900 桌面和 390×844 窄屏、明暗主题、Escape/焦点恢复、Tab/Shift+Tab、原 Evidence 片段与问答草稿/回答、地图拖拽/滚轮/打开关闭时视口保留均通过；窄屏整页横向溢出为 0。受控 404/409/503 与真实 413 均展示安全失败，重试可回到真实 GET。缓冲真实 GET 后关闭换文件/切项目，再在临时库真实激活新快照并重新打开同 workspace，旧响应未回填。`pageerror=0`；console error 仅为明确测试的 413/404/409/503 网络失败。自动化中两次主题按钮选择/点击超时属于脚本定位与遮挡问题，已调整为关闭阅读器后切主题，并按窄屏按钮 title 定位；不记作产品通过证据。截图检查发现窄屏五位行号折行，修正 CSS 后重新验证和更新截图。
+
+脚本、日志、fixture 和截图均位于仓库外 `C:\Users\Anon\.codex\visualizations\2026\10\01\01a0f5bc-90cc-7ce0-80f7-d162bc145959\rn-fe-02`。本轮创建的浏览器及 18761/18762 服务在交付前清理，既有服务保留；原 `output/playwright` 六张未跟踪截图以 SHA-256 前后核验保留。下面的历史验收/待办段落保持原样。
+
+**最短人工验收路径（初次交付记录）。** 在现有已激活项目打开“项目地图”→选择文件→“打开源码”，核对首行、路径/revision、末段、折行和全文复制；关闭后确认原地图位置和文件详情。回到“源码问答”，打开已有回答的引用片段→“查看完整文件”，核对引用行高亮与片段保留；按 Escape 确认焦点回到入口，切明暗主题/手机宽度复看，确认问答草稿未丢失。无需为阅读功能重新导入、重新索引或提交新问答。初次交付结论为 `READY_FOR_MANUAL_UAT`；后续结果如下。
+
+**用户人工确认（2026-10-01）。** 两个入口、引用高亮、300→301 分段衔接、3838 末行、全文复制至 VSCode、折行、放大、鼠标关闭、项目切换、地图视口保留、夜间模式、非 Python 文件及窄屏阅读均已确认。结论为：**主要流程人工验收通过，未发现阻塞使用的问题。** 窄屏默认全屏，放大与恢复侧栏的宽度可能相同，进入桌面宽度后可见差别。全文仅指数据库保存的已分析文件快照文本；粘贴结果不扩大为完整仓库覆盖或原文件字节一致。
+
+- Escape／键盘焦点恢复：已有隔离验证，未人工验证；鼠标关闭不替代键盘验收。
+- 慢网竞态：已有隔离验证，未取得人工确认；普通项目切换和静态截图不作为慢网竞态通过证据。
+
+**独立用户现场观察（2026-10-01）。** 用户在 Click 项目 `6aabf099bfdd…` 的回答截图中观察到“语义检索未完成”，执行摘要显示语义阶段执行中超时、模型状态 loading；本次回答使用词法证据完成。此为真实用户现场的有限观察，不是 RN-FE-02 阅读器失败；不能据此判定历史 BASE 超时根因、模型冷启动等具体瓶颈已查明，也不代表专门的慢语义回退验收已完成。下方 2026-09-24 尚无真实回退观察的记录保留其历史适用范围，不再作为当前尚无任何真实观察的结论。本次收口未排障检索链路、调用 Provider、提交正式问答或重新访问正式项目数据。
+
+**提交前收口与证据复用（2026-10-01）。** 当前 9 个已跟踪修改、6 个新实现/测试文件与初次交付清单一致；源码和测试文件的最后修改时间均早于上次最终验证，未发现验证后发生实质代码修改。聚焦审查确认同一读取视图中的 active snapshot 身份与精确路径正文、只读边界、旧引用与迟到响应失效、300 行分段/绝对行号/原文复制，以及 1 MiB、UTF-8 SHA-256 和 `splitlines()` 合同未偏离。未发现阻断，不修改生产代码或测试。复用上文已记录的受影响后端 45 项、完整前端 200 项、build 和隔离浏览器结果，**均非本次收口重新执行**；本次仅更新本计划并执行 `git diff --check`（通过）。原 `output/playwright` 六张截图与初次交付 SHA-256 一致，保留并排除提交；仓库外验证日志、fixture、截图和其他既有工作均不纳入提交，未启动服务。
 
 ## 当前状态与提交前收口（2026-09-24）
 

@@ -18,6 +18,16 @@ SCHEMA_VERSION = 11
 CODE_CHUNKER_VERSION = "python_ast_chunks_v1@1"
 LEARNING_CONTINUITY_CONFIG_IDENTITY = "learning-continuity-v1@1"
 LOCAL_CONTINUITY_LEARNER_ID = "learner-local-single-user-v1"
+SOURCE_FILE_MAX_BYTES = 1_048_576
+
+
+class SourceFileError(ValueError):
+    def __init__(self, code: str, status_code: int) -> None:
+        super().__init__(code)
+        self.code = code
+        self.status_code = status_code
+
+
 UPDATE_RUN_PHASES = (
     "revision_resolution",
     "manifest_diff",
@@ -1955,6 +1965,60 @@ class Database:
         if not row:
             return None
         return self._project_from_row(row)
+
+    def read_source_file(self, project_id: str, revision: str, path: str) -> dict[str, Any]:
+        """Read saved decoded text and its active identity in one SQLite read view."""
+        from app.services.agent_contracts import normalize_repository_relative_path
+
+        try:
+            # Validate safety, but use the exact supplied key, including legal backslashes.
+            normalize_repository_relative_path(path)
+        except ValueError as exc:
+            raise SourceFileError("source_path_invalid", 422) from exc
+        if not revision:
+            raise SourceFileError("source_revision_required", 422)
+        with self.connect() as conn:
+            conn.execute("PRAGMA query_only = ON")
+            conn.execute("BEGIN")
+            row = conn.execute(
+                """SELECT p.status, p.repository_revision,
+                          wr.workspace_id, wr.repository_revision AS linked_revision,
+                          wr.activation_status, w.active_project_id, w.activation_version
+                   FROM projects p
+                   LEFT JOIN workspace_revisions wr ON wr.project_id = p.id
+                   LEFT JOIN repository_workspaces w ON w.id = wr.workspace_id
+                   WHERE p.id = ?""", (project_id,),
+            ).fetchone()
+            if row is None:
+                raise SourceFileError("source_project_not_found", 404)
+            if row["status"] != "done":
+                raise SourceFileError("source_project_unavailable", 409)
+            if row["repository_revision"] != revision:
+                raise SourceFileError("source_revision_mismatch", 409)
+            if (not row["workspace_id"] or row["active_project_id"] != project_id
+                    or row["activation_status"] != "active"
+                    or row["linked_revision"] != revision):
+                raise SourceFileError("source_snapshot_inactive", 409)
+            files = conn.execute(
+                "SELECT content FROM repo_files WHERE project_id = ? AND path = ? LIMIT 2",
+                (project_id, path),
+            ).fetchall()
+            if not files:
+                raise SourceFileError("source_file_not_found", 404)
+            if len(files) != 1 or not isinstance(files[0]["content"], str):
+                raise SourceFileError("source_file_invalid", 409)
+            content = files[0]["content"]
+            encoded = content.encode("utf-8")
+            if len(encoded) > SOURCE_FILE_MAX_BYTES:
+                raise SourceFileError("source_file_too_large", 413)
+            return {
+                "project_id": project_id, "revision": revision, "path": path,
+                "workspace_id": row["workspace_id"],
+                "activation_version": row["activation_version"],
+                "content": content, "total_lines": len(content.splitlines()),
+                "complete": True, "content_sha256": hashlib.sha256(encoded).hexdigest(),
+                "utf8_bytes": len(encoded),
+            }
 
     def get_project_by_source_identity(
         self, source_identity: str

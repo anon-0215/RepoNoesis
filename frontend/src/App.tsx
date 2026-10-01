@@ -623,13 +623,13 @@ export default function App() {
     />;
     if (!hasProject || !project) return <EmptyState />;
     if (activeTab === 'dashboard') return <Dashboard project={project} />;
-    if (activeTab === 'map') return <ProjectMapView key={`${workspaceId}:${projectId}:${currentRevision}`} projectId={projectId} revision={currentRevision} projectMap={projectMap} error={mapError} loading={workspaceLoading} onRetry={() => void retryMap()} />;
+    if (activeTab === 'map') return <ProjectMapView key={`${workspaceId}:${projectId}:${currentRevision}`} projectId={projectId} revision={currentRevision} workspaceId={workspaceId} projectMap={projectMap} error={mapError} loading={workspaceLoading} onRetry={() => void retryMap()} />;
     if (activeTab === 'learning') return <LearningView steps={learningSteps} continuity={continuity} />;
     if (activeTab === 'report') return <ReportView markdown={report} />;
     return null;
   }, [activeTab, analysisLoading, configStatus, continuity, continuityState, currentRevision, deletingProjectId, hasProject, libraryStatus, mapError, project, projectId, projectMap, report, revisionCheck, source, sourceType, updateRun, updateState, workspaceId, workspaceLoading, workspaces]);
 
-  return <Workbench project={project} workspaces={workspaces} workspaceId={workspaceId} revision={currentRevision} executionMode={executionMode} onExecutionModeChange={setExecutionMode}
+  return <Workbench contextGeneration={requestGate.current.getContext().generation} project={project} workspaces={workspaces} workspaceId={workspaceId} revision={currentRevision} executionMode={executionMode} onExecutionModeChange={setExecutionMode}
     question={question} answers={answers} error={askError} loading={askLoading}
     libraryLoading={libraryStatus === 'loading'} projectLoading={workspaceLoading || analysisLoading}
     statusMessage={connectionError || message} activePage={activeTab}

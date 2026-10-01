@@ -8,12 +8,14 @@ import type {
   LearningContinuity,
   ProjectMap,
   ProjectResponse,
+  SourceFile,
   WorkspaceDetail,
   WorkspaceListResponse,
   WorkspaceRevisionCheck,
   WorkspaceUpdateRun
 } from '../types';
 import { buildAnalyzePayload, type SourceType } from './product';
+import { sourceLines } from './sourceLines';
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL ?? 'http://127.0.0.1:8000';
 const SAFE_NETWORK_ERROR_MESSAGE = '无法连接后端服务。请确认后端已启动后重试。';
@@ -114,6 +116,15 @@ function optionalBoolean(value: unknown): boolean | undefined {
   return typeof value === 'boolean' ? value : undefined;
 }
 const SAFE_LEGACY_ERROR_MESSAGES: Readonly<Record<string, string>> = Object.freeze({
+  source_path_invalid: '文件路径无效，无法读取。',
+  source_revision_required: '缺少可靠的版本身份，无法读取。',
+  source_project_not_found: '已保存项目不存在。',
+  source_project_unavailable: '项目尚不可用或正在删除，请重新打开项目。',
+  source_revision_mismatch: '版本不符，请重新打开项目；旧引用不能读取当前版本。',
+  source_snapshot_inactive: '该快照已不再激活，无法打开旧版本引用。',
+  source_file_not_found: '已保存快照中没有该已分析文件。',
+  source_file_invalid: '已保存文件记录不完整或不唯一，无法读取。',
+  source_file_too_large: '文件超过 1 MiB 全文读取上限，未返回截断内容。',
   git_executable_unavailable: '后端未找到 Git 客户端，请安装或配置 Git 后重试。',
   git_dns_failed: '无法解析公开 Git 主机，请检查 DNS 或网络设置。',
   git_tls_failed: '公开 Git 仓库的 TLS 或证书校验失败，请检查系统证书链或网络代理。',
@@ -461,6 +472,20 @@ export async function deleteProject(
 
 export async function getProjectMap(projectId: string): Promise<ProjectMap> {
   return request(`/api/projects/${projectId}/map`);
+}
+
+export async function getSourceFile(projectId: string, revision: string, path: string, workspaceId: string, signal?: AbortSignal): Promise<SourceFile> {
+  const query = new URLSearchParams({ revision, path });
+  const result = await request<SourceFile>(`/api/projects/${encodeURIComponent(projectId)}/source-file?${query}`, { signal });
+  if (!result || typeof result !== 'object' || result.project_id !== projectId || result.revision !== revision || result.path !== path || result.workspace_id !== workspaceId ||
+      result.complete !== true || typeof result.content !== 'string' || !Number.isInteger(result.total_lines) || result.total_lines < 0 ||
+      !Number.isInteger(result.activation_version) || result.activation_version < 1 ||
+      !Number.isInteger(result.utf8_bytes) || result.utf8_bytes < 0 || result.utf8_bytes > 1_048_576 ||
+      !/^[a-f0-9]{64}$/.test(result.content_sha256) ||
+      new TextEncoder().encode(result.content).byteLength !== result.utf8_bytes || sourceLines(result.content).length !== result.total_lines) {
+    throw new ApiError('全文响应身份或完整性合同不符，未展示内容。', 0);
+  }
+  return result;
 }
 
 export async function getLearningPath(projectId: string): Promise<{ steps: LearningStep[] }> {
