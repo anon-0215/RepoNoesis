@@ -11,8 +11,42 @@ interface MarkdownAnswerProps {
   onEvidence?: (id: string, trigger: HTMLButtonElement) => void;
 }
 
-interface MarkdownNode { type: string; value?: string; url?: string; children?: MarkdownNode[] }
+interface MarkdownNode {
+  type: string; value?: string; url?: string; children?: MarkdownNode[];
+  position?: { start: { offset?: number }; end: { offset?: number } };
+}
 const marker = /\[\b(E[1-9]\d*)\]/g;
+
+function codeSymbolPlugin(text: string, bindings?: Map<string, EvidenceBinding>) {
+  // Only repair an underscore strong node inside an exact, bound qualified
+  // symbol. Bare __name__ remains ordinary Markdown because it is ambiguous.
+  const symbols = new Set(Array.from(bindings?.values() || []).flatMap(binding =>
+    binding.citations.map(citation => citation.qualified_name || '').filter(name =>
+      /^(?:[A-Za-z_]\w*\.)+__[A-Za-z_]\w*__$/.test(name))));
+  return (tree: MarkdownNode) => {
+    const visit = (node: MarkdownNode) => {
+      if (!node.children || ['link', 'linkReference', 'image', 'imageReference', 'code', 'inlineCode'].includes(node.type)) return;
+      node.children = node.children.map(child => {
+        const start = child.position?.start.offset, end = child.position?.end.offset;
+        if (child.type === 'strong' && start !== undefined && end !== undefined &&
+            child.children?.length === 1 && child.children[0].type === 'text') {
+          const raw = text.slice(start, end);
+          if (/^__[A-Za-z_]\w*__$/.test(raw) && child.children[0].value === raw.slice(2, -2)) {
+            for (const symbol of symbols) {
+              const symbolStart = end - symbol.length;
+              if (symbolStart >= 0 && text.slice(symbolStart, end) === symbol &&
+                  !/[\p{ID_Continue}.\\]/u.test(text[symbolStart - 1] || '') && !/[\p{ID_Continue}.]/u.test(text[end] || '')) {
+                return { type: 'text', value: raw, position: child.position };
+              }
+            }
+          }
+        }
+        visit(child); return child;
+      });
+    };
+    visit(tree);
+  };
+}
 
 function evidencePlugin(ids: string[]) {
   const known = new Set(ids);
@@ -50,9 +84,10 @@ function safeHref(value?: string) {
 
 export function MarkdownAnswer({ text, onExpandCode, bindings, selectedEvidenceId, onEvidence }: MarkdownAnswerProps) {
   const plugin = () => evidencePlugin(Array.from(bindings?.keys() || []));
+  const symbols = () => codeSymbolPlugin(text, bindings);
   return <div className="wb-markdown">
     <ReactMarkdown
-      remarkPlugins={[remarkGfm, plugin]}
+      remarkPlugins={[remarkGfm, symbols, plugin]}
       urlTransform={(url) => /^evidence:E[1-9]\d*$/.test(url) ? url : defaultUrlTransform(url)}
       components={{
         a({ href, children }) {

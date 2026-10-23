@@ -11,6 +11,7 @@ from unittest.mock import patch
 from urllib.parse import urlencode
 
 from app.database import Database
+from app.source_lines import source_lines
 
 
 class SourceFileApiTests(unittest.TestCase):
@@ -68,7 +69,7 @@ class SourceFileApiTests(unittest.TestCase):
                 self.assertEqual(response.status_code, 200, response.text)
                 data = response.json(); text = self.contents[path]
                 self.assertEqual(data["content"], text)
-                self.assertEqual(data["total_lines"], len(text.splitlines()))
+                self.assertEqual(data["total_lines"], len(source_lines(text)))
                 self.assertEqual(data["utf8_bytes"], len(text.encode("utf-8")))
                 self.assertEqual(data["content_sha256"], hashlib.sha256(text.encode("utf-8")).hexdigest())
                 self.assertEqual((data["project_id"], data["revision"], data["path"], data["workspace_id"]),

@@ -440,7 +440,7 @@ describe('App ask request gate integration', () => {
         setInputValue(input!, 'first question');
         await Promise.resolve();
       });
-      await act(async () => { buttonWithText(container, '项目概览').click(); await flushPromises(); });
+      await act(async () => { buttonWithText(container, '项目地图').click(); await flushPromises(); });
       expect(container.querySelectorAll('.wb-rail')).toHaveLength(1);
       expect(container.querySelectorAll('.wb-context')).toHaveLength(1);
       expect(document.documentElement.dataset.theme).toBe('dark');
@@ -474,7 +474,7 @@ describe('App ask request gate integration', () => {
       expect(errorCard?.textContent).toContain('tool_timeout');
       expect(submit?.disabled).toBe(false);
       expect(container.querySelector('.wb-notification')).toBeNull();
-      await act(async () => { buttonWithText(container, '项目概览').click(); await flushPromises(); });
+      await act(async () => { buttonWithText(container, '项目地图').click(); await flushPromises(); });
       await act(async () => { buttonWithText(container, '源码问答').click(); await flushPromises(); });
       expect(container.querySelector('.wb-error')?.textContent).toContain('request-safe-123');
       form = container.querySelector<HTMLFormElement>('form.ask-form');
@@ -525,6 +525,8 @@ describe('App connection and import status integration', () => {
       expect(container.querySelector<HTMLButtonElement>('form.ask-form button[type="submit"]')?.disabled).toBe(true);
       await act(async () => { buttonWithText(container, '项目管理').click(); await flushPromises(); });
       expect(container.querySelector('form.analyze-form')).not.toBeNull();
+      expect(container.textContent).toContain('首次导入需要预先准备本地 BGE-M3 权重');
+      expect(container.textContent).toContain('不需要生成模型');
     } finally {
       if (root) await act(async () => root?.unmount());
       container.remove();

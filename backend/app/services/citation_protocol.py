@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import hashlib
 import json
+import logging
 import re
 from typing import Any, Literal
 
@@ -16,6 +17,8 @@ MAX_PART_TEXT_CHARS = 2_000
 MAX_ALIASES_PER_PART = 5
 MAX_FINAL_ANSWER_OUTPUT_CHARS = 16_000
 _ALIAS = re.compile(r"A[1-9][0-9]{0,2}")
+_SINGLE_JSON_FENCE = re.compile(r"```(?:json)?[ \t]*\r?\n(?P<body>[\s\S]*?)\r?\n```")
+logger = logging.getLogger(__name__)
 # This is deliberately identical to the marker namespace consumed by
 # qa_agent._validate_grounded_answer_references(). Ordinary technical prose,
 # including paths, URLs, revisions, hashes, and line-like text, is not a
@@ -144,6 +147,9 @@ class FinalAnswerProtocolResult:
     answer: str | None = None
     selected_evidence_ids: tuple[str, ...] = ()
     failure: FinalAnswerProtocolFailure | None = None
+    # Safe parser diagnostics bind to the original model text, never the body
+    # after normalization. Experiment raw capture stays before this boundary.
+    parse_metadata: dict[str, Any] = field(default_factory=dict)
 
     @property
     def valid(self) -> bool:
@@ -196,8 +202,14 @@ def render_structured_final_answer(
         return _failure("final_answer_invalid_json", metadata)
     if len(raw) > MAX_FINAL_ANSWER_OUTPUT_CHARS:
         return _failure("final_answer_schema_invalid", metadata)
+    candidate = raw.strip()
+    fence = _SINGLE_JSON_FENCE.fullmatch(candidate)
+    if fence is not None and re.search(r"(?m)^[ \t]*```", fence.group("body")) is None:
+        candidate = fence.group("body")
+        metadata["normalized"] = True
+        metadata["normalization_type"] = "single_json_code_fence"
     try:
-        parsed = json.loads(raw.strip())
+        parsed = json.loads(candidate)
     except json.JSONDecodeError:
         return _failure("final_answer_invalid_json", metadata)
     try:
@@ -266,9 +278,11 @@ def render_structured_final_answer(
             for alias in part.evidence_aliases
         )
         rendered_parts.append(f"{part.text} {' '.join(tokens)}")
+    _record_format_metadata(metadata)
     return FinalAnswerProtocolResult(
         answer="\n\n".join(rendered_parts),
         selected_evidence_ids=tuple(dict.fromkeys(selected_ids)),
+        parse_metadata=dict(metadata),
     )
 
 
@@ -286,12 +300,25 @@ def _output_metadata(raw: Any) -> dict[str, Any]:
             "output_chars": 0,
             "output_sha256": None,
             "markdown_fence_detected": False,
+            "normalized": False,
+            "normalization_type": "none",
         }
     return {
         "output_chars": len(raw),
         "output_sha256": hashlib.sha256(raw.encode("utf-8")).hexdigest(),
         "markdown_fence_detected": "```" in raw,
+        "normalized": False,
+        "normalization_type": "none",
     }
+
+
+def _record_format_metadata(metadata: dict[str, Any]) -> None:
+    # No raw response body, source text, credentials or private reasoning.
+    try:
+        logger.info("final_answer_format", extra={"final_answer_parse": dict(metadata)})
+    except Exception:
+        # Optional diagnostics must not change validation or product results.
+        pass
 
 
 def _failure(
@@ -303,6 +330,7 @@ def _failure(
     alias_count: int = 0,
     violation_kind: CitationTextViolationKind | None = None,
 ) -> FinalAnswerProtocolResult:
+    _record_format_metadata(metadata)
     return FinalAnswerProtocolResult(
         failure=FinalAnswerProtocolFailure(
             stable_code=stable_code,
@@ -310,8 +338,10 @@ def _failure(
             part_count=part_count,
             alias_count=alias_count,
             violation_kind=violation_kind,
-            **metadata,
-        )
+            **{key: value for key, value in metadata.items()
+               if key not in {"normalized", "normalization_type"}},
+        ),
+        parse_metadata=dict(metadata),
     )
 
 

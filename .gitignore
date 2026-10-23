@@ -38,3 +38,12 @@ temp/
 artifacts/m5/
 artifacts/retrieval_v2_phase5/
 artifacts/retrieval_v2_phase6/
+
+# Local runs, audits, backups and delivery artifacts (not product source).
+/output/
+/backend/output/
+
+# Local research/submission drafts and historical response replay material.
+/docs/aic/
+/backend/tests/test_final_answer_fence_compat.py
+/backend/tests/fixtures/final_answer_fenced_outputs.json

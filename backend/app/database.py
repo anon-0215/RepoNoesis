@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from app.source_lines import source_lines as physical_source_lines
+
 import hashlib
 import json
 import math
@@ -15,7 +17,8 @@ from app.learning_schema import LEARNING_SCHEMA_STATEMENTS
 
 
 SCHEMA_VERSION = 12
-CODE_CHUNKER_VERSION = "python_ast_chunks_v1@1"
+CODE_CHUNKER_VERSION = "python_ast_chunks_v1@2"
+LEGACY_CODE_CHUNKER_VERSION = "python_ast_chunks_v1@1"
 LEARNING_CONTINUITY_CONFIG_IDENTITY = "learning-continuity-v1@1"
 LOCAL_CONTINUITY_LEARNER_ID = "learner-local-single-user-v1"
 SOURCE_FILE_MAX_BYTES = 1_048_576
@@ -749,7 +752,7 @@ class Database:
                 """,
                 (
                     manifest_hash,
-                    CODE_CHUNKER_VERSION,
+                    LEGACY_CODE_CHUNKER_VERSION,
                     status,
                     status,
                     row["workspace_id"],
@@ -2022,7 +2025,7 @@ class Database:
                 "project_id": project_id, "revision": revision, "path": path,
                 "workspace_id": row["workspace_id"],
                 "activation_version": row["activation_version"],
-                "content": content, "total_lines": len(content.splitlines()),
+                "content": content, "total_lines": len(physical_source_lines(content)),
                 "complete": True, "content_sha256": hashlib.sha256(encoded).hexdigest(),
                 "utf8_bytes": len(encoded),
             }

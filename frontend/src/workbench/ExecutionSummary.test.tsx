@@ -14,7 +14,7 @@ describe('execution summary projection', () => {
     const missing = renderToStaticMarkup(<ExecutionSummary result={answer} />);
     expect(missing).toContain('未提供结构化执行详情'); expect(missing).not.toContain('0 次');
     const truncated = renderToStaticMarkup(<ExecutionSummary result={{ ...answer, execution_summary: { status: 'completed', planner_termination_reason: 'planner_repair_failed', diagnostics_truncated: true } }} />);
-    expect(truncated).toContain('补充检索提前结束'); expect(truncated).toContain('诊断详情已裁剪'); expect(truncated).not.toContain('工具调用 0');
+    expect(truncated).toContain('补充检索提前结束'); expect(truncated).toContain('诊断详情仅保存了部分内容'); expect(truncated).not.toContain('工具调用 0');
   });
   it('labels BASE tool duration separately from BASE-excluded attempts', () => {
     const markup = renderToStaticMarkup(<ExecutionSummary result={{ ...answer, execution_mode: 'rag', execution_summary: {

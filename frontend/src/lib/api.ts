@@ -130,6 +130,16 @@ const SAFE_LEGACY_ERROR_MESSAGES: Readonly<Record<string, string>> = Object.free
   source_project_unavailable: '项目尚不可用或正在删除，请重新打开项目。',
   source_revision_mismatch: '版本不符，请重新打开项目；旧引用不能读取当前版本。',
   source_snapshot_inactive: '该快照已不再激活，无法打开旧版本引用。',
+  exploration_revision_unavailable: '所选本地仓库没有当前精确版本；未读取其他版本。',
+  exploration_exact_revision_required: '当前快照没有完整 Git 提交身份，无法可靠补充同版本材料。',
+  exploration_snapshot_content_conflict: '同版本材料与已保存源码冲突，已拒绝补充。',
+  exploration_directory_unavailable: '本地仓库目录不可用，请检查路径。',
+  exploration_material_invalid: '同版本材料身份或内容校验失败，请检查后重试。',
+  exploration_git_limit: 'Git 材料超过读取上限，未完成补充。',
+  exploration_pair_too_large: '这组对照超过显示上限，请选择其他对照或直接阅读源码。',
+  exploration_result_too_large: '报错定位结果超过显示上限；请缩短输入或从项目地图直接阅读源码。',
+  exploration_pair_not_found: '该对照已失效，请重新加载当前版本。',
+  exploration_failed: '源码探索暂时无法完成；其他页面仍可使用。',
   source_file_not_found: '已保存快照中没有该已分析文件。',
   source_file_invalid: '已保存文件记录不完整或不唯一，无法读取。',
   source_file_too_large: '文件超过 1 MiB 全文读取上限，未返回截断内容。',
@@ -208,7 +218,7 @@ export class ApiError extends Error {
   }
 }
 
-async function request<T>(path: string, options?: RequestInit): Promise<T> {
+export async function request<T>(path: string, options?: RequestInit): Promise<T> {
   let response: Response;
   try {
     response = await fetch(`${API_BASE}${path}`, {

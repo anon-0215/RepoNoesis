@@ -5,9 +5,10 @@ import base64
 import json
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from app.services.agent_contracts import normalize_repository_relative_path
+from app.services.smoke_diagnostics import sanitize_provider_usage_summary
 
 
 class BaseRetrievalSummaryResponse(BaseModel):
@@ -29,6 +30,7 @@ class ExecutionSummaryResponse(BaseModel):
     planner_repair_attempts: int | None = Field(default=None, ge=0)
     provider_logical_calls: int | None = Field(default=None, ge=0)
     provider_http_attempt_count: int | None = Field(default=None, ge=0)
+    provider_usage_summary: dict[str, Any] | None = None
     tool_calls_attempted: int | None = Field(default=None, ge=0)
     tool_calls_succeeded: int | None = Field(default=None, ge=0)
     tool_calls_failed: int | None = Field(default=None, ge=0)
@@ -43,6 +45,18 @@ class ExecutionSummaryResponse(BaseModel):
     relation_validation_passed: bool | None = None
     post_generation_validation_passed: bool | None = None
     diagnostics_truncated: bool | None = None
+
+    @field_validator("provider_usage_summary", mode="before")
+    @classmethod
+    def validate_provider_usage(cls, value: Any) -> dict[str, Any] | None:
+        # Legacy saved rows omit this optional field. Preserve unknown values;
+        # only the bounded numeric summary may cross the history boundary.
+        if value is None:
+            return None
+        safe = sanitize_provider_usage_summary(value)
+        if safe is None:
+            raise ValueError("invalid provider usage summary")
+        return safe
 
 
 class SavedCitation(BaseModel):

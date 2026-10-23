@@ -9,6 +9,7 @@ from app.services.smoke_diagnostics import (
     BASE_RETRIEVAL_STATUSES,
     PLANNER_ENHANCEMENT_TERMINATION_CODES,
     normalize_public_failure_reason,
+    sanitize_provider_usage_summary,
 )
 
 
@@ -235,6 +236,11 @@ def build_ask_success_diagnostics(
     base_retrieval = _safe_base_retrieval(recorder_snapshot.get("base_retrieval"))
     if base_retrieval is not None:
         diagnostics["base_retrieval"] = base_retrieval
+    usage_summary = sanitize_provider_usage_summary(recorder_snapshot.get("provider_usage_summary"))
+    if usage_summary is not None:
+        diagnostics["provider_usage_summary"] = usage_summary
+    diagnostics["provider_http_attempt_count_complete"] = recorder_snapshot.get("provider_http_attempt_count_complete", True) is True
+    diagnostics["provider_http_attempts_unknown"] = _count(recorder_snapshot.get("provider_http_attempts_unknown"))
     return _bounded_payload(diagnostics)
 
 
@@ -417,6 +423,11 @@ def build_ask_failure_detail(
     base_retrieval = _safe_base_retrieval(recorder_snapshot.get("base_retrieval"))
     if base_retrieval is not None:
         diagnostics["base_retrieval"] = base_retrieval
+    usage_summary = sanitize_provider_usage_summary(recorder_snapshot.get("provider_usage_summary"))
+    if usage_summary is not None:
+        diagnostics["provider_usage_summary"] = usage_summary
+    diagnostics["provider_http_attempt_count_complete"] = recorder_snapshot.get("provider_http_attempt_count_complete", True) is True
+    diagnostics["provider_http_attempts_unknown"] = _count(recorder_snapshot.get("provider_http_attempts_unknown"))
     diagnostics = _bounded_payload(diagnostics)
     message = (
         "The server rejected an invalid answer response before persistence."
@@ -593,7 +604,7 @@ def _safe_candidate_metrics(value: Any) -> dict[str, Any]:
 
 
 def _safe_attempt_outcomes(value: Any) -> list[str]:
-    allowed = {"success", "http_error", "timeout", "network_error", "invalid_response", "deadline"}
+    allowed = {"success", "http_error", "timeout", "network_error", "invalid_response", "deadline", "cancelled", "collection_error"}
     if not isinstance(value, list):
         return []
     return [item for item in value[:8] if isinstance(item, str) and item in allowed]
@@ -909,6 +920,11 @@ def _safe_final_answer_repair_failure(value: Any) -> dict[str, Any] | None:
 
 def _bounded_payload(value: dict[str, Any]) -> dict[str, Any]:
     result = dict(value)
+    usage_summary = sanitize_provider_usage_summary(result.get("provider_usage_summary"))
+    if usage_summary is None:
+        result.pop("provider_usage_summary", None)
+    else:
+        result["provider_usage_summary"] = usage_summary
 
     def oversized() -> bool:
         return _serialized_diagnostics_size(result) > MAX_ASK_DIAGNOSTICS_BYTES
@@ -949,6 +965,7 @@ def _bounded_payload(value: dict[str, Any]) -> dict[str, Any]:
         "final_answer_repair_protocol_succeeded",
         "final_answer_repair_succeeded",
         "provider_logical_calls",
+        "provider_usage_summary",
         "evidence_count",
         "citation_count",
         "citation_failure_reason_code",
@@ -1060,6 +1077,7 @@ def _minimal_ask_payload(value: dict[str, Any]) -> dict[str, Any]:
         "final_answer_repair_protocol_succeeded",
         "final_answer_repair_succeeded",
         "provider_logical_calls",
+        "provider_usage_summary",
         "evidence_count",
         "citation_count",
         "citation_failure_reason_code",
@@ -1088,10 +1106,13 @@ def _minimal_ask_payload(value: dict[str, Any]) -> dict[str, Any]:
 
 def _absolute_minimal_ask_payload(value: dict[str, Any]) -> dict[str, Any]:
     request_id = _request_id(value.get("request_id"))
+    summary = sanitize_provider_usage_summary(value.get("provider_usage_summary"))
+    usage_field = {"provider_usage_summary": summary} if summary is not None else {}
     if "failure_reason_code" not in value:
         return {
             "request_id": request_id,
             "diagnostics_truncated": True,
+            **usage_field,
         }
     return {
         "request_id": request_id,
@@ -1144,6 +1165,7 @@ def _absolute_minimal_ask_payload(value: dict[str, Any]) -> dict[str, Any]:
         ),
         "elapsed_ms": _elapsed(value.get("elapsed_ms")),
         "diagnostics_truncated": True,
+        **usage_field,
         **{
             key: {"stable_code": value[key]["stable_code"]}
             for key in (

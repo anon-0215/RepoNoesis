@@ -25,6 +25,7 @@ import './workbench/reading-fixes.css';
 import './workbench/evidence-summary.css';
 import './workbench/history.css';
 import './workbench/reading-theme.css';
+import './workbench/experience.css';
 import {
   ApiError,
   analyzeProject,
@@ -84,10 +85,6 @@ type Tab = WorkbenchPage;
 
 interface LoadedProjectData {
   project: ProjectResponse;
-  projectMap: ProjectMap | null;
-  mapError: string | null;
-  learningSteps: LearningStep[];
-  report: string;
 }
 
 export default function App() {
@@ -105,6 +102,9 @@ export default function App() {
   const [project, setProject] = useState<ProjectResponse | null>(null);
   const [projectMap, setProjectMap] = useState<ProjectMap | null>(null);
   const [mapError, setMapError] = useState<string | null>(null);
+  const [mapStatus, setMapStatus] = useState<'idle' | 'loading' | 'ready' | 'error'>('idle');
+  const [reportStatus, setReportStatus] = useState<'idle' | 'loading' | 'ready' | 'error'>('idle');
+  const optionalRequests = useRef({ map: 0, report: 0 });
   const [learningSteps, setLearningSteps] = useState<LearningStep[]>([]);
   const [report, setReport] = useState('');
   const [activeTab, setActiveTab] = useState<Tab>('ask');
@@ -152,10 +152,10 @@ export default function App() {
   }, [workspaceId, updateRun]);
 
   useEffect(() => {
-    if (!workspaceId || !continuity?.transition_id || !['pending', 'running'].includes(continuity.status)) return;
+    if (activeTab !== 'manage' || !workspaceId || !continuity?.transition_id || !['pending', 'running'].includes(continuity.status)) return;
     const timer = window.setTimeout(() => void pollContinuity(workspaceId), 1000);
     return () => window.clearTimeout(timer);
-  }, [workspaceId, continuity]);
+  }, [activeTab, workspaceId, continuity]);
 
   async function initializeWorkspace() {
     const initialGeneration = requestGate.current.getContext().generation;
@@ -251,19 +251,7 @@ export default function App() {
   }
 
   async function loadAll(nextProjectId: string): Promise<LoadedProjectData> {
-    const [projectData, mapData, learningData, reportData] = await Promise.all([
-      getProject(nextProjectId),
-      getProjectMap(nextProjectId).then((value) => ({ value, error: null })).catch(() => ({ value: null, error: '地图接口不可用，请重试。' })),
-      getLearningPath(nextProjectId),
-      getReport(nextProjectId)
-    ]);
-    return {
-      project: projectData,
-      projectMap: mapData.value,
-      mapError: mapData.error,
-      learningSteps: learningData.steps,
-      report: reportData.markdown
-    };
+    return { project: await getProject(nextProjectId) };
   }
 
   function applyWorkspace(workspace: WorkspaceDetail, loaded: LoadedProjectData) {
@@ -274,11 +262,12 @@ export default function App() {
     setUpdateRun(workspace.latest_update_run);
     setContinuity(workspace.learning_continuity);
     setProject(loaded.project);
-    const mapMatches = !loaded.projectMap || ((!loaded.projectMap.project_id || loaded.projectMap.project_id === workspace.active_snapshot.project_id) && (!loaded.projectMap.repository_revision || loaded.projectMap.repository_revision === workspace.active_snapshot.repository_revision));
-    setProjectMap(mapMatches ? loaded.projectMap : null);
-    setMapError(mapMatches ? loaded.mapError : '地图版本与当前项目不一致，请重试。');
-    setLearningSteps(loaded.learningSteps);
-    setReport(loaded.report);
+    setProjectMap(null);
+    setMapError(null);
+    setMapStatus('idle');
+    setReportStatus('idle');
+    setLearningSteps([]);
+    setReport('');
     setAnswers([]);
     setAskError(null);
     window.localStorage.setItem(RECENT_WORKSPACE_KEY, workspace.workspace_id);
@@ -286,6 +275,8 @@ export default function App() {
   }
 
   function beginContextChange(operation: string, targetWorkspaceId: string) {
+    activeAskConnection.current?.abort();
+    activeAskConnection.current = null;
     const token = requestGate.current.beginContextChange(operation, targetWorkspaceId);
     connectionGate.current.changeContext(token.context.generation);
     setConnectionError('');
@@ -296,23 +287,62 @@ export default function App() {
     setAskError(null);
     setProjectMap(null);
     setMapError(null);
+    setMapStatus('idle');
+    setReportStatus('idle');
+    setReport('');
+    ++optionalRequests.current.map;
+    ++optionalRequests.current.report;
     return token;
+  }
+
+  useEffect(() => {
+    if (workspaceLoading || !hasProject) return;
+    const context = requestGate.current.getContext();
+    if (context.projectId !== projectId || context.revision !== currentRevision) return;
+    if (activeTab === 'map' && mapStatus === 'idle') void retryMap();
+    if (activeTab === 'report' && reportStatus === 'idle') void retryReport();
+  }, [activeTab, hasProject, workspaceLoading, projectId, currentRevision, mapStatus, reportStatus]);
+
+  function optionalRequestCurrent(context: ReturnType<typeof requestGate.current.getContext>, kind: 'map' | 'report', id: number) {
+    const now = requestGate.current.getContext();
+    return optionalRequests.current[kind] === id && now.generation === context.generation &&
+      now.workspaceId === context.workspaceId && now.projectId === context.projectId && now.revision === context.revision;
+  }
+
+  async function retryReport() {
+    const context = requestGate.current.getContext();
+    if (!context.projectId || !context.revision) return;
+    const id = ++optionalRequests.current.report;
+    setReportStatus('loading');
+    try {
+      const result = await getReport(context.projectId);
+      if (!optionalRequestCurrent(context, 'report', id)) return;
+      setReport(result.markdown);
+      setReportStatus('ready');
+    } catch {
+      if (optionalRequestCurrent(context, 'report', id)) setReportStatus('error');
+    }
   }
 
   async function retryMap() {
     if (!projectId || !currentRevision) return;
     const context = requestGate.current.getContext();
+    if (context.projectId !== projectId || context.revision !== currentRevision) return;
+    const id = ++optionalRequests.current.map;
     setMapError(null);
+    setMapStatus('loading');
     setProjectMap(null);
     try {
       const result = await getProjectMap(projectId);
-      const now = requestGate.current.getContext();
-      if (now.generation !== context.generation || now.projectId !== projectId || now.revision !== currentRevision) return;
+      if (!optionalRequestCurrent(context, 'map', id)) return;
       if ((result.project_id && result.project_id !== projectId) || (result.repository_revision && result.repository_revision !== currentRevision)) throw new Error('map_context_mismatch');
       setProjectMap(result);
+      setMapStatus('ready');
     } catch {
-      const now = requestGate.current.getContext();
-      if (now.generation === context.generation && now.projectId === projectId && now.revision === currentRevision) setMapError('地图接口不可用或版本不匹配，请重试。');
+      if (optionalRequestCurrent(context, 'map', id)) {
+        setMapError('地图接口不可用或版本不匹配，请重试。');
+        setMapStatus('error');
+      }
     }
   }
 
@@ -323,12 +353,15 @@ export default function App() {
     resetActiveTab = true
   ) {
     const token = beginContextChange('context', nextWorkspaceId);
+    if (resetActiveTab) setActiveTab('ask');
     setWorkspaceLoading(true);
     setMessage('正在从项目库重新打开持久化项目…');
     const probe = beginConnectionProbe();
     try {
       const workspace = await getWorkspace(nextWorkspaceId);
+      if (!requestGate.current.isActive(token)) return false;
       const loaded = await loadAll(workspace.active_snapshot.project_id);
+      if (loaded.project.project.id !== workspace.active_snapshot.project_id) throw new Error('项目身份与当前快照不一致。');
       if (
         !requestGate.current.commitContext(token, {
           workspaceId: workspace.workspace_id,
@@ -362,7 +395,7 @@ export default function App() {
       setReport('');
       requestGate.current.clearContext(token);
       setMessage(
-        `${error instanceof Error ? error.message : '项目重新打开失败'} 请从项目库选择其他项目或重新分析。`
+        `项目重新打开失败：${error instanceof Error ? error.message : '无法读取必需的项目资料'} 请从项目库选择其他项目或重新分析。`
       );
       return false;
     } finally {
@@ -630,18 +663,18 @@ export default function App() {
     />;
     if (!hasProject || !project) return <EmptyState />;
     if (activeTab === 'dashboard') return <Dashboard project={project} />;
-    if (activeTab === 'map') return <ProjectMapView key={`${workspaceId}:${projectId}:${currentRevision}`} projectId={projectId} revision={currentRevision} workspaceId={workspaceId} projectMap={projectMap} error={mapError} loading={workspaceLoading} onRetry={() => void retryMap()} />;
+    if (activeTab === 'map') return <ProjectMapView key={`${workspaceId}:${projectId}:${currentRevision}`} projectId={projectId} revision={currentRevision} workspaceId={workspaceId} projectMap={projectMap} error={mapError} loading={workspaceLoading || mapStatus === 'loading'} onRetry={() => void retryMap()} />;
     if (activeTab === 'learning') return <LearningView steps={learningSteps} continuity={continuity} />;
-    if (activeTab === 'report') return <ReportView markdown={report} />;
+    if (activeTab === 'report') return <section className="wb-page"><h1>项目分析报告</h1><p>项目静态分析资料，按需查看和导出。</p>{reportStatus === 'loading' ? <p role="status">正在读取报告…</p> : reportStatus === 'error' ? <div role="alert">报告读取失败。<button type="button" onClick={() => void retryReport()}>重试报告</button></div> : reportStatus === 'idle' ? <p>报告尚未加载。</p> : report ? <ReportView markdown={report} /> : <p>接口未返回报告内容。</p>}</section>;
     return null;
-  }, [activeTab, analysisLoading, configStatus, continuity, continuityState, currentRevision, deletingProjectId, hasProject, libraryStatus, mapError, project, projectId, projectMap, report, revisionCheck, source, sourceType, updateRun, updateState, workspaceId, workspaceLoading, workspaces]);
+  }, [activeTab, analysisLoading, configStatus, continuity, continuityState, currentRevision, deletingProjectId, hasProject, libraryStatus, mapError, mapStatus, reportStatus, project, projectId, projectMap, report, revisionCheck, source, sourceType, updateRun, updateState, workspaceId, workspaceLoading, workspaces]);
 
   return <Workbench contextGeneration={requestGate.current.getContext().generation} project={project} workspaces={workspaces} workspaceId={workspaceId} revision={currentRevision} executionMode={executionMode} onExecutionModeChange={setExecutionMode}
     question={question} answers={displayedAnswers} history={history} error={askError} loading={askLoading}
     libraryLoading={libraryStatus === 'loading'} projectLoading={workspaceLoading || analysisLoading}
     statusMessage={connectionError || message} activePage={activeTab}
     content={activeContent} onQuestionChange={setQuestion} onSubmit={handleAsk}
-    onOpenWorkspace={(id) => void openWorkspace(id, 'selection', '已切换项目；回答和引用已清空。', false)}
+    onOpenWorkspace={(id) => void openWorkspace(id, 'selection', '已切换项目；回答和引用已清空。')}
     onRefreshLibrary={() => void loadWorkspaceLibrary()} onNavigate={setActiveTab} />;
 }
 
@@ -649,11 +682,11 @@ function EmptyState() {
   return (
     <div className="empty-state">
       <Waypoints aria-hidden="true" />
-      <h1>把仓库变成学习路线</h1>
-      <p>系统会先抓取公开仓库，再用静态分析识别入口、依赖、模块和核心文件，最后生成适合初学者的导读结果。</p>
+      <h1>打开项目，围绕源码提问</h1>
+      <p>从项目库选择已分析的仓库，阅读回答并通过源码引用核对实现。</p>
       <div className="empty-grid">
         <span>项目地图</span>
-        <span>学习任务</span>
+        <span>源码问答</span>
         <span>源码引用</span>
         <span>报告导出</span>
       </div>
@@ -685,7 +718,7 @@ function ManagementView({
     </section>
     {workspaceId && <section className={`wb-panel wb-update ${updateState}`} aria-label="revision 更新"><h2>Revision 更新</h2><p>当前：{currentRevision.slice(0, 12) || 'unknown'}</p>{revisionCheck?.state === 'update_available' && <p>可用：{revisionCheck.available_revision.slice(0, 12)}</p>}{updateState === 'updating' && <p>阶段：{updateRun?.phase}</p>}{updateState === 'failed' && <p className="wb-notice">{updateRun?.error_code || 'update_failed'}</p>}<div className="wb-row-actions"><button type="button" onClick={onCheckRevision} disabled={updateState === 'updating'}>检查更新</button>{updateState === 'update-available' && <button type="button" onClick={onStartRefresh}>确认更新</button>}{updateState === 'failed' && updateRun?.retryable && <button type="button" onClick={onRetryRefresh}>安全重试</button>}</div></section>}
     {workspaceId && continuityState !== 'not-required' && continuity && <section className="wb-panel" aria-label="学习连续性"><h2>跨版本学习连续性</h2><p>状态：{continuityState}</p>{continuityState === 'failed' && <p className="wb-notice">{continuity.error_code || 'continuity_failed'}；旧 mastery 未用于当前 revision。</p>}{continuityState === 'failed' && continuity.retryable && <button type="button" onClick={onRetryContinuity}>重试学习连续性</button>}</section>}
-    <section className="wb-panel"><h2>导入项目</h2><form className="analyze-form wb-import-form" onSubmit={onAnalyze}><label htmlFor="repo-source">仓库来源</label><div className="source-toggle" role="group" aria-label="仓库来源"><button type="button" className={sourceType === 'local' ? 'active' : ''} onClick={() => onSourceType('local')}>本地目录</button><button type="button" className={sourceType === 'git_url' ? 'active' : ''} onClick={() => onSourceType('git_url')}>公开 HTTPS Git</button></div><input id="repo-source" value={source} onChange={(event) => onSourceChange(event.target.value)} placeholder={sourceType === 'local' ? 'D:\\Project\\my-python-repo' : 'https://host/owner/repo.git'} required /><button type="submit" disabled={analysisLoading}>{analysisLoading ? <RefreshCw className="spin" /> : <GitBranch />}<span>{analysisLoading ? '分析中' : '开始分析'}</span></button></form></section>
+    <section className="wb-panel"><h2>导入项目</h2><p>首次导入需要预先准备本地 BGE-M3 权重并建立索引，不需要生成模型。已有项目的报错定位、用例对照和源码阅读也不调用生成模型。</p><form className="analyze-form wb-import-form" onSubmit={onAnalyze}><label htmlFor="repo-source">仓库来源</label><div className="source-toggle" role="group" aria-label="仓库来源"><button type="button" className={sourceType === 'local' ? 'active' : ''} onClick={() => onSourceType('local')}>本地目录</button><button type="button" className={sourceType === 'git_url' ? 'active' : ''} onClick={() => onSourceType('git_url')}>公开 HTTPS Git</button></div><input id="repo-source" value={source} onChange={(event) => onSourceChange(event.target.value)} placeholder={sourceType === 'local' ? 'D:\\Project\\my-python-repo' : 'https://host/owner/repo.git'} required /><button type="submit" disabled={analysisLoading}>{analysisLoading ? <RefreshCw className="spin" /> : <GitBranch />}<span>{analysisLoading ? '分析中' : '开始分析'}</span></button></form></section>
     <section className="wb-panel wb-provider"><strong>{providerSummary(configStatus)}</strong><span>BGE-M3：{configStatus ? `${configStatus.embedding.model} / ${configStatus.embedding.device} / ${configStatus.embedding.offline ? 'offline' : 'online'}${configStatus.embedding.ready ? '' : `；缺少 ${configStatus.embedding.missing.join(', ')}`}` : '读取中'}</span><small>API Key 只保存在后端根目录 .env，不会发送到浏览器或写入项目数据库。</small></section>
   </div>;
 }

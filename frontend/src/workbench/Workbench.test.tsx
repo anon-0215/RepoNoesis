@@ -4,7 +4,7 @@ import { createRoot } from 'react-dom/client';
 import { renderToStaticMarkup } from 'react-dom/server';
 import { describe, expect, it, vi } from 'vitest';
 import { Workbench, type WorkbenchAnswer } from './Workbench';
-import type { AskFailure } from '../types';
+import type { AskFailure, ChatHistoryRecord } from '../types';
 
 const answer = (text: string, symbol: string): WorkbenchAnswer => ({
   question: `question for ${symbol}`,
@@ -28,6 +28,76 @@ function view(answers: WorkbenchAnswer[], currentRevision = revision) {
 }
 
 describe('answer-owned evidence and execution summary', () => {
+  it('keeps diagnostic truncation in neutral execution details', () => {
+    const item = boundAnswer('truncated', 'E1', 'source');
+    item.result!.execution_summary!.diagnostics_truncated = true;
+    const host = document.createElement('div');
+    host.innerHTML = renderToStaticMarkup(view([item]));
+    expect(host.querySelector('.wb-outcome')).toBeNull();
+    expect(host.querySelector('.wb-execution')?.textContent).toContain('诊断详情');
+  });
+  it('collapses completed progress while keeping pending and failed progress visible', () => {
+    const complete = boundAnswer('done', 'E1', 'source');
+    complete.progress = [{ request_id: 'r', client_request_id: '1', project_id: 'p', repository_revision: revision, sequence: 1, type: 'answer_started' }];
+    const success = renderToStaticMarkup(view([complete]));
+    expect(success).toContain('<details class="wb-process">');
+    expect(success).toContain('答案生成开始');
+    const pending = renderToStaticMarkup(view([{ ...complete, status: 'pending', result: undefined }]));
+    expect(pending).not.toContain('class="wb-process"');
+    expect(pending).toContain('执行进度 · 执行中');
+    const failed = renderToStaticMarkup(view([{ ...complete, status: 'failure', result: undefined, errorMessage: '连接中断，最终状态未知' }]));
+    expect(failed).not.toContain('class="wb-process"');
+    expect(failed).toContain('最终状态未知');
+  });
+  it('keeps warnings and abnormal summary outcomes outside collapsed details', () => {
+    const item = boundAnswer('warning', 'E1', 'source');
+    item.result!.warnings = ['保留的真实警告'];
+    item.result!.execution_summary = { status: 'degraded', citation_validation_passed: false };
+    const markup = renderToStaticMarkup(view([item]));
+    expect(markup).toContain('class="wb-outcome"');
+    expect(markup).toContain('降级完成');
+    expect(markup).toContain('引用身份与范围校验未通过');
+    expect(markup).toContain('<p class="wb-warnings">保留的真实警告</p>');
+  });
+  it('returns focus to a Markdown entry even when that button was remounted', async () => {
+    const host = document.createElement('div'); document.body.appendChild(host); const root = createRoot(host);
+    await act(async () => root.render(view([boundAnswer('first', 'E1', 'first')])));
+    await act(async () => (host.querySelector('.wb-evidence-marker') as HTMLButtonElement).click());
+    expect(document.activeElement?.getAttribute('aria-label')).toBe('关闭源码栏');
+    await act(async () => (host.querySelector('[aria-label="关闭源码栏"]') as HTMLButtonElement).click());
+    expect(document.activeElement).toBe(host.querySelector('.wb-evidence-marker'));
+    await act(async () => root.unmount()); host.remove();
+  });
+  it('keeps missing historical fields explicit and separates compact metadata from full revision', async () => {
+    const history: ChatHistoryRecord = {
+      record_id: '99', project_id: 'p', repository_revision: revision, revision_source: 'saved',
+      identity_status: 'reliable', created_at: '2001-02-03 04:05:06', question: 'saved question',
+      answer: 'saved answer', citations: [], citations_status: 'available', recovery_metadata: null,
+      metadata_status: 'missing', snapshot_status: 'superseded', is_current_snapshot: false,
+      full_file_available: false, full_file_unavailable_reason: 'history_snapshot_old'
+    };
+    const host = document.createElement('div'); document.body.appendChild(host); const root = createRoot(host);
+    await act(async () => root.render(view([{ id: 'saved:99', status: 'success', question: history.question, history, revision, projectId: 'p' }])));
+    expect(host.querySelector('.wb-history-meta')?.textContent).toContain('2001-02-03 04:05:06');
+    expect(host.querySelector('.wb-history-meta')?.textContent).toContain('模式：未提供');
+    expect(host.querySelector('.wb-history-meta')?.textContent).toContain('旧版本');
+    expect(host.querySelector('.wb-history-meta')?.textContent).not.toContain(revision);
+    expect(host.querySelector<HTMLDetailsElement>('.wb-history-details')?.open).toBe(false);
+    expect(host.querySelector('.wb-history-details')?.textContent).toContain(revision);
+    expect(host.querySelector('.wb-warnings')?.textContent).toContain('生成时执行信息未提供');
+    expect(host.querySelector('.wb-answer-head')?.textContent).not.toContain('源码引用已校验');
+    await act(async () => root.unmount()); host.remove();
+  });
+  it('retains all received completed checkpoints inside the collapsed process', () => {
+    const item = boundAnswer('complete', 'E1', 'source');
+    item.progress = Array.from({ length: 9 }, (_, index) => ({
+      request_id: 'r', client_request_id: '1', project_id: 'p', repository_revision: revision,
+      sequence: index + 1, type: 'tool_completed', status: 'succeeded'
+    }));
+    const markup = renderToStaticMarkup(view([item]));
+    expect(markup.match(/补充工具已执行/g)).toHaveLength(9);
+    expect(markup).toContain('<details class="wb-process">');
+  });
   it('marks a validated lexical fallback as a successful answer', () => {
     const item = boundAnswer('lexical-fallback', 'E1', 'auth');
     item.result!.execution_mode = 'rag';

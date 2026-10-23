@@ -5,10 +5,12 @@ import importlib.util
 import json
 import math
 import re
+import time
+from contextlib import contextmanager
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
-from threading import BoundedSemaphore, RLock
+from threading import BoundedSemaphore, RLock, local
 from typing import Any, Callable, Protocol, Sequence
 
 from app.config import EmbeddingSettings, clamp_embedding_max_length, get_embedding_settings
@@ -244,30 +246,166 @@ class EmbeddingService:
         self._semantic_executor: ThreadPoolExecutor | None = None
         self._semantic_executor_lock = RLock()
         self._load_state = "unready"
+        self._task_local = local()
+        self._tasks: dict[int, dict[str, Any]] = {}
+        self._last_task: dict[str, Any] | None = None
+        self._next_task_id = 0
+        self._closed = False
+        self._preparation_future: Future[Any] | None = None
+        self._preparation_state = "unready"
+        self._preparation_summary: dict[str, Any] | None = None
 
     @property
     def model_load_state(self) -> str:
+        if self._preparation_state == "loading":
+            return "loading"
+        if self._preparation_state == "failed":
+            return "failed"
         return self._load_state
 
-    def submit_semantic_work(self, work: Callable[[], Any]) -> Future[Any]:
+    def runtime_status(self) -> dict[str, Any]:
+        """Bounded, content-free snapshots; never wait for the native model lock."""
+        with self._semantic_executor_lock:
+            now = time.monotonic()
+            tasks = [{**{k: v for k, v in task.items() if k != "started_at"},
+                      "elapsed_ms": int((now - task["started_at"]) * 1000)}
+                     for task in self._tasks.values()]
+            return {
+                "model_state": self.model_load_state,
+                "preparation_state": self._preparation_state,
+                "ready": self.model_load_state == "ready" and not self._closed,
+                "closed": self._closed,
+                "active_tasks": len(tasks),
+                "capacity": 2,
+                "tasks": tasks,
+                "last_task": dict(self._last_task) if self._last_task else None,
+                "preparation": dict(self._preparation_summary) if self._preparation_summary else None,
+            }
+
+    @contextmanager
+    def observe_phase(self, phase: str):
+        task_id = getattr(self._task_local, "task_id", None)
+        started = time.monotonic()
+        with self._semantic_executor_lock:
+            task = self._tasks.get(task_id)
+            previous = task.get("phase", "semantic") if task else "semantic"
+            if task is not None:
+                task["phase"] = phase
+        try:
+            yield
+        except BaseException:
+            with self._semantic_executor_lock:
+                if task is not None:
+                    task.setdefault("failed_phase", phase)
+            raise
+        finally:
+            with self._semantic_executor_lock:
+                if task is not None:
+                    key = phase + "_ms"
+                    task[key] = task.get(key, 0) + int((time.monotonic()-started)*1000)
+                    task["phase"] = previous
+
+    @contextmanager
+    def _model_lock(self):
+        with self.observe_phase("lock_wait"):
+            self._lock.acquire()
+        try:
+            yield
+        finally:
+            self._lock.release()
+
+    def start_preparation(self) -> Future[Any] | None:
+        """Normal startup owns one local load/first encode, never a reindex."""
+        with self._semantic_executor_lock:
+            if not self.settings.enabled or self._closed:
+                return None
+            if self._preparation_future is not None:
+                return self._preparation_future
+            self._preparation_state = "loading"
+            def prepare() -> None:
+                try:
+                    with self.observe_phase("model_identity"):
+                        self.load_model(local_files_only=True)
+                    if not self._closed:
+                        self.encode_query("source code", local_files_only=True)
+                        self._preparation_state = "ready"
+                except BaseException:
+                    self._preparation_state = "failed"
+                    raise
+            try:
+                self._preparation_future = self.submit_semantic_work(prepare, purpose="startup")
+            except (EmbeddingError, OSError, RuntimeError) as exc:
+                self._preparation_state = "failed"
+                self._preparation_summary = {
+                    "purpose": "startup", "status": "failed", "failed_phase": "submission",
+                    "exception_type": type(exc).__name__,
+                    "cause_type": type(exc.__cause__).__name__ if exc.__cause__ else None,
+                }
+                raise
+            return self._preparation_future
+
+    def close(self) -> None:
+        """Stop submissions; running native work retains its slot until return."""
+        with self._semantic_executor_lock:
+            self._closed = True
+            executor = self._semantic_executor
+            idle = not self._tasks
+        if executor is not None:
+            executor.shutdown(wait=False, cancel_futures=True)
+        if idle:
+            self.unload_model()
+
+    def submit_semantic_work(self, work: Callable[[], Any], *, purpose: str = "retrieval") -> Future[Any]:
         if not self._semantic_slots.acquire(blocking=False):
             raise SemanticCapacityUnavailable("semantic workers are occupied")
         try:
             with self._semantic_executor_lock:
+                if self._closed:
+                    raise SemanticCapacityUnavailable("semantic service is closed")
                 if self._semantic_executor is None:
                     self._semantic_executor = ThreadPoolExecutor(
                         max_workers=2, thread_name_prefix="rn-semantic"
                     )
                 executor = self._semantic_executor
+                self._next_task_id += 1
+                task_id = self._next_task_id
+                task = {"task_id": task_id, "purpose": purpose, "started_at": time.monotonic(),
+                        "phase": "queued", "status": "running"}
+                self._tasks[task_id] = task
 
             def run() -> Any:
+                self._task_local.task_id = task_id
+                task["phase"] = "semantic"
                 try:
                     return work()
+                except BaseException as exc:
+                    task["status"] = "failed"
+                    task["exception_type"] = type(exc).__name__
+                    task["cause_type"] = type(exc.__cause__).__name__ if exc.__cause__ else None
+                    raise
                 finally:
-                    self._semantic_slots.release()
+                    self._task_local.task_id = None
 
-            return executor.submit(run)
+            future = executor.submit(run)
+            def finished(done: Future[Any]) -> None:
+                with self._semantic_executor_lock:
+                    task["status"] = ("cancelled" if done.cancelled() else
+                                      "failed" if done.exception() is not None else "completed")
+                    task["elapsed_ms"] = int((time.monotonic()-task["started_at"])*1000)
+                    self._last_task = {k:v for k,v in task.items() if k != "started_at"}
+                    if purpose == "startup":
+                        self._preparation_summary = dict(self._last_task)
+                    self._tasks.pop(task_id, None)
+                    self._semantic_slots.release()
+                    unload = self._closed and not self._tasks
+                if unload:
+                    self.unload_model()
+            future.add_done_callback(finished)
+            return future
         except BaseException:
+            with self._semantic_executor_lock:
+                if "task_id" in locals():
+                    self._tasks.pop(task_id, None)
             self._semantic_slots.release()
             raise
 
@@ -278,36 +416,45 @@ class EmbeddingService:
         check_active: Callable[[], None] | None = None,
     ) -> None:
         _check_active(check_active)
-        with self._lock:
+        with self._model_lock():
             _check_active(check_active)
             if self._backend is not None:
                 return
-            if not self.settings.enabled:
-                raise EmbeddingConfigurationError("embeddings are disabled by EMBEDDING_ENABLED")
-            if self.settings.provider != "local_bge_m3":
-                raise EmbeddingConfigurationError(
-                    "EMBEDDING_PROVIDER must be local_bge_m3 for the local product path"
+            self._load_state = "loading"
+            try:
+                if not self.settings.enabled:
+                    raise EmbeddingConfigurationError("embeddings are disabled by EMBEDDING_ENABLED")
+                if self.settings.provider != "local_bge_m3":
+                    raise EmbeddingConfigurationError(
+                        "EMBEDDING_PROVIDER must be local_bge_m3 for the local product path"
+                    )
+                local_files_only = bool(local_files_only or self.settings.offline)
+                device = resolve_embedding_device(self.settings.device, self._cuda_available)
+                identity = build_model_identity(
+                    self.settings.model_name_or_path,
+                    device,
+                    self.settings.model_revision,
                 )
-            local_files_only = bool(local_files_only or self.settings.offline)
-            device = resolve_embedding_device(self.settings.device, self._cuda_available)
-            identity = build_model_identity(
-                self.settings.model_name_or_path,
-                device,
-                self.settings.model_revision,
-            )
+            except EmbeddingError:
+                self._load_state = "failed"
+                raise
+            except (OSError, RuntimeError) as exc:
+                self._load_state = "failed"
+                raise EmbeddingModelLoadError("embedding initialization failed") from exc
             try:
                 _check_active(check_active)
                 self._load_state = "loading"
                 backend = self._backend_factory()
                 if isinstance(backend, SentenceTransformerEmbeddingBackend):
                     backend.local_files_only = local_files_only
-                backend.load_model(
-                    self.settings.model_name_or_path,
-                    device,
-                    self.settings.cache_dir,
-                    clamp_embedding_max_length(self.settings.max_length),
-                    self.settings.model_revision,
-                )
+                with self.observe_phase("model_load"):
+                    backend.load_model(
+                        self.settings.model_name_or_path,
+                        device,
+                        self.settings.cache_dir,
+                        clamp_embedding_max_length(self.settings.max_length),
+                        self.settings.model_revision,
+                    )
             except EmbeddingError:
                 self._load_state = "failed"
                 raise
@@ -399,7 +546,9 @@ class EmbeddingService:
             return self._identity
         device = (
             self.settings.device
-            if self.settings.device != "auto"
+            # A failed initialization has no verified runtime device. Health
+            # must not repeat the failed probe or infer a CPU fallback.
+            if self.settings.device != "auto" or self.model_load_state == "failed"
             else ("cuda" if self._cuda_available() else "cpu")
         )
         return build_model_identity(
@@ -475,7 +624,7 @@ class EmbeddingService:
         return self._dimension
 
     def unload_model(self) -> None:
-        with self._lock:
+        with self._model_lock():
             if self._backend is not None:
                 self._backend.unload_model()
             self._backend = None
@@ -500,7 +649,7 @@ class EmbeddingService:
         check_active: Callable[[], None] | None = None,
     ) -> list[list[float]]:
         _check_active(check_active)
-        with self._lock:
+        with self._model_lock():
             self.load_model(
                 local_files_only=local_files_only,
                 check_active=check_active,
@@ -510,11 +659,12 @@ class EmbeddingService:
             identity = self.get_model_identity()
             try:
                 _check_active(check_active)
-                raw_vectors = self._backend.encode(
-                    texts,
-                    batch_size=self.settings.batch_size,
-                    normalize=self.settings.normalize,
-                )
+                with self.observe_phase("query_encode" if operation == "query" else "document_encode"):
+                    raw_vectors = self._backend.encode(
+                        texts,
+                        batch_size=self.settings.batch_size,
+                        normalize=self.settings.normalize,
+                    )
                 _check_active(check_active)
             except EmbeddingError:
                 raise
@@ -533,6 +683,8 @@ class EmbeddingService:
                 if any(len(vector) != dimension for vector in vectors):
                     raise EmbeddingEncodeError("embedding backend returned inconsistent dimensions")
                 self._dimension = dimension
+                if operation == "query" and self._preparation_state == "failed":
+                    self._preparation_state = "ready"
             return vectors
 
 

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from app.source_lines import source_lines as physical_source_lines
+
 import ast
 from dataclasses import asdict, dataclass
 import hashlib
@@ -254,7 +256,7 @@ class PythonRelationIndexer:
                 symbol_name=PurePosixPath(path).name,
                 qualified_name=_module_name(path),
                 start_line=1,
-                end_line=max(1, len(content.splitlines())),
+                end_line=max(1, len(physical_source_lines(content))),
                 content_hash=hashlib.sha256(content.encode("utf-8")).hexdigest(),
             )
             nodes.append(node)

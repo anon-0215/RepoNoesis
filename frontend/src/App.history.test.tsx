@@ -63,6 +63,49 @@ beforeEach(() => {
 afterEach(async () => { await act(async () => root.unmount()); vi.resetAllMocks(); vi.unstubAllGlobals(); window.localStorage.clear(); host.remove(); });
 
 describe('database history integration', () => {
+  it('opens QA without fetching optional map, learning or report data', async () => {
+    vi.mocked(getLearningPath).mockRejectedValue(new Error('learning unavailable'));
+    vi.mocked(getReport).mockRejectedValue(new Error('report unavailable'));
+    await mount();
+    expect(host.querySelector('.wb-composer textarea')).not.toBeNull();
+    expect(getChatHistory).toHaveBeenCalled();
+    expect(getLearningPath).not.toHaveBeenCalled();
+    expect(getProjectMap).not.toHaveBeenCalled();
+    expect(getReport).not.toHaveBeenCalled();
+    expect(host.querySelector('.wb-nav')?.textContent).toBe('源码问答项目地图源码探索');
+  });
+  it('loads optional pages on demand with separate error and retry states', async () => {
+    vi.mocked(getReport).mockRejectedValueOnce(new Error('report unavailable')).mockResolvedValueOnce({ markdown: 'analysis material' });
+    await mount(); await click('项目地图');
+    expect(host.textContent).toContain('地图接口不可用');
+    await click('重试'); expect(getProjectMap).toHaveBeenCalledTimes(2);
+    await click('项目分析报告');
+    expect(host.textContent).toContain('报告读取失败');
+    await click('重试报告');
+    expect(host.querySelector<HTMLTextAreaElement>('.report-box')?.value).toBe('analysis material');
+  });
+  it('rejects late optional responses across workspace changes', async () => {
+    const delayed = deferred<{ markdown: string }>();
+    vi.mocked(getReport).mockReturnValueOnce(delayed.promise).mockResolvedValue({ markdown: 'project 2 report' });
+    await mount(); await click('项目分析报告'); await click('project 2');
+    await act(async () => { delayed.resolve({ markdown: 'stale project 1 report' }); await flush(); });
+    expect(host.textContent).not.toContain('stale project 1 report');
+    await click('项目分析报告');
+    expect(host.querySelector<HTMLTextAreaElement>('.report-box')?.value).toBe('project 2 report');
+  });
+  it('discards a late map and keeps a required project failure visible', async () => {
+    const delayed = deferred<Awaited<ReturnType<typeof getProjectMap>>>();
+    vi.mocked(getProjectMap).mockReturnValueOnce(delayed.promise).mockRejectedValue(new Error('map unavailable'));
+    await mount(); await click('项目地图'); await click('project 2');
+    await act(async () => { delayed.resolve({ project_id: 'p1', repository_revision: 'rev-a', tree: { name: 'stale-map', path: '', type: 'directory', children: [] }, modules: [], dependency_edges: [], core_files: [] }); await flush(); });
+    await click('项目地图');
+    expect(host.textContent).toContain('地图接口不可用');
+    expect(host.textContent).not.toContain('stale-map');
+    vi.mocked(getProject).mockRejectedValueOnce(new Error('required project unavailable'));
+    await click('project 1');
+    expect(host.querySelector('[role="alert"]')?.textContent).toContain('required project unavailable');
+    expect(host.querySelector<HTMLTextAreaElement>('.wb-composer textarea')?.disabled).toBe(true);
+  });
   it('restores on reload and reopening with original time and a stable decimal ID', async () => {
     vi.mocked(getChatHistory).mockResolvedValue(page([record()])); await mount();
     expect(host.querySelector('[data-answer-id="saved:9007199254740993"]')).not.toBeNull();

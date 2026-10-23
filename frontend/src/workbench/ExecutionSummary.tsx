@@ -53,6 +53,6 @@ export function ExecutionSummary({ result, failure, mode, historical = false }: 
       count(summary.tool_duration_ms) !== null ? `工具执行（含基础检索）${summary.tool_duration_ms} 毫秒` : null,
       count(summary.finalization_duration_ms) !== null ? `回答整理 ${summary.finalization_duration_ms} 毫秒` : null
     ].filter(Boolean).join(' · ')}</p>}
-    {summary.diagnostics_truncated && <small>诊断详情已裁剪；上方计数仅使用独立聚合字段。</small>}
+    {summary.diagnostics_truncated && <small>诊断详情仅保存了部分内容；上方计数来自独立聚合字段。</small>}
   </>}</div></details>;
 }

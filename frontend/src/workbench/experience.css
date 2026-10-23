@@ -1,0 +1,61 @@
+/* The question, answer and composer share one reading column. */
+:root[data-theme="light"] { --wb-canvas: #f7f9f8; --wb-surface: #ffffff; --wb-rail: #f0f4f2; --wb-soft: #edf3f0; --wb-line: #dce5e0; --wb-accent: #176e64; }
+:root[data-theme="dark"] { --wb-canvas: #181e1c; --wb-surface: #202825; --wb-rail: #1c2421; --wb-soft: #29342f; --wb-line: #394840; }
+.wb-frame { font-family: "Segoe UI", "Microsoft YaHei", sans-serif; grid-template-columns: 224px minmax(0,1fr) 0; }
+.wb-frame.source-open { grid-template-columns: 224px minmax(420px,1fr) minmax(320px,380px); }
+.wb-main { position: relative; }
+.wb-scroll { overflow-anchor: none; scrollbar-gutter: stable both-edges; }
+.wb-scroll:focus-visible { outline: 2px solid var(--wb-accent); outline-offset: -3px; }
+.wb-brand { padding-bottom: 28px; }
+.wb-brand strong { font-size: 15px; }
+.wb-rail-title { font-size: 12px; letter-spacing: 0; }
+.wb-project-list { margin-bottom: 16px; }
+.wb-nav { border: 0; padding-top: 4px; gap: 6px; }
+.wb-nav button { padding: 11px 10px; font-size: 14px; font-weight: 600; }
+.wb-nav button.is-active { border-color: transparent; background: var(--wb-accent-soft); color: var(--wb-accent); }
+.wb-secondary { display: grid; gap: 8px; margin-top: auto; padding-top: 24px; font-size: 12px; }
+.wb-secondary button { display: flex; align-items: center; gap: 8px; padding: 9px 10px; width: 100%; border: 0; background: transparent; color: var(--wb-muted); text-align: left; font-size: 12px; }
+.wb-secondary button svg { width: 16px; height: 16px; }
+.wb-secondary button:hover { background: var(--wb-accent-soft); color: var(--wb-accent); }
+.wb-secondary summary, .wb-project-materials summary { cursor: pointer; padding: 9px 10px; color: var(--wb-muted); font-size: 12px; }
+.wb-project-materials { margin-top: 18px; }
+.wb-project-materials>div { padding: 0 10px 12px; font-size: 12px; overflow-wrap: anywhere; }
+.wb-project-materials h3 { font-size: 12px; margin: 18px 0 6px; }
+.wb-project-materials strong { font-size: 12px; }
+.wb-project-materials p { line-height: 1.7; }
+.wb-project-materials dl { display: grid; gap: 4px; color: var(--wb-muted); font-size: 11px; }
+.wb-project-materials dt { font-weight: 600; }
+.wb-project-materials dd { margin: 0 0 5px; }
+.wb-project-materials button { display: block; max-width: 100%; padding: 4px 0; border: 0; background: transparent; color: var(--wb-accent); text-align: left; overflow-wrap: anywhere; font-size: 12px; }
+.wb-project-materials button:disabled { color: var(--wb-muted); cursor: not-allowed; }
+.wb-context { min-height: 58px; border-bottom-color: transparent; background: var(--wb-canvas); padding: 10px 24px; }
+.wb-context-primary>span { display: none; }
+.wb-context-name { font-size: 14px; font-weight: 600; }
+.wb-context-meta { flex-shrink: 0; }
+.wb-theme svg { color: var(--wb-text); }
+.wb-content.wb-ask-content { width: min(844px,100%); padding: 24px 32px 48px; }
+.wb-conversation { gap: 48px; }
+.wb-conversation .wb-answer { width: 100%; max-width: none; }
+.wb-conversation .wb-answer:last-child { min-height: calc(100dvh - 220px); }
+.wb-question { margin-bottom: 26px; }
+.wb-question p { padding: 13px 17px; line-height: 1.75; }
+.wb-answer-head { margin-bottom: 18px; }
+.wb-answer-head button { border-color: transparent; background: transparent; }
+.wb-markdown { font-family: "Segoe UI", "Microsoft YaHei", sans-serif; line-height: 1.85; }
+.wb-history-controls { border: 0; background: transparent; padding: 0 0 24px; font-size: 11px; color: var(--wb-muted); }
+.wb-history-meta { font-size: 11px; }
+.wb-request-details { margin-top: 12px; color: var(--wb-muted); font-size: 11px; }
+.wb-request-details summary { cursor: pointer; }
+.wb-request-details .wb-request-context { margin: 8px 0; }
+.ask-form.wb-composer { padding: 8px 0 16px; border: 0; background: var(--wb-canvas); }
+.ask-form.wb-composer>div { position: relative; width: min(844px,calc(100% - var(--wb-scroll-gutter,0px))); padding: 12px 32px 0; }
+.wb-composer textarea { min-height: 56px; padding: 14px 16px; border: 1px solid var(--wb-line); border-radius: 14px; background: var(--wb-surface); font-size: 14px; }
+.wb-composer textarea:focus { outline: 2px solid var(--wb-accent); outline-offset: 2px; }
+.wb-composer-foot { border: 0; padding-top: 8px; margin-top: 0; }
+.wb-first-prompt .ask-form.wb-composer>div { border: 0; box-shadow: none; padding: 12px 0 0; }
+.wb-first-prompt .wb-composer textarea { background: var(--wb-surface); }
+.wb-composer .wb-latest { position: absolute; z-index: 5; right: 32px; bottom: calc(100% + 8px); padding: 9px 15px; border: 1px solid var(--wb-line); border-radius: 22px; box-shadow: 0 3px 14px #0001; background: var(--wb-surface); color: var(--wb-accent); font-size: 12px; }
+.wb-frame button:focus-visible, .wb-frame summary:focus-visible { outline: 2px solid var(--wb-accent); outline-offset: 3px; }
+@media(max-width:1030px) { .wb-frame,.wb-frame.source-open { grid-template-columns: minmax(0,1fr); } .wb-context-primary { display: flex; } .wb-context-name { min-width: 0; } }
+@media(max-width:650px) { .wb-composer-foot small { order: 3; flex-basis: 100%; text-align: left; margin-top: 2px; } .wb-composer-foot { row-gap: 5px; } }
+@media(max-width:650px) { .wb-context { padding: 10px 16px; gap: 10px; } .wb-content.wb-ask-content, .ask-form.wb-composer>div { padding-left: 20px; padding-right: 20px; } .wb-content.wb-ask-content { padding-top: 16px; } .wb-conversation { gap: 36px; } .wb-composer-foot small { font-size: 9px; } .wb-composer-foot { flex-wrap: wrap; } .wb-composer-foot>button { margin-left: auto; } .wb-composer .wb-latest { right: 20px; } }

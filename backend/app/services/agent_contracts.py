@@ -85,6 +85,8 @@ class AgentLimits:
     max_recent_learning_events: int = 8
     max_plan_steps_in_learning_context: int = 12
     max_learning_context_bytes: int = 16_384
+    budget_profile: Literal["legacy", "quality"] = "legacy"
+    base_evidence_count: int | None = None
 
 
 BudgetFailureReason = Literal[
@@ -351,6 +353,14 @@ class ToolCall:
     started_at: str | None = None
     ended_at: str | None = None
     status: str = "pending"
+    # Request-local execution facts, not Evidence or persisted citation identity.
+    proposed_parameters: dict[str, Any] | None = None
+    constrained_parameters: dict[str, Any] | None = None
+    bound_constraints: dict[str, Any] | None = None
+    effective_parameters: dict[str, Any] | None = None
+    execution_limits: dict[str, Any] | None = None
+    execution_started: bool | None = None
+    execution_stage: str = "unknown"
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

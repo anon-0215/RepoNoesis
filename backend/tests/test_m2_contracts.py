@@ -82,6 +82,9 @@ class M2ContractTests(unittest.TestCase):
                 "max_recent_learning_events": 8,
                 "max_plan_steps_in_learning_context": 12,
                 "max_learning_context_bytes": 16384,
+                # Quality is opt-in; every pre-existing default above stays frozen.
+                "budget_profile": "legacy",
+                "base_evidence_count": None,
             },
         )
 

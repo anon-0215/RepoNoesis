@@ -22,5 +22,5 @@ if not exist "node_modules\vite\bin\vite.js" (
   exit /b 1
 )
 
-"%NODE_EXE%" node_modules\vite\bin\vite.js --configLoader native --host 127.0.0.1 --port 5173
+"%NODE_EXE%" node_modules\vite\bin\vite.js --configLoader native --host 127.0.0.1 --port 5173 --strictPort
 exit /b %ERRORLEVEL%

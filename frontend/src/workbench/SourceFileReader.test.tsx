@@ -123,10 +123,10 @@ describe('snapshot full file reader', () => {
     expect(host.querySelectorAll('.wb-code-modal')).toHaveLength(1);
   });
 
-  it('uses Python line rules for CRLF, trailing newlines and uncommon separators', () => {
+  it('uses Python physical line rules without splitting Unicode characters', () => {
     expect(sourceLines('')).toEqual([]); expect(sourceLines('\n')).toEqual(['']);
     expect(sourceLines('a\r\nb\r\n')).toEqual(['a', 'b']);
     expect(sourceLines('a\rb\n\n')).toEqual(['a', 'b', '']);
-    expect(sourceLines('a\vb\fc\x1cd\x85e\u2028f\u2029')).toEqual(['a', 'b', 'c', 'd', 'e', 'f']);
+    expect(sourceLines('a\vb\fc\x1cd\x85e\u2028f\u2029')).toEqual(['a\vb\fc\x1cd\x85e\u2028f\u2029']);
   });
 });
