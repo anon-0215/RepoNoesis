@@ -1,8 +1,12 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from app.source_lines import source_lines as physical_source_lines
+
+import ast
+from dataclasses import asdict, dataclass, field, replace
 import hashlib
 from pathlib import PurePosixPath, PureWindowsPath
+import textwrap
 from typing import Any
 
 from app.database import Database
@@ -12,6 +16,23 @@ from app.services.hybrid_retriever import HybridSearchResult
 EVIDENCE_SCHEMA_VERSION = 1
 DEFAULT_EXCERPT_LIMIT = 2000
 RETRIEVAL_STRATEGY_VERSION = "weighted-rrf-v1"
+MAX_DIRECT_CALL_HINTS_PER_EVIDENCE = 4
+MAX_DIRECT_CALL_HINT_SOURCE_BYTES = 8192
+MAX_DIRECT_CALL_EXPRESSION_CHARS = 160
+MAX_DIRECT_CALL_EXPRESSION_BYTES = 512
+
+
+@dataclass(frozen=True)
+class _ExcerptCoverage:
+    """Request-local proof for one exact prefix; never a public/history field."""
+
+    start_line: int
+    end_line: int
+    excerpt_sha256: str
+    complete_end_line: int | None
+    partial_end_line: int | None
+    truncated: bool
+    source_identity: tuple[Any, ...] | None = None
 
 
 @dataclass
@@ -43,9 +64,140 @@ class Evidence:
     validation_status: str = "unvalidated"
     invalid_reason: str | None = None
     retrieval_strategy_version: str = RETRIEVAL_STRATEGY_VERSION
+    _excerpt_coverage: _ExcerptCoverage | None = field(
+        default=None, repr=False, compare=False,
+    )
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        value = asdict(self)
+        value.pop("_excerpt_coverage")
+        return value
+
+    def planner_excerpt_coverage(self) -> dict[str, Any]:
+        proof = self._excerpt_coverage
+        if (
+            proof is None
+            or proof.start_line != self.start_line
+            or proof.end_line != self.end_line
+            or not isinstance(self.excerpt, str)
+            or proof.excerpt_sha256 != hashlib.sha256(self.excerpt.encode("utf-8")).hexdigest()
+        ):
+            # Legacy Evidence or a changed excerpt cannot inherit an old proof.
+            return {"status": "unknown"}
+        return {
+            "status": "known",
+            "start_line": proof.start_line,
+            "complete_end_line": proof.complete_end_line,
+            "partial_end_line": proof.partial_end_line,
+            "truncated": proof.truncated,
+        }
+
+    def _planner_source_identity(self) -> tuple[Any, ...]:
+        # Store-assigned Evidence IDs may change; canonical source identity may not.
+        return (self.project_id, self.repository_id, self.repository_url,
+                self.repository_revision, self.path, self.language, self.code_chunk_id,
+                self.chunk_identity, self.chunk_type, self.symbol_name, self.qualified_name,
+                self.start_line, self.end_line, self.content_hash)
+
+    def _bind_planner_source(self) -> None:
+        if self._excerpt_coverage is not None:
+            self._excerpt_coverage = replace(
+                self._excerpt_coverage, source_identity=self._planner_source_identity(),
+            )
+
+    def planner_direct_call_hints(self, limit: int = MAX_DIRECT_CALL_HINTS_PER_EVIDENCE) -> dict[str, Any]:
+        """One-hop syntax from complete acquired lines, never target Evidence.
+
+        No resolution or execution is attempted. Recompute from the exact prefix;
+        private source binding prevents a changed identity retaining an old proof.
+        """
+        def unknown(reason: str) -> dict[str, Any]:
+            return {"status": "unknown", "reason": reason,
+                    "calls": [], "may_be_incomplete": True}
+
+        proof = self._excerpt_coverage
+        if (self.planner_excerpt_coverage()["status"] != "known" or proof is None
+            or proof.source_identity != self._planner_source_identity()):
+            return unknown("source_proof_unavailable_or_changed")
+        if self.language.casefold() != "python":
+            return {"status": "unavailable", "reason": "unsupported_language",
+                    "calls": [], "may_be_incomplete": True}
+        if len(self.excerpt.encode("utf-8")) > MAX_DIRECT_CALL_HINT_SOURCE_BYTES:
+            return unknown("analysis_input_limit")
+        if proof.complete_end_line is None:
+            return unknown("no_complete_source_lines")
+        line_count = proof.complete_end_line - self.start_line + 1
+        # Never parse a partial final line, even if its prefix looks like a call.
+        # Normalize only the AST analysis copy. CRLF blank lines otherwise
+        # contribute a zero-indent margin to textwrap.dedent. Original text,
+        # identity/hash and complete-line proof remain unchanged.
+        analysis_text = "".join(physical_source_lines(self.excerpt, keepends=True)[:line_count])
+        source = textwrap.dedent(analysis_text.replace("\r\n", "\n").replace("\r", "\n"))
+        try:
+            tree = ast.parse(source)
+        except (SyntaxError, ValueError, RecursionError):
+            return unknown("parse_unavailable")
+        calls = []
+        incomplete = proof.truncated
+        limit = max(0, min(MAX_DIRECT_CALL_HINTS_PER_EVIDENCE, limit))
+        nodes = sorted((n for n in ast.walk(tree) if isinstance(n, ast.Call)),
+                       key=lambda n: (n.lineno, n.col_offset))
+        for node in nodes:
+            if node.end_lineno is None or node.end_lineno > line_count:
+                incomplete = True
+                continue
+            expression = ast.get_source_segment(source, node.func)
+            if (not expression or len(expression) > MAX_DIRECT_CALL_EXPRESSION_CHARS
+                or len(expression.encode("utf-8")) > MAX_DIRECT_CALL_EXPRESSION_BYTES):
+                incomplete = True
+                continue
+            if len(calls) >= limit:
+                incomplete = True
+                break
+            calls.append({
+                "callee_expression": expression,
+                "start_line": self.start_line + node.lineno - 1,
+                "end_line": self.start_line + node.end_lineno - 1,
+                "resolution_status": "unresolved",
+            })
+        return {"status": "available", "calls": calls,
+                "may_be_incomplete": incomplete}
+
+
+def _excerpt_coverage(
+    content: str, excerpt: str, start_line: int, end_line: int,
+) -> _ExcerptCoverage | None:
+    """A complete line includes its existing terminator (CRLF is indivisible).
+
+    A final source line without a terminator is complete only if fully present.
+    A cutoff exactly after a complete line has no partial line. Empty or
+    inconsistent source/location data yields unknown coverage.
+    """
+    lines = physical_source_lines(content, keepends=True)
+    if (
+        type(start_line) is not int or type(end_line) is not int
+        or start_line < 1 or end_line < start_line
+        or len(lines) != end_line - start_line + 1
+        or not excerpt or not content.startswith(excerpt)
+    ):
+        return None
+    offset = 0
+    complete_end = partial_end = None
+    for number, line in enumerate(lines, start_line):
+        if len(excerpt) >= offset + len(line):
+            complete_end = number
+        elif len(excerpt) > offset:
+            partial_end = number
+            break
+        else:
+            break
+        offset += len(line)
+    return _ExcerptCoverage(
+        start_line=start_line, end_line=end_line,
+        excerpt_sha256=hashlib.sha256(excerpt.encode("utf-8")).hexdigest(),
+        complete_end_line=complete_end, partial_end_line=partial_end,
+        truncated=len(excerpt) < len(content),
+    )
 
 
 class EvidenceBuilder:
@@ -106,8 +258,14 @@ class EvidenceBuilder:
                         )
                     ),
                     retrieval_strategy_version=retrieval_strategy_version,
+                    _excerpt_coverage=_excerpt_coverage(
+                        candidate.content, candidate.content[: self.excerpt_limit],
+                        candidate.start_line, candidate.end_line,
+                    ),
                 )
             )
+        for item in evidence:
+            item._bind_planner_source()
         return evidence
 
     def build_from_code_chunks(
@@ -159,8 +317,14 @@ class EvidenceBuilder:
                     fusion_rank=index,
                     selection_reason=selection_reason,
                     retrieval_strategy_version="relation-expansion-v1",
+                    _excerpt_coverage=_excerpt_coverage(
+                        content, content[: self.excerpt_limit],
+                        int(chunk["start_line"]), int(chunk["end_line"]),
+                    ),
                 )
             )
+        for item in evidence:
+            item._bind_planner_source()
         return evidence
 
 
@@ -174,6 +338,7 @@ class CitationValidator:
         evidence.invalid_reason = invalid_reason
         if invalid_reason is not None:
             evidence.excerpt = ""
+            evidence._excerpt_coverage = None
         return evidence
 
     def validate_all(
@@ -218,7 +383,7 @@ class CitationValidator:
         if evidence.start_line < 1 or evidence.end_line < evidence.start_line:
             return "invalid line range"
 
-        file_lines = str(source["file_content"]).splitlines(keepends=True)
+        file_lines = physical_source_lines(str(source["file_content"]), keepends=True)
         if evidence.end_line > len(file_lines):
             return "line range exceeds stored source"
         current_content = "".join(
@@ -244,6 +409,10 @@ class CitationValidator:
             return "chunk identity mismatch"
         if not current_content.startswith(evidence.excerpt):
             return "excerpt mismatch"
+        evidence._excerpt_coverage = _excerpt_coverage(
+            current_content, evidence.excerpt, evidence.start_line, evidence.end_line,
+        )
+        evidence._bind_planner_source()
         return None
 
 

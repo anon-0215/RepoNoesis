@@ -1,0 +1,74 @@
+{
+  "N-main": {
+    "question": "请只依据这一版本 Click 的 Parameter.handle_parse_result 正文推导，不执行被分析代码。p 和 ctx 使用原版 Parameter/Context 方法，没有子类覆盖；p.name=\"color\"、p.expose_value=True、p.deprecated=False，ctx.resilient_parsing=False。三个独立情形进入方法前都有 ctx.params[\"color\"]=\"red\"、ctx._param_default_explicit[\"color\"]=True；args 是列表 [\"rest\"]。本题明确给定：每次 p.consume_value(ctx, opts) 正常返回 (\"blue\", ParameterSource.DEFAULT)，p.process_value(ctx, \"blue\") 正常返回 \"BLUE\" 且不修改 ctx；augment_usage_errors 进入/退出正常，不改变结果或状态，除此以外没有并发或外部修改。分别考虑：① 原有参数来源是 ParameterSource.DEFAULT，p._default_explicit=False；② 原有来源是 ParameterSource.DEFAULT，p._default_explicit=True；③ 原有来源是 ParameterSource.COMMANDLINE，p._default_explicit=True。请逐项给出 handle_parse_result 的返回值、返回 args 是否仍为原列表、最终 ctx.params[\"color\"]、最终默认显式标记与最终参数来源，并说明 process_value 执行时记录的来源是什么。为什么已处理得到的 \"BLUE\" 不一定写入 ctx.params？请核查现存值快照、正文后段的同名槽位仲裁及来源恢复，不以注释代替条件判断。",
+    "revision": "6aabf099bfdd4c1e75fe8d0e0d4241372b988ab1",
+    "base": [
+      {
+        "path": "src/click/core.py",
+        "symbol": "Parameter.handle_parse_result",
+        "start_line": 2758,
+        "end_line": 2844
+      },
+      {
+        "path": "src/click/core.py",
+        "symbol": "Parameter.consume_value",
+        "start_line": 2509,
+        "end_line": 2555
+      },
+      {
+        "path": "src/click/core.py",
+        "symbol": "Parameter",
+        "start_line": 2215,
+        "end_line": 2883
+      },
+      {
+        "path": "tests/test_defaults.py",
+        "symbol": "test_parameter_source_on_parse_result_bypass",
+        "start_line": 395,
+        "end_line": 419
+      },
+      {
+        "path": "src/click/core.py",
+        "symbol": "Option.consume_value",
+        "start_line": 3628,
+        "end_line": 3682
+      }
+    ]
+  },
+  "U-boundary": {
+    "question": "只依据这一版本 Click 源码，不执行被分析代码。p 和 ctx 是已经建立的普通 Parameter/Context，使用原版方法且没有覆盖；p.name=\"level\"、p.default=7，ctx.default_map 是普通 dict。plugin_default 是项目外提供的零参数 callable，它的实现未提供，也不在当前源码快照内。以下情形各自独立；调用期间属性与字典不被外部修改。① ctx.default_map={\"level\": plugin_default} 时，p.get_default(ctx, call=False) 返回什么，plugin_default 是否已经被调用？② 同样的 default_map 下，p.get_default(ctx, call=True) 怎样调用插件；能否仅凭 Click 断言具体返回值、必然成功或不会访问网络？若另明确给定 plugin_default() 正常返回 18，整个调用返回什么；若另明确给定它抛出 ValueError(\"bad\")，该异常是否在这条调用链内被 Click 捕获后改用 7？③ ctx.default_map={\"level\": None} 时，p.get_default(ctx, call=True) 返回什么，是否改用 7？④ ctx.default_map={} 时，同一调用返回什么？请追踪 Parameter.get_default、Context.lookup_default 与 _default_map_has 的实际正文，区分确定的 Click 分支、给定外部条件及仍未知的插件行为，不因外部未知省略其他可确认结论。",
+    "revision": "6aabf099bfdd4c1e75fe8d0e0d4241372b988ab1",
+    "base": [
+      {
+        "path": "src/click/core.py",
+        "symbol": "Parameter.get_default",
+        "start_line": 2473,
+        "end_line": 2504
+      },
+      {
+        "path": "src/click/core.py",
+        "symbol": "Context.lookup_default",
+        "start_line": 790,
+        "end_line": 810
+      },
+      {
+        "path": "tests/test_defaults.py",
+        "symbol": "test_lookup_default_callable_in_default_map",
+        "start_line": 203,
+        "end_line": 235
+      },
+      {
+        "path": "tests/test_defaults.py",
+        "symbol": "test_lookup_default_override_respected",
+        "start_line": 422,
+        "end_line": 467
+      },
+      {
+        "path": "src/click/core.py",
+        "symbol": "Parameter.get_default",
+        "start_line": 2468,
+        "end_line": 2471
+      }
+    ]
+  }
+}

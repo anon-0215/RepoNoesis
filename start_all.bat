@@ -8,6 +8,6 @@ if not exist "%POWERSHELL_EXE%" (
   exit /b 1
 )
 
-"%POWERSHELL_EXE%" -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\start_local.ps1"
+"%POWERSHELL_EXE%" -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\start_local.ps1" %*
 exit /b %ERRORLEVEL%
 

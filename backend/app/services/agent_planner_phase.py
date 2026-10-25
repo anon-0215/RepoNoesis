@@ -49,6 +49,7 @@ class PlannerPhaseOperations:
     merge_server_bound_constraints: Callable[[ToolSpec | None, dict[str, Any], Any], dict[str, Any]]
     apply_request_top_k_limit: Callable[..., dict[str, Any]]
     execute_agent_tool: Callable[..., tuple[ToolCall, ToolObservation]]
+    has_pending_source_delivery: Callable[[Any], bool]
 
 
 def run_planner_enhancement(
@@ -110,6 +111,9 @@ def run_planner_enhancement(
                 planner, state, registry, diagnostics_recorder
             )
         except ProviderError as exc:
+            if exc.code == "cancelled" and state.context.cancellation.cancelled:
+                state.completion_status = "cancelled"
+                break
             now = time.monotonic()
             if operations.planner_deadline_is_recoverable(
                 exc=exc,
@@ -145,6 +149,9 @@ def run_planner_enhancement(
                     "planner", int((time.monotonic() - planner_started) * 1000)
                 )
         if decision is None:
+            if state.context.cancellation.cancelled:
+                state.completion_status = "cancelled"
+                break
             if "budget exhausted" in decision_error:
                 state.completion_status = "budget_exhausted"
                 if state.context.evidence_store.all(state.request_id):
@@ -280,6 +287,8 @@ def run_planner_enhancement(
             step_id=step_id,
             phase="planner",
             diagnostics_recorder=diagnostics_recorder,
+            proposed_arguments=dict(decision.arguments),
+            server_constraints=server_constraints,
         )
         state.steps.append(
             AgentStep(
@@ -329,7 +338,8 @@ def run_planner_enhancement(
                     "tool_budget_exhausted"
                 )
             break
-        if state.no_progress_count >= state.limits.max_no_progress_steps:
+        if (state.no_progress_count >= state.limits.max_no_progress_steps
+                and not operations.has_pending_source_delivery(state)):
             state.completion_status = (
                 "completed"
                 if state.context.evidence_store.all(state.request_id)

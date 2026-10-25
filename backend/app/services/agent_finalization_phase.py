@@ -88,6 +88,9 @@ def run_finalization_phase(
             deadline_at=state.context.deadline_monotonic,
             evidence_count=len(evidence), reason=reason))
 
+    if state.context.cancellation.cancelled:
+        state.completion_status = "cancelled"
+        return budget_failure("cancelled")
     if state.failure_reason is not None:
         return budget_failure(state.failure_reason)
     if time.monotonic() >= state.context.deadline_monotonic:
@@ -110,11 +113,16 @@ def run_finalization_phase(
         evidence_truncated = False
     valid_chains: list[Any] = []
     if relation_enabled:
-        evidence, valid_chains, relation_warnings, citation_failure = (
-            operations.validated_relation_context(
-                state, evidence, diagnostics_recorder, checkpoint="initial_evidence"
+        try:
+            evidence, valid_chains, relation_warnings, citation_failure = (
+                operations.validated_relation_context(
+                    state, evidence, diagnostics_recorder, checkpoint="initial_evidence"
+                )
             )
-        )
+        except ProviderError as exc:
+            if exc.code in {"deadline_exceeded", "cancelled"}:
+                return budget_failure(exc.code)
+            raise
         state.warnings.extend(relation_warnings)
         if citation_failure is not None:
             return FinalizationPhaseResult(
@@ -148,6 +156,17 @@ def run_finalization_phase(
         diagnostics_recorder.record_final_answer_failure("deadline_exhausted")
     try:
         state.final_answer_attempted = True
+        delivery_arguments = {}
+        ledger = getattr(state, 'directed_evidence_ledger', None)
+        if ledger is not None:
+            from app.services.directed_evidence import delivery_report, DELIVERY_GUIDANCE
+            def delivery_for_selected(selected):
+                remaining = max(0, state.limits.max_accumulated_evidence_context_bytes
+                    - sum(len(e.excerpt.encode('utf-8')) for e in selected)
+                    - len(DELIVERY_GUIDANCE.encode('utf-8')) - 128)
+                return delivery_report(ledger, selected, remaining, 'final_answer',
+                    held=state.context.evidence_store.all(state.request_id))
+            delivery_arguments['source_delivery_provider'] = delivery_for_selected
         final = operations.answer_from_evidence(question, evidence, final_llm, database,
             retrieval_mode=state.retrieval_mode, warnings=state.warnings,
             max_answer_tokens=state.limits.max_final_answer_tokens,
@@ -155,8 +174,11 @@ def run_finalization_phase(
             relation_context=operations.relation_answer_context(state, valid_chains),
             learning_context=state.context.learning_context,
             diagnostics_recorder=diagnostics_recorder,
-            request_deadline_at=state.context.deadline_monotonic)
+            request_deadline_at=state.context.deadline_monotonic, **delivery_arguments)
     except ProviderError as exc:
+        if exc.code == "cancelled" and state.context.cancellation.cancelled:
+            state.completion_status = "cancelled"
+            return budget_failure("cancelled")
         if exc.code == "deadline_exceeded":
             if diagnostics_recorder is not None:
                 diagnostics_recorder.record_final_answer_failure("deadline_exhausted")
@@ -173,13 +195,21 @@ def run_finalization_phase(
         if diagnostics_recorder is not None:
             diagnostics_recorder.record_stage_duration("finalization", int((time.monotonic() - finalization_started) * 1000))
         return budget_failure("deadline_exceeded")
+    if state.context.cancellation.cancelled:
+        state.completion_status = "cancelled"
+        return budget_failure("cancelled")
     if relation_enabled:
-        post_evidence, post_chains, post_warnings, post_failure = (
-            operations.validated_relation_context(
-                state, evidence_store.all(state.request_id), diagnostics_recorder,
-                checkpoint="post_answer_evidence"
+        try:
+            post_evidence, post_chains, post_warnings, post_failure = (
+                operations.validated_relation_context(
+                    state, evidence_store.all(state.request_id), diagnostics_recorder,
+                    checkpoint="post_answer_evidence"
+                )
             )
-        )
+        except ProviderError as exc:
+            if exc.code in {"deadline_exceeded", "cancelled"}:
+                return budget_failure(exc.code)
+            raise
         state.warnings.extend(post_warnings)
         if post_failure is not None:
             return FinalizationPhaseResult(
@@ -226,6 +256,10 @@ def run_finalization_phase(
                 ),
             )
         valid_chains = post_chains
+    if state.context.cancellation.cancelled:
+        return budget_failure("cancelled")
+    if time.monotonic() >= state.context.deadline_monotonic:
+        return budget_failure("deadline_exceeded")
     if state.completion_status == "cancelled":
         pass
     elif deterministic_fallback:

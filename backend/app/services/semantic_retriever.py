@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
+from contextlib import nullcontext
 import math
 import time
 from typing import Any, Callable
@@ -84,28 +85,32 @@ class SemanticRetriever:
         if diagnostics_recorder is not None:
             diagnostics_recorder.record_embedding_stage("model_load")
         phase_started = time.monotonic()
-        identity = self.embedding_service.ensure_effective_embedding_identity(
-            local_files_only=local_files_only,
-            check_active=check_active,
-        )
+        with (self.embedding_service.observe_phase("model_identity")
+              if hasattr(self.embedding_service, "observe_phase") else nullcontext()):
+            identity = self.embedding_service.ensure_effective_embedding_identity(
+                local_files_only=local_files_only,
+                check_active=check_active,
+            )
         if phase_timings is not None:
             phase_timings["model_identity_ms"] = int((time.monotonic() - phase_started) * 1000)
         _check(check_active)
         embedding_config_hash = identity.embedding_config_hash
         phase_started = time.monotonic()
-        candidates = self.database.get_code_chunk_embeddings_for_project(
-            project_id,
-            identity.model_name,
-            identity.backend_model_identity,
-            CODE_CHUNK_TEXT_FORMAT_VERSION,
-            embedding_config_hash,
-            self.embedding_service.settings.normalize,
-            path=path,
-            chunk_type=chunk_type,
-            language=language,
-            symbol=symbol,
-            effective_identity=identity,
-        )
+        with (self.embedding_service.observe_phase("vector_read")
+              if hasattr(self.embedding_service, "observe_phase") else nullcontext()):
+            candidates = self.database.get_code_chunk_embeddings_for_project(
+                project_id,
+                identity.model_name,
+                identity.backend_model_identity,
+                CODE_CHUNK_TEXT_FORMAT_VERSION,
+                embedding_config_hash,
+                self.embedding_service.settings.normalize,
+                path=path,
+                chunk_type=chunk_type,
+                language=language,
+                symbol=symbol,
+                effective_identity=identity,
+            )
         candidates = [
             candidate
             for candidate in candidates

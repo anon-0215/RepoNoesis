@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from app.source_lines import source_lines as physical_source_lines
+
 import ast
 import hashlib
 from dataclasses import asdict, dataclass
@@ -115,7 +117,7 @@ class _ChunkVisitor(ast.NodeVisitor):
     def __init__(self, path: str, source: str, repository_revision: str) -> None:
         self.path = path
         self.repository_revision = repository_revision
-        self.lines = source.splitlines(keepends=True)
+        self.lines = physical_source_lines(source, keepends=True)
         self.chunks: list[CodeChunk] = []
         self.warnings: list[CodeChunkWarning] = []
         self._symbol_stack: list[_SymbolContext] = []

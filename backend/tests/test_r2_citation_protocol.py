@@ -257,7 +257,7 @@ class CitationProtocolTests(unittest.TestCase):
         valid_part = {"text": "Fact", "evidence_aliases": ["A1"]}
         cases = (
             ("not json", "final_answer_invalid_json"),
-            ("```json\n" + _structured() + "\n```", "final_answer_invalid_json"),
+            ("Explanation\n```json\n" + _structured() + "\n```", "final_answer_invalid_json"),
             ("prefix " + _structured(), "final_answer_invalid_json"),
             (json.dumps([]), "final_answer_schema_invalid"),
             (json.dumps({"wrong": []}), "final_answer_schema_invalid"),
@@ -994,6 +994,7 @@ class CitationProtocolRouteTests(unittest.TestCase):
         *,
         callback=None,
         limits: AgentLimits | None = None,
+        question: str = "explain authentication",
     ):
         provider = _RouteProvider(final_output, callback=callback)
         collector = _SafeLogCollector()
@@ -1020,7 +1021,7 @@ class CitationProtocolRouteTests(unittest.TestCase):
                 _post(
                     main.app,
                     f"/api/projects/{self.project_id}/ask",
-                    {"question": "explain authentication"},
+                    {"question": question},
                 )
             )
         return status, body, provider, collector.messages
@@ -1103,7 +1104,9 @@ class CitationProtocolRouteTests(unittest.TestCase):
         )
         before = self._count()
 
-        status, body, provider, logs = self._route(final_output)
+        # Obtain both fixtures through BASE; supplemental admission is now
+        # incremental. This test still checks two real citation-eligible items.
+        status, body, provider, logs = self._route(final_output, question="authenticate_user")
 
         self.assertEqual(status, 200)
         self.assertEqual(self._count() - before, 1)

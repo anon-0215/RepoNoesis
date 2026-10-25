@@ -23,7 +23,7 @@ from app.services.evidence import (
 )
 from app.services.hybrid_retriever import DEFAULT_EVIDENCE_COUNT
 from app.services.hierarchy_normalization import HIERARCHY_MODE_OFF
-from app.services.llm_client import LLMClient, ProviderError
+from app.services.llm_client import LLMClient, ProviderError, raise_if_provider_cancelled
 from app.services.smoke_diagnostics import SmokeDiagnosticsRecorder
 from app.services.retrieval_v2 import RETRIEVAL_VERSION_V1, retrieve_code
 from app.services.relation_retrieval import (
@@ -72,6 +72,7 @@ def answer_question(
     language: str | None = None,
     symbol: str | None = None,
     evidence_count: int = DEFAULT_EVIDENCE_COUNT,
+    max_answer_tokens: int | None = None,
     retrieval_version: str = RETRIEVAL_VERSION_V1,
     hierarchy_mode: str = HIERARCHY_MODE_OFF,
     relation_mode: str = RELATION_MODE_OFF,
@@ -142,6 +143,7 @@ def answer_question(
         database,
         retrieval_mode=outcome.retrieval_mode,
         warnings=[*outcome.warnings, *([relation_warning] if relation_warning else [])],
+        max_answer_tokens=max_answer_tokens,
         diagnostics_recorder=diagnostics_recorder,
         request_deadline_at=request_deadline_at,
     )
@@ -161,6 +163,7 @@ def answer_from_evidence(
     learning_context: dict[str, Any] | None = None,
     diagnostics_recorder: SmokeDiagnosticsRecorder | None = None,
     request_deadline_at: float | None = None,
+    source_delivery_provider: Callable[[list[Evidence]], dict[str, Any] | None] | None = None,
 ) -> dict[str, Any]:
     """Generate an M1-compatible answer after server-controlled validation.
 
@@ -220,6 +223,11 @@ def answer_from_evidence(
             grounding_status="insufficient_evidence",
         )
 
+    delivery_arguments = {}
+    if source_delivery_provider is not None:
+        delivery = source_delivery_provider(valid)
+        if delivery is not None:
+            delivery_arguments['source_delivery_diagnostics'] = delivery
     answer: str | None = None
     generated_with_llm = False
     final_answer_repair_attempted = False
@@ -237,6 +245,7 @@ def answer_from_evidence(
             learning_context=learning_context,
             diagnostics_recorder=diagnostics_recorder,
             request_deadline_at=request_deadline_at,
+            **delivery_arguments,
         )
         _raise_if_deadline_expired(request_deadline_at)
         if diagnostics_recorder is not None:
@@ -281,6 +290,7 @@ def answer_from_evidence(
                         request_deadline_at=request_deadline_at,
                         repair_failure=initial_failure,
                         on_logical_call=record_repair_logical_call,
+                        **delivery_arguments,
                     )
                     _raise_if_deadline_expired(request_deadline_at)
                     if diagnostics_recorder is not None:
@@ -557,6 +567,7 @@ def _answer_with_grounded_llm(
     learning_context: dict[str, Any] | None = None,
     diagnostics_recorder: SmokeDiagnosticsRecorder | None = None,
     request_deadline_at: float | None = None,
+    source_delivery_diagnostics: dict[str, Any] | None = None,
 ) -> str | None:
     final_answer_schema = build_final_answer_json_schema(descriptors)
     allowed_evidence = [item.prompt_evidence() for item in descriptors]
@@ -568,6 +579,7 @@ def _answer_with_grounded_llm(
         allowed_evidence=allowed_evidence,
         relation_aliases=relation_aliases,
         learner_guidance=_learning_answer_guidance(learning_context),
+        source_delivery_diagnostics=source_delivery_diagnostics,
     )
     return _chat_final_answer(
         llm,
@@ -592,6 +604,7 @@ def _answer_with_grounded_llm_repair(
     diagnostics_recorder: SmokeDiagnosticsRecorder | None = None,
     request_deadline_at: float | None = None,
     on_logical_call: Callable[[], None] | None = None,
+    source_delivery_diagnostics: dict[str, Any] | None = None,
 ) -> str | None:
     final_answer_schema = build_final_answer_json_schema(descriptors)
     messages = _build_final_answer_repair_messages(
@@ -603,6 +616,7 @@ def _answer_with_grounded_llm_repair(
         learner_guidance=_learning_answer_guidance(learning_context),
         failure=repair_failure,
         request_deadline_at=request_deadline_at,
+        source_delivery_diagnostics=source_delivery_diagnostics,
     )
     return _chat_final_answer(
         llm,
@@ -635,8 +649,9 @@ def _chat_final_answer(
     )
     if answer_thinking is not None:
         chat_arguments["thinking"] = answer_thinking
-    if diagnostics_recorder is not None:
+    if isinstance(llm, LLMClient) or diagnostics_recorder is not None:
         chat_arguments["purpose"] = "final_answer"
+    if diagnostics_recorder is not None:
         chat_arguments["diagnostics_recorder"] = diagnostics_recorder
     if request_deadline_at is not None and isinstance(llm, LLMClient):
         chat_arguments["deadline_monotonic"] = request_deadline_at
@@ -656,8 +671,9 @@ def _build_final_answer_messages(
     allowed_evidence: list[dict[str, Any]],
     relation_aliases: list[dict[str, Any]],
     learner_guidance: dict[str, Any],
+    source_delivery_diagnostics: dict[str, Any] | None = None,
 ) -> list[dict[str, str]]:
-    return [
+    messages = [
             {
                 "role": "system",
                 "content": (
@@ -727,6 +743,13 @@ def _build_final_answer_messages(
                 ),
             },
         ]
+    if source_delivery_diagnostics is not None:
+        from app.services.directed_evidence import DELIVERY_GUIDANCE
+        messages[0]['content'] = messages[0]['content'].replace('Prompt version: m1-v3.', 'Prompt version: m1-v6.') + DELIVERY_GUIDANCE
+        messages[1]['content'] += ('\n\nBOUNDED_SOURCE_DELIVERY_DIAGNOSTICS_BEGIN\n' + json.dumps(
+            source_delivery_diagnostics, ensure_ascii=False, sort_keys=True, separators=(',', ':'))
+            + '\nBOUNDED_SOURCE_DELIVERY_DIAGNOSTICS_END')
+    return messages
 
 
 def _is_repairable_final_answer_failure(
@@ -745,6 +768,7 @@ def _build_final_answer_repair_messages(
     learner_guidance: dict[str, Any],
     failure: FinalAnswerProtocolFailure,
     request_deadline_at: float | None,
+    source_delivery_diagnostics: dict[str, Any] | None = None,
 ) -> list[dict[str, str]]:
     """Build a fresh, allowlisted repair request without any rejected output."""
 
@@ -777,7 +801,9 @@ def _build_final_answer_repair_messages(
         ],
         "remaining_deadline_ms": remaining_ms,
     }
-    return [
+    if source_delivery_diagnostics is not None:
+        payload['source_delivery_diagnostics'] = source_delivery_diagnostics
+    messages = [
         {
             "role": "system",
             "content": (
@@ -799,9 +825,14 @@ def _build_final_answer_repair_messages(
             ),
         },
     ]
+    if source_delivery_diagnostics is not None:
+        from app.services.directed_evidence import DELIVERY_GUIDANCE
+        messages[0]['content'] = messages[0]['content'].replace('Prompt version: m1-v3-repair1.', 'Prompt version: m1-v6-repair1.') + DELIVERY_GUIDANCE
+    return messages
 
 
 def _raise_if_deadline_expired(deadline_monotonic: float | None) -> None:
+    raise_if_provider_cancelled()
     if deadline_monotonic is not None and time.monotonic() >= deadline_monotonic:
         raise ProviderError(
             "deadline_exceeded",

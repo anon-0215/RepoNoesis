@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
+import ast
+import hashlib
 import math
+import textwrap
 from typing import Literal
 
 from app.database import Database
@@ -108,6 +111,10 @@ class CandidatePromotion:
     valid_candidate_count: int
     new_candidate_count: int
     accepted_candidate_count: int
+    duplicate_candidate_count: int = 0
+    capacity_rejected_count: int = 0
+    admission_deferred_count: int = 0
+    selection_audit: list[dict[str, object]] = field(default_factory=list)
 
 
 @dataclass
@@ -166,8 +173,18 @@ class CandidateEvidencePool:
         repository_revision: str,
         retrieval_strategy_version: str,
         accepted_limit: int | None = None,
+        new_evidence_limit: int | None = None,
+        reserved_slots: int = 0,
+        held_chunk_identities: set[str] | None = None,
+        directed_read_evidence: list[Evidence] | None = None,
+        directed_read_scope_chunks: list[dict[str, object]] | None = None,
     ) -> CandidatePromotion:
-        """Fail closed by rebuilding formal Evidence from bound authoritative chunks."""
+        """Rebuild from canonical chunks before considering owned duplicates.
+
+        Product callers supply the current request-owned EvidenceStore snapshot.
+        Pool metadata alone is insufficient when another tool acquired Evidence.
+        Callers without a snapshot retain the standalone pool contract.
+        """
 
         rejection_counts: dict[CandidateRejectionCode, int] = {}
         valid_candidates: list[CandidateEvidence] = []
@@ -214,22 +231,68 @@ class CandidateEvidencePool:
             )
 
         selected_candidates = sorted(merged_for_call.values(), key=_candidate_sort_key)
+        priority_reasons: dict[str, tuple[str, ...]] = {}
+        if directed_read_evidence is not None:
+            priority_reasons = _directed_read_priorities(
+                selected_candidates, canonical_by_id, directed_read_evidence,
+                directed_read_scope_chunks or [], project_id, repository_revision,
+            )
+            # Retain the original scores/ranks. Static syntax changes only this
+            # call's admission order, never retrieval or runtime relation facts.
+            selected_candidates.sort(key=lambda c: (
+                0 if c.chunk_identity in priority_reasons else 1,
+                *_candidate_sort_key(c),
+            ))
         if accepted_limit is not None:
             selected_candidates = selected_candidates[: max(0, accepted_limit)]
 
+        if held_chunk_identities is None:
+            occupied = set(self._accepted_by_identity)
+        else:
+            occupied = set(held_chunk_identities)
+            # A promotion that never reached the Store must not occupy a later
+            # call's capacity. The snapshot does not make a candidate valid:
+            # all candidates above still underwent bound canonical validation.
+            self._accepted_by_identity = {
+                identity: candidate
+                for identity, candidate in self._accepted_by_identity.items()
+                if identity in occupied
+            }
+
         newly_accepted: list[CandidateEvidence] = []
+        duplicates = capacity_rejected = deferred = 0
+        admission_capacity = max(0, self.capacity - max(0, reserved_slots))
+        selection_audit: list[dict[str, object]] = []
         for candidate in selected_candidates:
             identity = candidate.chunk_identity
+            audit = {"code_chunk_id": candidate.code_chunk_id,
+                     "original_fusion_rank": candidate.fusion_rank,
+                     "selection_position": len(selection_audit) + 1,
+                     "selection_reason": "same_class_static_call_syntax" if identity in priority_reasons else "original_order_fallback",
+                     "source_evidence_ids": list(priority_reasons.get(identity, ())),
+                     "admission": "added"}
+            if directed_read_evidence is not None:
+                selection_audit.append(audit)
             existing = self._accepted_by_identity.get(identity)
-            if existing is not None:
-                self._accepted_by_identity[identity] = _merge_candidate_metadata(
-                    existing,
-                    candidate,
+            if identity in occupied:
+                audit["admission"] = "duplicate"
+                duplicates += 1
+                self._accepted_by_identity[identity] = (
+                    candidate if existing is None
+                    else _merge_candidate_metadata(existing, candidate)
                 )
                 continue
-            if len(self._accepted_by_identity) >= self.capacity:
+            if len(occupied) >= self.capacity:
+                audit["admission"] = "capacity_exhausted"
+                capacity_rejected += 1
+                continue
+            if (len(occupied) >= admission_capacity
+                or (new_evidence_limit is not None and len(newly_accepted) >= max(0, new_evidence_limit))):
+                deferred += 1
+                audit["admission"] = "admission_deferred"
                 continue
             self._accepted_by_identity[identity] = candidate
+            occupied.add(identity)
             newly_accepted.append(candidate)
 
         evidence: list[Evidence] = []
@@ -243,6 +306,8 @@ class CandidateEvidencePool:
                     retrieval_strategy_version=retrieval_strategy_version,
                 )
             )
+            if candidate.chunk_identity in priority_reasons:
+                evidence[-1].selection_reason += "; directed read priority: same-class static call syntax only, runtime target unresolved"
         return CandidatePromotion(
             evidence=evidence,
             selected_candidates=selected_candidates,
@@ -251,12 +316,100 @@ class CandidateEvidencePool:
             valid_candidate_count=len(canonical_valid),
             new_candidate_count=len(newly_accepted),
             accepted_candidate_count=len(self._accepted_by_identity),
+            duplicate_candidate_count=duplicates,
+            capacity_rejected_count=capacity_rejected,
+            admission_deferred_count=deferred,
+            selection_audit=selection_audit,
         )
 
     def accepted_candidates(self) -> list[CandidateEvidence]:
         """Return a stable snapshot for bounded request-local auditing."""
 
         return sorted(self._accepted_by_identity.values(), key=_candidate_sort_key)
+
+
+def _method_ast(content: str, symbol: str) -> ast.FunctionDef | ast.AsyncFunctionDef | None:
+    """Conservative instance-method syntax; no aliases or nested scopes."""
+    if len(content.encode("utf-8")) > 8192:
+        return None
+    try:
+        tree = ast.parse(textwrap.dedent(content.replace("\r\n", "\n").replace("\r", "\n")))
+    except (SyntaxError, ValueError, RecursionError):
+        return None
+    if len(tree.body) != 1 or not isinstance(tree.body[0], (ast.FunctionDef, ast.AsyncFunctionDef)):
+        return None
+    method = tree.body[0]
+    args = method.args.posonlyargs + method.args.args
+    if method.name != symbol or not args or args[0].arg != "self" or method.decorator_list:
+        return None
+    # Rebinding self or introducing nested scopes makes lexical target matching
+    # unsafe. Attribute writes are filtered separately for each call name.
+    for statement in method.body:
+        for node in ast.walk(statement):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
+                return None
+            if isinstance(node, ast.Name) and node.id == "self" and isinstance(node.ctx, (ast.Store, ast.Del)):
+                return None
+            if (isinstance(node, ast.alias) and (node.asname or node.name.split(".", 1)[0]) == "self"
+                or isinstance(node, (ast.ExceptHandler, ast.MatchAs, ast.MatchStar)) and node.name == "self"
+                or isinstance(node, ast.MatchMapping) and node.rest == "self"
+                or isinstance(node, (ast.Global, ast.Nonlocal)) and "self" in node.names):
+                return None
+    return method
+
+
+def _directed_read_priorities(
+    candidates: list[CandidateEvidence], canonical: dict[int, dict[str, object]],
+    held: list[Evidence], scope_chunks: list[dict[str, object]],
+    project_id: str, revision: str,
+) -> dict[str, tuple[str, ...]]:
+    # A capped hierarchy cannot prove uniqueness. Scope metadata is used only
+    # to veto ambiguity, never to validate or admit a candidate.
+    if not scope_chunks or len(scope_chunks) >= 2049:
+        return {}
+    scopes: dict[tuple[str, str], set[int]] = {}
+    for chunk in scope_chunks:
+        key = (str(chunk.get("path", "")), str(chunk.get("qualified_name", "")))
+        scopes.setdefault(key, set()).add(int(chunk["id"]))
+    reasons: dict[str, set[str]] = {}
+    for source in held:
+        coverage = source.planner_excerpt_coverage()
+        hints = source.planner_direct_call_hints()
+        if (source.project_id != project_id or source.repository_revision != revision
+            or source.chunk_type not in {"method", "async_method"}
+            or coverage.get("status") != "known" or coverage.get("truncated") is not False
+            or coverage.get("complete_end_line") != source.end_line
+            or hints.get("status") != "available"
+            or hashlib.sha256(source.excerpt.encode("utf-8")).hexdigest() != source.content_hash):
+            continue
+        owner, separator, _ = source.qualified_name.rpartition(".")
+        if (not separator or len(scopes.get((source.path, source.qualified_name), ())) != 1
+            or len(scopes.get((source.path, owner), ())) != 1):
+            continue
+        method = _method_ast(source.excerpt, source.symbol_name)
+        if method is None:
+            continue
+        written_attributes = {n.attr for n in ast.walk(method) if isinstance(n, ast.Attribute)
+            and isinstance(n.value, ast.Name) and n.value.id == "self" and isinstance(n.ctx, (ast.Store, ast.Del))}
+        # Use the existing bounded trusted hint set, then require an exact call
+        # in this method body. Do not resolve self dynamically or infer inheritance.
+        expressions = {h["callee_expression"] for h in hints["calls"]}
+        names = {n.func.attr for statement in method.body for n in ast.walk(statement)
+            if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+            and isinstance(n.func.value, ast.Name) and n.func.value.id == "self"
+            and "self." + n.func.attr in expressions and n.func.attr not in written_attributes}
+        for candidate in candidates:
+            chunk = canonical[candidate.code_chunk_id]
+            if (candidate.path != source.path or candidate.language.casefold() != "python"
+                or "planner_read_source" not in candidate.provenance
+                or str(chunk.get("chunk_type")) not in {"method", "async_method"}
+                or candidate.symbol_name not in names
+                or candidate.qualified_name != owner + "." + candidate.symbol_name
+                or len(scopes.get((candidate.path, candidate.qualified_name), ())) != 1
+                or _method_ast(str(chunk["content"]), candidate.symbol_name) is None):
+                continue
+            reasons.setdefault(candidate.chunk_identity, set()).add(source.evidence_id)
+    return {identity: tuple(sorted(ids)) for identity, ids in reasons.items()}
 
 
 def _candidate_from_retrieval(

@@ -14,6 +14,9 @@ vi.mock('./lib/api', async () => {
     checkWorkspaceRevision: vi.fn(),
     deleteProject: vi.fn(),
     getConfigStatus: vi.fn(),
+    getChatHistory: vi.fn((workspace_id, active_project_id, repository_revision) => Promise.resolve({
+      workspace_id, active_project_id, repository_revision, activation_version: 1, items: [], next_cursor: null,
+    })),
     getLearningContinuity: vi.fn(),
     getLearningPath: vi.fn(),
     getProject: vi.fn(),
@@ -437,7 +440,7 @@ describe('App ask request gate integration', () => {
         setInputValue(input!, 'first question');
         await Promise.resolve();
       });
-      await act(async () => { buttonWithText(container, '项目概览').click(); await flushPromises(); });
+      await act(async () => { buttonWithText(container, '项目地图').click(); await flushPromises(); });
       expect(container.querySelectorAll('.wb-rail')).toHaveLength(1);
       expect(container.querySelectorAll('.wb-context')).toHaveLength(1);
       expect(document.documentElement.dataset.theme).toBe('dark');
@@ -450,6 +453,8 @@ describe('App ask request gate integration', () => {
         await Promise.resolve();
       });
       expect(askProjectStream).toHaveBeenCalledTimes(1);
+      expect(container.querySelector<HTMLTextAreaElement>('form.ask-form textarea')?.value).toBe('');
+      expect(vi.mocked(askProjectStream).mock.calls[0][2]).toBe('first question');
 
       form = container.querySelector<HTMLFormElement>('form.ask-form');
       submit = form?.querySelector<HTMLButtonElement>('button[type="submit"]');
@@ -461,6 +466,11 @@ describe('App ask request gate integration', () => {
       expect(askProjectStream).toHaveBeenCalledTimes(1);
 
       await act(async () => {
+        setInputValue(container.querySelector<HTMLTextAreaElement>('form.ask-form textarea')!, 'new unsent draft');
+        await flushPromises();
+      });
+
+      await act(async () => {
         rejectFirst(new ApiError('safe failure', 500, failure));
         await flushPromises();
       });
@@ -469,9 +479,16 @@ describe('App ask request gate integration', () => {
       input = form?.querySelector<HTMLTextAreaElement>('textarea');
       submit = form?.querySelector<HTMLButtonElement>('button[type="submit"]');
       expect(errorCard?.textContent).toContain('tool_timeout');
+      expect(input?.value).toBe('new unsent draft');
+      const restore = buttonWithText(container, '恢复到输入框');
+      expect(restore.disabled).toBe(true);
+      await act(async () => { setInputValue(input!, ''); await flushPromises(); });
+      await act(async () => { restore.click(); await flushPromises(); });
+      expect(input?.value).toBe('first question');
+      expect(askProjectStream).toHaveBeenCalledTimes(1);
       expect(submit?.disabled).toBe(false);
       expect(container.querySelector('.wb-notification')).toBeNull();
-      await act(async () => { buttonWithText(container, '项目概览').click(); await flushPromises(); });
+      await act(async () => { buttonWithText(container, '项目地图').click(); await flushPromises(); });
       await act(async () => { buttonWithText(container, '源码问答').click(); await flushPromises(); });
       expect(container.querySelector('.wb-error')?.textContent).toContain('request-safe-123');
       form = container.querySelector<HTMLFormElement>('form.ask-form');
@@ -522,6 +539,8 @@ describe('App connection and import status integration', () => {
       expect(container.querySelector<HTMLButtonElement>('form.ask-form button[type="submit"]')?.disabled).toBe(true);
       await act(async () => { buttonWithText(container, '项目管理').click(); await flushPromises(); });
       expect(container.querySelector('form.analyze-form')).not.toBeNull();
+      expect(container.textContent).toContain('首次导入需要预先准备本地 BGE-M3 权重');
+      expect(container.textContent).toContain('不需要生成模型');
     } finally {
       if (root) await act(async () => root?.unmount());
       container.remove();

@@ -23,7 +23,7 @@ const failureCode = (value?: { stable_code: string; violation_kind?: string } | 
 const repairCount = (attempted?: boolean | null) => attempted === true ? '1 次' : attempted === false ? '0 次（未尝试）' : '未提供';
 const repairResult = (value?: boolean | null) => value === true ? '通过' : value === false ? '未通过' : '未提供';
 
-export function ExecutionSummary({ result, failure, mode }: { result?: ChatAnswer; failure?: AskFailure; mode?: ExecutionMode }) {
+export function ExecutionSummary({ result, failure, mode, historical = false }: { result?: { execution_summary?: ChatAnswer['execution_summary']; execution_mode?: ExecutionMode | null }; failure?: AskFailure; mode?: ExecutionMode; historical?: boolean }) {
   const summary = result?.execution_summary;
   if (failure) {
     const d = failure.diagnostics;
@@ -33,7 +33,7 @@ export function ExecutionSummary({ result, failure, mode }: { result?: ChatAnswe
     return <details className="wb-execution"><summary>本次执行摘要</summary><div><p>本次请求失败：{statusLabel[d.agent_status] || '未完成'}</p><p>请求 ID：{d.request_id || '未提供'} · 执行模式：{mode === 'rag' ? 'RAG' : mode === 'agent' ? 'Agent' : '未提供'}</p><p>失败阶段：{d.failure_stage} · 原因代码：{d.failure_reason_code}</p>{answerFailed && <><p>首次协议失败子码：{failureCode(d.final_answer_initial_failure)}</p><p>有界修复：{repairCount(d.final_answer_repair_attempted)} · 协议重验：{repairState(d.final_answer_repair_protocol_succeeded)} · 最终修复结果：{repairState(d.final_answer_repair_succeeded)}</p><p>修复失败子码：{d.final_answer_repair_attempted === false ? '未尝试' : failureCode(d.final_answer_repair_failure)} · 最后协议子码：{failureCode(d.final_answer_protocol_failure)}</p></>}{base && <><p>基础检索：{base.attempted ? baseRetrievalStatusLabel(base.status) : '未执行'}</p>{base.attempted && ['succeeded', 'zero_hit', 'all_rejected'].includes(base.status) && <p>检索命中 {base.retrieval_hit_count} 条 · 候选通过 {base.valid_candidate_count} 条 · 新增证据 {base.new_evidence_count} 条</p>}<RetrievalDiagnostics detail={base.retrieval_detail} /></>}<p>服务端记录耗时：{d.elapsed_ms} 毫秒</p><small>仅显示该失败请求返回的诊断信息。</small></div></details>;
   }
   if (!result) return null;
-  return <details className="wb-execution"><summary>本次执行摘要</summary><div>{!summary ? <p>此回答未提供结构化执行详情。</p> : <>
+  return <details className="wb-execution"><summary>{historical ? '生成时记录的执行摘要' : '本次执行摘要'}</summary><div>{historical && <p>仅展示保存时的信息；历史读取没有重新执行或校验答案。</p>}{!summary ? <p>此回答未提供结构化执行详情。</p> : <>
     <p>最终状态：{statusLabel[summary.status || ''] || '状态未提供'} · {summary.answer_mode === 'llm_grounded' ? '基于证据生成' : summary.answer_mode === 'deterministic' ? '确定性回答' : '回答方式未提供'}</p>
     {summary.base_retrieval && <p>基础检索：{summary.base_retrieval.attempted ? (baseLabel[summary.base_retrieval.status] || '状态已记录') : '未执行'}{summary.base_retrieval.attempted ? ` · 新增证据 ${summary.base_retrieval.new_evidence_count}` : ''}</p>}
     <RetrievalDiagnostics detail={summary.base_retrieval?.retrieval_detail} />
@@ -53,6 +53,6 @@ export function ExecutionSummary({ result, failure, mode }: { result?: ChatAnswe
       count(summary.tool_duration_ms) !== null ? `工具执行（含基础检索）${summary.tool_duration_ms} 毫秒` : null,
       count(summary.finalization_duration_ms) !== null ? `回答整理 ${summary.finalization_duration_ms} 毫秒` : null
     ].filter(Boolean).join(' · ')}</p>}
-    {summary.diagnostics_truncated && <small>诊断详情已裁剪；上方计数仅使用独立聚合字段。</small>}
+    {summary.diagnostics_truncated && <small>诊断详情仅保存了部分内容；上方计数来自独立聚合字段。</small>}
   </>}</div></details>;
 }

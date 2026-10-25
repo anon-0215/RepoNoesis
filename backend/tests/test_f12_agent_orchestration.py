@@ -226,8 +226,10 @@ class F12AgentOrchestrationTests(unittest.TestCase):
         snapshot = recorder.snapshot()
         self.assertEqual(snapshot.get("tool_calls_attempted", 0), 0)
         self.assertEqual(snapshot.get("tool_executions", []), [])
+        base = dict(snapshot["base_retrieval"])
+        detail = base.pop("retrieval_detail")
         self.assertEqual(
-            snapshot["base_retrieval"],
+            base,
             {
                 "attempted": True,
                 "status": "succeeded",
@@ -239,6 +241,67 @@ class F12AgentOrchestrationTests(unittest.TestCase):
                 "rejection_code_counts": {},
             },
         )
+        # The seed still has an exact core contract. Additional diagnostics are
+        # independently allowlisted, typed and bounded, not silently ignored.
+        self.assertIsInstance(detail, dict)
+        numeric_fields = {
+            "lexical_ms", "lexical_hit_count", "semantic_remaining_ms",
+            "semantic_wait_ms", "model_identity_ms", "model_load_ms",
+            "vector_read_ms", "query_encode_ms", "vector_score_ms", "revision_read_ms",
+            "fusion_ms", "promotion_ms",
+        }
+        enums = {
+            "model_state": {"unready", "loading", "ready", "failed", "unknown"},
+            "model_state_at_start": {"unready", "loading", "ready", "failed", "unknown"},
+            "semantic_status": {"completed", "skipped_budget", "timed_out", "capacity", "failed", "disabled"},
+            "retrieval_source": {"hybrid", "lexical", "lexical_symbol", "symbol"},
+        }
+        self.assertLessEqual(set(detail), numeric_fields | set(enums))
+        for key, value in detail.items():
+            with self.subTest(retrieval_detail=key):
+                if key in numeric_fields:
+                    self.assertIs(type(value), int)  # bool and null are not counters
+                    self.assertGreaterEqual(value, 0)
+                    self.assertLessEqual(value, 86_400_000)  # recorder's existing bound
+                else:
+                    self.assertIsInstance(value, str)
+                    self.assertIn(value, enums[key])
+        self.assertEqual(detail["lexical_hit_count"], 1)
+        self.assertEqual(detail["semantic_status"], "disabled")
+        self.assertEqual(detail["retrieval_source"], "lexical")
+
+    def test_retrieval_detail_optional_values_and_existing_projection_bounds(self):
+        from app.services.smoke_diagnostics import _safe_base_retrieval as smoke_base
+        from app.services.ask_diagnostics import _safe_base_retrieval as ask_base
+
+        core = {"attempted": True, "status": "succeeded"}
+        for project, bound in ((smoke_base, 86_400_000), (ask_base, 1_000_000)):
+            with self.subTest(projection=project.__module__):
+                # Missing/null details are omitted; a present detail is a dict.
+                for absent in (None, {}, "invalid"):
+                    self.assertNotIn("retrieval_detail", project({**core, "retrieval_detail": absent}))
+                numeric = (
+                    "lexical_ms", "lexical_hit_count", "semantic_remaining_ms",
+                    "semantic_wait_ms", "model_identity_ms", "model_load_ms",
+                    "vector_read_ms", "query_encode_ms", "vector_score_ms", "revision_read_ms",
+                    "fusion_ms", "promotion_ms",
+                )
+                for value in (None, True, -1, 1.5, "1"):
+                    self.assertNotIn("retrieval_detail", project({**core, "retrieval_detail": dict.fromkeys(numeric, value)}))
+                for value, expected in ((0, 0), (bound, bound), (86_400_001, bound)):
+                    self.assertEqual(project({**core, "retrieval_detail": dict.fromkeys(numeric, value)})["retrieval_detail"], dict.fromkeys(numeric, expected))
+                enums = {
+                    "model_state": ("unready", "loading", "ready", "failed", "unknown"),
+                    "model_state_at_start": ("unready", "loading", "ready", "failed", "unknown"),
+                    "semantic_status": ("completed", "skipped_budget", "timed_out", "capacity", "failed", "disabled"),
+                    "retrieval_source": ("hybrid", "lexical", "lexical_symbol", "symbol"),
+                }
+                for key, allowed in enums.items():
+                    for value in allowed:
+                        self.assertEqual(project({**core, "retrieval_detail": {key: value}})["retrieval_detail"], {key: value})
+                    for value in (None, True, "unexpected"):
+                        self.assertNotIn("retrieval_detail", project({**core, "retrieval_detail": {key: value}}))
+                self.assertNotIn("retrieval_detail", project({**core, "retrieval_detail": {"unexpected": "must not escape"}}))
 
     def test_blank_question_is_rejected_before_route_or_direct_agent_work(self):
         invalid_questions = ("", "   ", "\t\n \r")

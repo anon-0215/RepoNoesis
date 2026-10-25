@@ -751,6 +751,11 @@ class AskRouteSafetyTests(unittest.TestCase):
             if record_failure is not None:
                 record_failure(kwargs["diagnostics_recorder"])
             value = dict(result)
+            value["evidence"] = [
+                {**item, "project_id": self.project_id, "repository_revision": self.bundle["project"]["repository_revision"]}
+                if isinstance(item, dict) and item.get("project_id") == "project-fixture" else item
+                for item in value.get("evidence", [])
+            ]
             value["request_id"] = kwargs["request_id"]
             return value
 
@@ -781,6 +786,11 @@ class AskRouteSafetyTests(unittest.TestCase):
             if run_error is not None:
                 raise run_error
             value = dict(result)
+            value["evidence"] = [
+                {**item, "project_id": self.project_id, "repository_revision": self.bundle["project"]["repository_revision"]}
+                if isinstance(item, dict) and item.get("project_id") == "project-fixture" else item
+                for item in value.get("evidence", [])
+            ]
             value["request_id"] = kwargs["request_id"]
             return value
 
@@ -1544,9 +1554,12 @@ class AskRouteSafetyTests(unittest.TestCase):
 
         def run(*_args, **kwargs):
             captured.update(kwargs)
-            return _result(
+            value = _result(
                 answer_mode="llm_grounded", agent_mode="bounded", agent_status="completed"
             )
+            value["evidence"][0].update(project_id=self.project_id,
+                                        repository_revision=self.bundle["project"]["repository_revision"])
+            return value
 
         with (
             patch.object(self.main, "db", self.database),
@@ -1590,6 +1603,11 @@ class AskRouteSafetyTests(unittest.TestCase):
         def run(*_args, **kwargs):
             clock.value = kwargs["request_budget"].request_deadline_at + 0.010
             value = dict(result)
+            value["evidence"] = [
+                {**item, "project_id": self.project_id, "repository_revision": self.bundle["project"]["repository_revision"]}
+                if isinstance(item, dict) and item.get("project_id") == "project-fixture" else item
+                for item in value.get("evidence", [])
+            ]
             value["request_id"] = kwargs["request_id"]
             return value
 

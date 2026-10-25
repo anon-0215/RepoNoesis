@@ -1,11 +1,41 @@
-"""Content-free progress projection from request-owned diagnostics calls."""
+"""Request-owned progress with bounded source targets, never tool output."""
 
 from __future__ import annotations
 
 from collections.abc import Callable
 from typing import Any
+import re
+import unicodedata
 
+from app.services.agent_contracts import normalize_repository_relative_path
 from app.services.smoke_diagnostics import SmokeDiagnosticsRecorder
+
+
+def _source_target(tool: str, parameters: Any) -> dict[str, Any] | None:
+    """Allowlist validated execution inputs; unsafe optional details fall back."""
+    if not isinstance(parameters, dict):
+        return None
+    if tool == "lookup_symbol":
+        symbol = parameters.get("symbol")
+        if isinstance(symbol, str) and len(symbol) <= 160 and re.fullmatch(
+            r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*", symbol
+        ):
+            return {"symbol": symbol}
+    elif tool == "read_source":
+        path = parameters.get("path")
+        start, end = parameters.get("start_line"), parameters.get("end_line")
+        if (not isinstance(path, str) or not 0 < len(path) <= 500
+                or ":" in path
+                or any(unicodedata.category(char) in {"Cc", "Cf", "Cs"} for char in path)
+                or type(start) is not int or type(end) is not int
+                or not 1 <= start <= end <= 10_000_000):
+            return None
+        try:
+            path = normalize_repository_relative_path(path)
+        except ValueError:
+            return None
+        return {"path": path, "start_line": start, "end_line": end}
+    return None
 
 
 class ProgressRecorder(SmokeDiagnosticsRecorder):
@@ -50,11 +80,16 @@ class ProgressRecorder(SmokeDiagnosticsRecorder):
     def record_tool_execution(self, **kwargs: Any) -> None:
         super().record_tool_execution(**kwargs)
         if kwargs["phase"] == "planner":
-            self._emit("tool_completed", {
+            details = {
                 "tool": kwargs["tool_name"],
                 "status": kwargs["status"],
                 "evidence_added": kwargs["evidence_added"],
-            })
+            }
+            if kwargs["status"] == "succeeded":
+                target = _source_target(kwargs["tool_name"], kwargs.get("effective_parameters"))
+                if target is not None:
+                    details["tool_target"] = target
+            self._emit("tool_completed", details)
 
     def record_planner_enhancement_termination(self, reason: str) -> None:
         super().record_planner_enhancement_termination(reason)

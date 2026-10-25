@@ -1,9 +1,10 @@
 import { useEffect, useMemo, useRef, useState, type PointerEvent } from 'react';
 import { ChevronDown, ChevronRight, File, Folder, LocateFixed, Minus, Plus, Search, X } from 'lucide-react';
+import { useSourceFile } from './SourceFileReader';
 import type { ProjectMap } from '../types';
 import { ancestorIds, indexProjectMap, visibleMap, type MapIndex, type MapNode } from './projectMapModel';
 
-interface Props { projectId: string; revision: string; projectMap: ProjectMap | null; error: string | null; loading: boolean; onRetry: () => void; }
+interface Props { projectId: string; revision: string; workspaceId?: string; projectMap: ProjectMap | null; error: string | null; loading: boolean; onRetry: () => void; }
 const STEP_X = 225;
 const STEP_Y = 59;
 const NODE_WIDTH = 194;
@@ -121,7 +122,8 @@ function useCanvas(index: MapIndex | null) {
   return { expanded, setExpanded, shown, setShown, selected, setSelected, query, setQuery, view, canvas, structure, matches, selectionTrigger, focusTarget, locate, fit, zoomBy, pointerDown, pointerMove, stopDrag, close };
 }
 
-export function ProjectMapView({ projectId, revision, projectMap, error, loading, onRetry }: Props) {
+export function ProjectMapView({ projectId, revision, workspaceId = '', projectMap, error, loading, onRetry }: Props) {
+  const openFile = useSourceFile();
   const index = useMemo(() => projectMap ? indexProjectMap(projectMap, projectId, revision) : null, [projectMap, projectId, revision]);
   const state = useCanvas(index);
   const selectedNode: MapNode | null = state.selected ? index?.nodes.get(state.selected) ?? null : null;
@@ -152,7 +154,7 @@ export function ProjectMapView({ projectId, revision, projectMap, error, loading
             {state.structure.more.map((entry) => <button className="pm-more" key={`${entry.parentId}:${entry.direction}`} type="button" style={{ left: entry.depth * STEP_X, top: entry.row * STEP_Y }} onClick={() => state.setShown((old) => new Map(old).set(entry.parentId, Math.max(0, (old.get(entry.parentId) ?? 0) + (entry.direction === 'next' ? 24 : -24))))}>{entry.direction === 'next' ? '下一组' : '上一组'} 24 项（剩余 {entry.remaining}）</button>)}
           </div>
         </div>
-        {selectedNode && <aside ref={state.focusTarget} className="pm-detail" aria-label="地图节点详情"><div><h2>{selectedNode.type === 'directory' ? '目录详情' : '文件详情'}</h2><button type="button" aria-label="关闭地图详情" onClick={state.close}><X /></button></div><dl><dt>名称</dt><dd>{selectedNode.name}</dd><dt>类型</dt><dd>{selectedNode.type === 'directory' ? '目录' : '文件'}</dd><dt>相对路径</dt><dd>{selectedNode.path || '项目根目录'}</dd><dt>revision</dt><dd>{revision || '未提供'}</dd>{selectedNode.type === 'directory' && <><dt>直接子项</dt><dd>{selectedNode.children.length}（当前分析结构）</dd></>}{selectedNode.type === 'file' && selectedNode.isCore && <><dt>分析标记</dt><dd>核心文件</dd></>}</dl><p>此节点来自项目结构，不属于问答引用。</p></aside>}
+        {selectedNode && <aside ref={state.focusTarget} className="pm-detail" aria-label="地图节点详情"><div><h2>{selectedNode.type === 'directory' ? '目录详情' : '文件详情'}</h2><button type="button" aria-label="关闭地图详情" onClick={state.close}><X /></button></div><dl><dt>名称</dt><dd>{selectedNode.name}</dd><dt>类型</dt><dd>{selectedNode.type === 'directory' ? '目录' : '文件'}</dd><dt>相对路径</dt><dd>{selectedNode.path || '项目根目录'}</dd><dt>revision</dt><dd>{revision || '未提供'}</dd>{selectedNode.type === 'directory' && <><dt>直接子项</dt><dd>{selectedNode.children.length}（当前分析结构）</dd></>}{selectedNode.type === 'file' && selectedNode.isCore && <><dt>分析标记</dt><dd>核心文件</dd></>}</dl><p>此节点来自项目结构，不属于问答引用。</p>{selectedNode.type === 'file' && openFile && <button type="button" onClick={(event) => openFile({ projectId, revision, workspaceId, path: selectedNode.path }, event.currentTarget)}>打开源码</button>}</aside>}
         </div>
         <p className="pm-note">连线仅表示目录包含关系。初始折叠目录，每个目录一次显示最多 24 项；搜索覆盖本次接口返回的整棵分析文件树。</p>
       </>}

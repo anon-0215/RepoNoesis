@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import os
 from pathlib import Path
-from typing import Any, Literal, cast
+from typing import Any, Callable, Literal, cast
 from urllib.parse import urlsplit
 
 from app.services.agent_contracts import AgentLimits
@@ -14,6 +14,7 @@ BACKEND_ROOT = Path(__file__).resolve().parents[1]
 EMBEDDING_MAX_LENGTH_MIN = 16
 EMBEDDING_MAX_LENGTH_MAX = 8192
 ThinkingMode = Literal["enabled", "disabled"]
+ReasoningEffort = Literal["low", "high", "max"]
 
 
 class EnvironmentLoadError(RuntimeError):
@@ -82,6 +83,16 @@ class LLMSettings:
     max_retries: int = 2
     planner_thinking: ThinkingMode | None = None
     answer_thinking: ThinkingMode | None = None
+    planner_max_generation_tokens: int | None = None
+    answer_max_generation_tokens: int | None = None
+    planner_reasoning_effort: ReasoningEffort | None = None
+    answer_reasoning_effort: ReasoningEffort | None = None
+    retry_transient_only: bool = False
+    answer_model: str | None = None
+
+    @property
+    def effective_answer_model(self) -> str:
+        return (self.answer_model or "").strip() or self.model
 
     @property
     def missing(self) -> tuple[str, ...]:
@@ -167,6 +178,10 @@ def get_embedding_settings() -> EmbeddingSettings:
     )
 
 
+def get_embedding_startup_timeout_seconds() -> float:
+    return _bounded_env_float("EMBEDDING_STARTUP_TIMEOUT_SECONDS", 20.0, 0.1, 25.0)
+
+
 def get_llm_settings() -> LLMSettings:
     return LLMSettings(
         provider=get_env_value("LLM_PROVIDER", "").strip(),
@@ -179,6 +194,12 @@ def get_llm_settings() -> LLMSettings:
         max_retries=_bounded_env_int("LLM_MAX_RETRIES", 2, 0, 4),
         planner_thinking=_env_optional_thinking("LLM_PLANNER_THINKING"),
         answer_thinking=_env_optional_thinking("LLM_ANSWER_THINKING"),
+        planner_max_generation_tokens=_optional_generation_tokens("LLM_PLANNER_MAX_GENERATION_TOKENS"),
+        answer_max_generation_tokens=_optional_generation_tokens("LLM_ANSWER_MAX_GENERATION_TOKENS"),
+        planner_reasoning_effort=_env_reasoning_effort("LLM_PLANNER_REASONING_EFFORT"),
+        answer_reasoning_effort=_env_reasoning_effort("LLM_ANSWER_REASONING_EFFORT"),
+        retry_transient_only=_strict_env_bool("LLM_RETRY_TRANSIENT_ONLY", False),
+        answer_model=get_env_value("LLM_ANSWER_MODEL", "").strip() or None,
     )
 
 
@@ -236,6 +257,10 @@ def get_product_config_status() -> dict[str, Any]:
             "api_key_configured": bool(llm.api_key),
             "planner_thinking": llm.planner_thinking or "omitted",
             "answer_thinking": llm.answer_thinking or "omitted",
+            "answer_model": llm.answer_model,
+            "effective_answer_model": llm.effective_answer_model or None,
+            "answer_reasoning_effort": llm.answer_reasoning_effort or "omitted",
+            "answer_max_generation_tokens": llm.answer_max_generation_tokens,
             "ready": llm.configured,
             "missing": list(llm.missing),
         },
@@ -257,87 +282,125 @@ def get_product_config_status() -> dict[str, Any]:
 
 
 def get_agent_limits() -> AgentLimits:
-    """Load bounded M2 limits; environment values may only stay in safe ranges."""
+    """Keep legacy fallback behavior; quality opts into strict bounded settings."""
+    profile = get_env_value("AGENT_BUDGET_PROFILE", "legacy").strip().lower()
+    if profile not in {"legacy", "quality"}:
+        raise ValueError("AGENT_BUDGET_PROFILE must be legacy or quality.")
+    if profile == "quality":
+        return _quality_agent_limits()
+    return _read_agent_limits(_bounded_env_int)
+
+
+def _read_agent_limits(read_int: Callable[[str, int, int, int], int]) -> AgentLimits:
     return AgentLimits(
-        max_agent_steps=_bounded_env_int("AGENT_MAX_STEPS", 5, 1, 8),
-        max_tool_calls=_bounded_env_int("AGENT_MAX_TOOL_CALLS", 8, 1, 12),
+        max_agent_steps=read_int("AGENT_MAX_STEPS", 5, 1, 8),
+        max_tool_calls=read_int("AGENT_MAX_TOOL_CALLS", 8, 1, 12),
         max_calls_per_step=1,
-        max_same_tool_calls=_bounded_env_int("AGENT_MAX_SAME_TOOL_CALLS", 3, 1, 3),
-        max_no_progress_steps=_bounded_env_int(
+        max_same_tool_calls=read_int("AGENT_MAX_SAME_TOOL_CALLS", 3, 1, 3),
+        max_no_progress_steps=read_int(
             "AGENT_MAX_NO_PROGRESS_STEPS", 2, 1, 2
         ),
-        total_deadline_ms=_bounded_env_int(
+        total_deadline_ms=read_int(
             "AGENT_TOTAL_DEADLINE_MS", 60_000, 1_000, 60_000
         ),
-        default_tool_timeout_ms=_bounded_env_int(
+        default_tool_timeout_ms=read_int(
             "AGENT_TOOL_TIMEOUT_MS", 40_000, 100, 40_000
         ),
-        min_final_answer_budget_ms=_bounded_env_int(
+        min_final_answer_budget_ms=read_int(
             "AGENT_FINAL_ANSWER_RESERVE_MS", 5_000, 100, 30_000
         ),
-        max_search_results=_bounded_env_int(
+        max_search_results=read_int(
             "AGENT_MAX_SEARCH_RESULTS", 20, 1, 20
         ),
-        max_observation_bytes=_bounded_env_int(
+        max_observation_bytes=read_int(
             "AGENT_MAX_OBSERVATION_BYTES", 65_536, 1_024, 65_536
         ),
-        max_source_read_lines=_bounded_env_int(
+        max_source_read_lines=read_int(
             "AGENT_MAX_SOURCE_READ_LINES", 200, 1, 200
         ),
-        max_source_read_bytes=_bounded_env_int(
+        max_source_read_bytes=read_int(
             "AGENT_MAX_SOURCE_READ_BYTES", 32_768, 1_024, 32_768
         ),
-        max_accumulated_evidence_context_bytes=_bounded_env_int(
+        max_accumulated_evidence_context_bytes=read_int(
             "AGENT_MAX_EVIDENCE_CONTEXT_BYTES", 49_152, 1_024, 49_152
         ),
-        max_planner_output_tokens_per_step=_bounded_env_int(
+        max_planner_output_tokens_per_step=read_int(
             "AGENT_MAX_PLANNER_TOKENS_PER_STEP", 512, 64, 512
         ),
-        max_total_planner_output_tokens=_bounded_env_int(
+        max_total_planner_output_tokens=read_int(
             "AGENT_MAX_TOTAL_PLANNER_TOKENS", 2_048, 64, 2_048
         ),
-        max_final_answer_tokens=_bounded_env_int(
+        max_final_answer_tokens=read_int(
             "AGENT_MAX_FINAL_ANSWER_TOKENS", 1_600, 128, 1_600
         ),
-        default_relation_depth=_bounded_env_int(
+        default_relation_depth=read_int(
             "AGENT_DEFAULT_RELATION_DEPTH", 1, 1, 2
         ),
-        max_relation_depth=_bounded_env_int(
+        max_relation_depth=read_int(
             "AGENT_MAX_RELATION_DEPTH", 2, 1, 2
         ),
-        max_relation_seed_nodes=_bounded_env_int(
+        max_relation_seed_nodes=read_int(
             "AGENT_MAX_RELATION_SEEDS", 8, 1, 8
         ),
-        max_relation_neighbors_per_node=_bounded_env_int(
+        max_relation_neighbors_per_node=read_int(
             "AGENT_MAX_RELATION_NEIGHBORS", 20, 1, 20
         ),
-        max_relation_nodes=_bounded_env_int(
+        max_relation_nodes=read_int(
             "AGENT_MAX_RELATION_NODES", 64, 2, 64
         ),
-        max_relation_edges=_bounded_env_int(
+        max_relation_edges=read_int(
             "AGENT_MAX_RELATION_EDGES", 128, 1, 128
         ),
-        max_relation_paths=_bounded_env_int(
+        max_relation_paths=read_int(
             "AGENT_MAX_RELATION_PATHS", 24, 1, 24
         ),
-        max_relation_observation_bytes=_bounded_env_int(
+        max_relation_observation_bytes=read_int(
             "AGENT_MAX_RELATION_OBSERVATION_BYTES", 65_536, 1_024, 65_536
         ),
-        max_relation_evidence_items=_bounded_env_int(
+        max_relation_evidence_items=read_int(
             "AGENT_MAX_RELATION_EVIDENCE", 16, 1, 16
         ),
-        max_learning_state_items=_bounded_env_int(
+        max_learning_state_items=read_int(
             "AGENT_MAX_LEARNING_STATE_ITEMS", 16, 1, 16
         ),
-        max_recent_learning_events=_bounded_env_int(
+        max_recent_learning_events=read_int(
             "AGENT_MAX_RECENT_LEARNING_EVENTS", 8, 1, 8
         ),
-        max_plan_steps_in_learning_context=_bounded_env_int(
+        max_plan_steps_in_learning_context=read_int(
             "AGENT_MAX_LEARNING_PLAN_STEPS", 12, 1, 12
         ),
-        max_learning_context_bytes=_bounded_env_int(
+        max_learning_context_bytes=read_int(
             "AGENT_MAX_LEARNING_CONTEXT_BYTES", 16_384, 1_024, 16_384
         ),
+    )
+
+
+def _quality_agent_limits() -> AgentLimits:
+    # These are software limits for visible output and request resources, not
+    # Provider usage or billing limits. Generation capacity is configured apart.
+    overrides = {
+        "AGENT_MAX_STEPS": (6, 1, 8),
+        "AGENT_MAX_TOOL_CALLS": (10, 1, 12),
+        "AGENT_TOTAL_DEADLINE_MS": (180_000, 1_000, 300_000),
+        "AGENT_FINAL_ANSWER_RESERVE_MS": (60_000, 100, 120_000),
+        "AGENT_MAX_PLANNER_TOKENS_PER_STEP": (1_024, 64, 4_096),
+        "AGENT_MAX_TOTAL_PLANNER_TOKENS": (8_192, 64, 32_768),
+        "AGENT_MAX_FINAL_ANSWER_TOKENS": (4_096, 128, 16_384),
+    }
+
+    def read_int(key: str, default: int, minimum: int, maximum: int) -> int:
+        default, minimum, maximum = overrides.get(key, (default, minimum, maximum))
+        return _strict_env_int(key, default, minimum, maximum)
+
+    limits = _read_agent_limits(read_int)
+    if limits.min_final_answer_budget_ms >= limits.total_deadline_ms:
+        raise ValueError("AGENT_FINAL_ANSWER_RESERVE_MS must be smaller than AGENT_TOTAL_DEADLINE_MS.")
+    if limits.max_total_planner_output_tokens < limits.max_planner_output_tokens_per_step:
+        raise ValueError("AGENT_MAX_TOTAL_PLANNER_TOKENS must cover AGENT_MAX_PLANNER_TOKENS_PER_STEP.")
+    return replace(
+        limits,
+        budget_profile="quality",
+        base_evidence_count=_strict_env_int("AGENT_BASE_EVIDENCE_COUNT", 5, 1, 8),
     )
 
 
@@ -382,6 +445,40 @@ def _env_optional_thinking(key: str) -> ThinkingMode | None:
     if value in {"enabled", "disabled"}:
         return cast(ThinkingMode, value)
     raise ValueError(f"{key} must be enabled, disabled, or empty.")
+
+
+def _strict_env_int(key: str, default: int, minimum: int, maximum: int) -> int:
+    try:
+        value = int(get_env_value(key, str(default)).strip())
+    except ValueError:
+        raise ValueError(f"{key} must be an integer in [{minimum}, {maximum}].") from None
+    if not minimum <= value <= maximum:
+        raise ValueError(f"{key} must be an integer in [{minimum}, {maximum}].")
+    return value
+
+
+def _optional_generation_tokens(key: str) -> int | None:
+    if not get_env_value(key, "").strip():
+        return None
+    return _strict_env_int(key, 1, 1, 65_536)
+
+
+def _env_reasoning_effort(key: str) -> ReasoningEffort | None:
+    value = get_env_value(key, "").strip().lower()
+    if not value:
+        return None
+    if value in {"low", "high", "max"}:
+        return cast(ReasoningEffort, value)
+    raise ValueError(f"{key} must be low, high, max, or empty.")
+
+
+def _strict_env_bool(key: str, default: bool) -> bool:
+    value = get_env_value(key, "true" if default else "false").strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"{key} must be a boolean.")
 
 
 def _bounded_env_int(key: str, default: int, minimum: int, maximum: int) -> int:

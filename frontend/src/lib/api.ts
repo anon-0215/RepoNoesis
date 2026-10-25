@@ -2,18 +2,22 @@ import type {
   AskFailure,
   AskProgressEvent,
   ChatAnswer,
+  ChatHistoryPage,
   ExecutionMode,
   ConfigStatus,
   LearningStep,
   LearningContinuity,
   ProjectMap,
   ProjectResponse,
+  SourceFile,
   WorkspaceDetail,
   WorkspaceListResponse,
   WorkspaceRevisionCheck,
   WorkspaceUpdateRun
 } from '../types';
 import { buildAnalyzePayload, type SourceType } from './product';
+import { sourceLines } from './sourceLines';
+import { compareRecordIds, isRecordId } from './chatHistory';
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL ?? 'http://127.0.0.1:8000';
 const SAFE_NETWORK_ERROR_MESSAGE = '无法连接后端服务。请确认后端已启动后重试。';
@@ -114,6 +118,31 @@ function optionalBoolean(value: unknown): boolean | undefined {
   return typeof value === 'boolean' ? value : undefined;
 }
 const SAFE_LEGACY_ERROR_MESSAGES: Readonly<Record<string, string>> = Object.freeze({
+  history_workspace_not_found: '历史所属项目不存在。',
+  history_context_changed: '项目版本已变化，请重新打开项目后加载历史。',
+  history_workspace_unavailable: '项目版本关联不可用，请重新打开项目。',
+  history_cursor_context_mismatch: '历史分页版本已变化，请重新打开项目。',
+  history_cursor_invalid: '历史分页信息无效，请重新打开项目。',
+  history_pagination_invalid: '历史分页参数无效。',
+  source_path_invalid: '文件路径无效，无法读取。',
+  source_revision_required: '缺少可靠的版本身份，无法读取。',
+  source_project_not_found: '已保存项目不存在。',
+  source_project_unavailable: '项目尚不可用或正在删除，请重新打开项目。',
+  source_revision_mismatch: '版本不符，请重新打开项目；旧引用不能读取当前版本。',
+  source_snapshot_inactive: '该快照已不再激活，无法打开旧版本引用。',
+  exploration_revision_unavailable: '所选本地仓库没有当前精确版本；未读取其他版本。',
+  exploration_exact_revision_required: '当前快照没有完整 Git 提交身份，无法可靠补充同版本材料。',
+  exploration_snapshot_content_conflict: '同版本材料与已保存源码冲突，已拒绝补充。',
+  exploration_directory_unavailable: '本地仓库目录不可用，请检查路径。',
+  exploration_material_invalid: '同版本材料身份或内容校验失败，请检查后重试。',
+  exploration_git_limit: 'Git 材料超过读取上限，未完成补充。',
+  exploration_pair_too_large: '这组对照超过显示上限，请选择其他对照或直接阅读源码。',
+  exploration_result_too_large: '报错定位结果超过显示上限；请缩短输入或从项目地图直接阅读源码。',
+  exploration_pair_not_found: '该对照已失效，请重新加载当前版本。',
+  exploration_failed: '源码探索暂时无法完成；其他页面仍可使用。',
+  source_file_not_found: '已保存快照中没有该已分析文件。',
+  source_file_invalid: '已保存文件记录不完整或不唯一，无法读取。',
+  source_file_too_large: '文件超过 1 MiB 全文读取上限，未返回截断内容。',
   git_executable_unavailable: '后端未找到 Git 客户端，请安装或配置 Git 后重试。',
   git_dns_failed: '无法解析公开 Git 主机，请检查 DNS 或网络设置。',
   git_tls_failed: '公开 Git 仓库的 TLS 或证书校验失败，请检查系统证书链或网络代理。',
@@ -189,7 +218,7 @@ export class ApiError extends Error {
   }
 }
 
-async function request<T>(path: string, options?: RequestInit): Promise<T> {
+export async function request<T>(path: string, options?: RequestInit): Promise<T> {
   let response: Response;
   try {
     response = await fetch(`${API_BASE}${path}`, {
@@ -463,6 +492,51 @@ export async function getProjectMap(projectId: string): Promise<ProjectMap> {
   return request(`/api/projects/${projectId}/map`);
 }
 
+export async function getChatHistory(workspaceId: string, projectId: string, revision: string,
+  cursor: string | null = null, activationVersion?: number, signal?: AbortSignal): Promise<ChatHistoryPage> {
+  const query = new URLSearchParams({ active_project_id: projectId, revision, limit: '20' });
+  if (cursor !== null) query.set('cursor', cursor);
+  if (activationVersion !== undefined) query.set('activation_version', String(activationVersion));
+  const page = await request<ChatHistoryPage>(`/api/workspaces/${encodeURIComponent(workspaceId)}/chat-history?${query}`, { signal });
+  if (!page || page.workspace_id !== workspaceId || page.active_project_id !== projectId || page.repository_revision !== revision ||
+      !Number.isInteger(page.activation_version) || page.activation_version < 1 ||
+      activationVersion !== undefined && page.activation_version !== activationVersion ||
+      !Array.isArray(page.items) || page.items.length > 20 ||
+      !(page.next_cursor === null || typeof page.next_cursor === 'string')) {
+    throw new ApiError('历史响应的项目或版本身份不一致，未展示。', 0);
+  }
+  for (let index = 0; index < page.items.length; index++) {
+    const item = page.items[index];
+    if (!isRecord(item) || !isRecordId(item.record_id) || typeof item.project_id !== 'string' ||
+        typeof item.question !== 'string' || typeof item.answer !== 'string' || !Array.isArray(item.citations) ||
+        !(item.repository_revision === null || typeof item.repository_revision === 'string') ||
+        !(item.created_at === null || typeof item.created_at === 'string') ||
+        !['reliable', 'missing', 'conflict'].includes(item.identity_status) ||
+        !['active', 'superseded'].includes(item.snapshot_status) ||
+        typeof item.is_current_snapshot !== 'boolean' || typeof item.full_file_available !== 'boolean' ||
+        item.is_current_snapshot && (item.project_id !== projectId || item.snapshot_status !== 'active') ||
+        item.full_file_available && (!item.is_current_snapshot || item.identity_status !== 'reliable' || item.repository_revision !== revision) ||
+        index > 0 && compareRecordIds(page.items[index - 1].record_id, item.record_id) <= 0) {
+      throw new ApiError('历史记录身份或排序无效，未展示。', 0);
+    }
+  }
+  return page;
+}
+
+export async function getSourceFile(projectId: string, revision: string, path: string, workspaceId: string, signal?: AbortSignal): Promise<SourceFile> {
+  const query = new URLSearchParams({ revision, path });
+  const result = await request<SourceFile>(`/api/projects/${encodeURIComponent(projectId)}/source-file?${query}`, { signal });
+  if (!result || typeof result !== 'object' || result.project_id !== projectId || result.revision !== revision || result.path !== path || result.workspace_id !== workspaceId ||
+      result.complete !== true || typeof result.content !== 'string' || !Number.isInteger(result.total_lines) || result.total_lines < 0 ||
+      !Number.isInteger(result.activation_version) || result.activation_version < 1 ||
+      !Number.isInteger(result.utf8_bytes) || result.utf8_bytes < 0 || result.utf8_bytes > 1_048_576 ||
+      !/^[a-f0-9]{64}$/.test(result.content_sha256) ||
+      new TextEncoder().encode(result.content).byteLength !== result.utf8_bytes || sourceLines(result.content).length !== result.total_lines) {
+    throw new ApiError('全文响应身份或完整性合同不符，未展示内容。', 0);
+  }
+  return result;
+}
+
 export async function getLearningPath(projectId: string): Promise<{ steps: LearningStep[] }> {
   return request(`/api/projects/${projectId}/learning-path`);
 }
@@ -509,6 +583,7 @@ export async function askProjectStream(
     if (value.type === 'completed') {
       terminal = true;
       if (!isRecord(value.result) || value.result.execution_mode !== mode) throw new ApiError('服务端执行模式与提交模式不一致，答案未展示。', 0);
+      if (value.result.record_id != null && !isRecordId(value.result.record_id)) throw new ApiError('保存记录身份无效，最终状态未知。', 0);
       return value.result as unknown as ChatAnswer;
     }
     if (value.type === 'failed') {

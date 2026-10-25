@@ -51,7 +51,7 @@ describe('workbench reading surface', () => {
 
   it('links only bound text nodes and preserves code, normal links, and unknown markers', async () => {
     const onEvidence = vi.fn(); container = document.createElement('div'); document.body.appendChild(container); root = createRoot(container);
-    const bindings = new Map([['E5', { evidenceId: 'E5', citations: [{ evidence_id: 'E5', path: 'src/a.py', qualified_name: 'a', summary: '', snippet: 'a', start_line: 5, end_line: 6 }], indices: [0] }]]);
+    const bindings = new Map([['E5', { evidenceId: 'E5', citations: [{ evidence_id: 'E5', path: 'src/a.py', qualified_name: 'a', summary: '', snippet: 'a', start_line: 5, end_line: 6 }], indices: [0], source: 'live_evidence' as const }]]);
     await act(async () => root?.render(<MarkdownAnswer text={'正文 [E5] 再次 [E5]，未知 [E1]。`[E5]`\n\n```python\n# [E5]\n```\n\n[普通链接 E5](https://example.com) 与 [[E5]](https://example.com/evidence)'} bindings={bindings} onEvidence={onEvidence} onExpandCode={vi.fn()} />));
     const markers = container.querySelectorAll<HTMLButtonElement>('.wb-evidence-marker');
     expect(markers).toHaveLength(2);

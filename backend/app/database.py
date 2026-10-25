@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from app.source_lines import source_lines as physical_source_lines
+
 import hashlib
 import json
 import math
@@ -14,10 +16,21 @@ from app.config import get_database_path, get_env_value
 from app.learning_schema import LEARNING_SCHEMA_STATEMENTS
 
 
-SCHEMA_VERSION = 11
-CODE_CHUNKER_VERSION = "python_ast_chunks_v1@1"
+SCHEMA_VERSION = 12
+CODE_CHUNKER_VERSION = "python_ast_chunks_v1@2"
+LEGACY_CODE_CHUNKER_VERSION = "python_ast_chunks_v1@1"
 LEARNING_CONTINUITY_CONFIG_IDENTITY = "learning-continuity-v1@1"
 LOCAL_CONTINUITY_LEARNER_ID = "learner-local-single-user-v1"
+SOURCE_FILE_MAX_BYTES = 1_048_576
+
+
+class SourceFileError(ValueError):
+    def __init__(self, code: str, status_code: int) -> None:
+        super().__init__(code)
+        self.code = code
+        self.status_code = status_code
+
+
 UPDATE_RUN_PHASES = (
     "revision_resolution",
     "manifest_diff",
@@ -102,6 +115,8 @@ CREATE TABLE IF NOT EXISTS chat_answers (
     answer TEXT NOT NULL,
     citations_json TEXT DEFAULT '[]',
     created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    repository_revision TEXT,
+    recovery_metadata_json TEXT,
     FOREIGN KEY(project_id) REFERENCES projects(id)
 );
 
@@ -300,6 +315,11 @@ class Database:
                 conn.commit()
 
     def _migrate_schema(self, conn: sqlite3.Connection) -> None:
+        chat_columns = {row["name"] for row in conn.execute("PRAGMA table_info(chat_answers)")}
+        for column in ("repository_revision", "recovery_metadata_json"):
+            if column not in chat_columns:
+                conn.execute(f"ALTER TABLE chat_answers ADD COLUMN {column} TEXT")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_chat_answers_project_id ON chat_answers(project_id, id DESC)")
         project_columns = {
             row["name"]
             for row in conn.execute("PRAGMA table_info(projects)").fetchall()
@@ -732,7 +752,7 @@ class Database:
                 """,
                 (
                     manifest_hash,
-                    CODE_CHUNKER_VERSION,
+                    LEGACY_CODE_CHUNKER_VERSION,
                     status,
                     status,
                     row["workspace_id"],
@@ -1956,6 +1976,60 @@ class Database:
             return None
         return self._project_from_row(row)
 
+    def read_source_file(self, project_id: str, revision: str, path: str) -> dict[str, Any]:
+        """Read saved decoded text and its active identity in one SQLite read view."""
+        from app.services.agent_contracts import normalize_repository_relative_path
+
+        try:
+            # Validate safety, but use the exact supplied key, including legal backslashes.
+            normalize_repository_relative_path(path)
+        except ValueError as exc:
+            raise SourceFileError("source_path_invalid", 422) from exc
+        if not revision:
+            raise SourceFileError("source_revision_required", 422)
+        with self.connect() as conn:
+            conn.execute("PRAGMA query_only = ON")
+            conn.execute("BEGIN")
+            row = conn.execute(
+                """SELECT p.status, p.repository_revision,
+                          wr.workspace_id, wr.repository_revision AS linked_revision,
+                          wr.activation_status, w.active_project_id, w.activation_version
+                   FROM projects p
+                   LEFT JOIN workspace_revisions wr ON wr.project_id = p.id
+                   LEFT JOIN repository_workspaces w ON w.id = wr.workspace_id
+                   WHERE p.id = ?""", (project_id,),
+            ).fetchone()
+            if row is None:
+                raise SourceFileError("source_project_not_found", 404)
+            if row["status"] != "done":
+                raise SourceFileError("source_project_unavailable", 409)
+            if row["repository_revision"] != revision:
+                raise SourceFileError("source_revision_mismatch", 409)
+            if (not row["workspace_id"] or row["active_project_id"] != project_id
+                    or row["activation_status"] != "active"
+                    or row["linked_revision"] != revision):
+                raise SourceFileError("source_snapshot_inactive", 409)
+            files = conn.execute(
+                "SELECT content FROM repo_files WHERE project_id = ? AND path = ? LIMIT 2",
+                (project_id, path),
+            ).fetchall()
+            if not files:
+                raise SourceFileError("source_file_not_found", 404)
+            if len(files) != 1 or not isinstance(files[0]["content"], str):
+                raise SourceFileError("source_file_invalid", 409)
+            content = files[0]["content"]
+            encoded = content.encode("utf-8")
+            if len(encoded) > SOURCE_FILE_MAX_BYTES:
+                raise SourceFileError("source_file_too_large", 413)
+            return {
+                "project_id": project_id, "revision": revision, "path": path,
+                "workspace_id": row["workspace_id"],
+                "activation_version": row["activation_version"],
+                "content": content, "total_lines": len(physical_source_lines(content)),
+                "complete": True, "content_sha256": hashlib.sha256(encoded).hexdigest(),
+                "utf8_bytes": len(encoded),
+            }
+
     def get_project_by_source_identity(
         self, source_identity: str
     ) -> dict[str, Any] | None:
@@ -2648,15 +2722,85 @@ class Database:
         question: str,
         answer: str,
         citations: list[dict[str, Any]],
-    ) -> None:
+        *,
+        repository_revision: str | None = None,
+        recovery_metadata: dict[str, Any] | None = None,
+    ) -> dict[str, str]:
+        from app.services.chat_history import RecoveryMetadata, bindings_match
+
+        metadata_json = None
+        if recovery_metadata is not None:
+            metadata = RecoveryMetadata.model_validate(recovery_metadata)
+            if not bindings_match(metadata, citations, project_id, repository_revision):
+                raise ValueError("saved citation binding is invalid")
+            metadata_json = metadata.model_dump_json()
+        citations_json = json.dumps(citations, ensure_ascii=False, allow_nan=False)
         with self.connect() as conn:
-            conn.execute(
+            cursor = conn.execute(
                 """
-                INSERT INTO chat_answers (project_id, question, answer, citations_json)
-                VALUES (?, ?, ?, ?)
+                INSERT INTO chat_answers (project_id, question, answer, citations_json,
+                                          repository_revision, recovery_metadata_json)
+                VALUES (?, ?, ?, ?, ?, ?)
                 """,
-                (project_id, question, answer, json.dumps(citations, ensure_ascii=False)),
+                (project_id, question, answer, citations_json, repository_revision, metadata_json),
             )
+            row = conn.execute("SELECT id, created_at FROM chat_answers WHERE id=?", (cursor.lastrowid,)).fetchone()
+            identity = {"record_id": str(row["id"]), "created_at": row["created_at"]}
+        return identity
+
+    def read_chat_history(self, workspace_id: str, active_project_id: str, revision: str,
+                          *, limit: int = 20, cursor: str | None = None,
+                          activation_version: int | None = None) -> dict[str, Any]:
+        from app.services.chat_history import ChatHistoryError, HistoryCursor, project_history_record
+
+        if not 1 <= limit <= 50:
+            raise ChatHistoryError("history_pagination_invalid", 422)
+        page_cursor = HistoryCursor.decode(cursor) if cursor is not None else None
+        with self.connect() as conn:
+            conn.execute("PRAGMA query_only = ON")
+            conn.execute("BEGIN")
+            context = conn.execute("""
+                SELECT w.active_project_id, w.activation_version, p.repository_revision,
+                       p.status, wr.repository_revision AS linked_revision, wr.activation_status
+                FROM repository_workspaces w
+                LEFT JOIN projects p ON p.id=w.active_project_id
+                LEFT JOIN workspace_revisions wr ON wr.workspace_id=w.id AND wr.project_id=w.active_project_id
+                WHERE w.id=?""", (workspace_id,)).fetchone()
+            if context is None:
+                raise ChatHistoryError("history_workspace_not_found", 404)
+            if (context["active_project_id"] != active_project_id or context["repository_revision"] != revision
+                    or activation_version is not None and context["activation_version"] != activation_version):
+                raise ChatHistoryError("history_context_changed", 409)
+            if (context["status"] != "done" or context["activation_status"] != "active"
+                    or context["linked_revision"] != revision):
+                raise ChatHistoryError("history_workspace_unavailable", 409)
+            scope = {
+                "workspace_id": workspace_id, "active_project_id": active_project_id,
+                "repository_revision": revision, "activation_version": context["activation_version"],
+            }
+            if page_cursor and any(getattr(page_cursor, key) != value for key, value in scope.items()):
+                raise ChatHistoryError("history_cursor_context_mismatch", 422)
+            # Every page repeats this exact ownership/status scope. The cursor never grants access.
+            query = """FROM chat_answers ca
+                       JOIN projects p ON p.id=ca.project_id
+                       JOIN workspace_revisions wr ON wr.project_id=p.id
+                       WHERE wr.workspace_id=? AND wr.activation_status IN ('active','superseded')
+                             AND p.status='done'"""
+            if page_cursor:
+                anchor, before = int(page_cursor.anchor_id), int(page_cursor.before_id)
+            else:
+                anchor = conn.execute("SELECT COALESCE(MAX(ca.id),0) " + query, (workspace_id,)).fetchone()[0]
+                before = None
+            rows = conn.execute(
+                "SELECT ca.*, p.repository_revision AS project_revision, wr.repository_revision AS linked_revision, "
+                "wr.activation_status " + query + " AND ca.id<=?" + (" AND ca.id<?" if before is not None else "")
+                + " ORDER BY ca.id DESC LIMIT ?",
+                (workspace_id, anchor, *((before,) if before is not None else ()), limit + 1),
+            ).fetchall()
+            items = [project_history_record(dict(row), active_project_id) for row in rows[:limit]]
+            next_cursor = (HistoryCursor(**scope, anchor_id=str(anchor), before_id=str(rows[limit - 1]["id"])).encode()
+                           if len(rows) > limit else None)
+            return {**scope, "items": items, "next_cursor": next_cursor}
 
     @staticmethod
     def _json(value: str, fallback: Any) -> Any:

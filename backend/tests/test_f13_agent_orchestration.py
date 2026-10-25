@@ -320,11 +320,13 @@ class F13AgentOrchestrationTests(unittest.TestCase):
         cancellation = CancellationToken()
         clock = _Clock()
         harness = _CutoffProviderHarness(clock, cancellation=cancellation)
-        with self.assertRaises(ProviderError):
-            self._run_cutoff(
-                harness,
-                cancellation=cancellation,
-            )
+        # Cancellation now interrupts the transport before its later work
+        # deadline error; it is an explicit empty terminal state, never a
+        # recoverable Planner cutoff or permission to generate a final answer.
+        cancelled = self._run_cutoff(harness, cancellation=cancellation)
+        self.assertEqual(cancelled["agent_status"], "cancelled")
+        self.assertEqual(cancelled["answer"], "")
+        self.assertEqual(cancelled["citations"], [])
         self.assertEqual(harness.final_calls, 0)
 
         clock = _Clock()

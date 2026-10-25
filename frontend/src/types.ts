@@ -84,7 +84,22 @@ export interface Citation {
   end_line: number;
 }
 
+export interface SourceFile {
+  project_id: string;
+  revision: string;
+  path: string;
+  workspace_id: string;
+  activation_version: number;
+  content: string;
+  total_lines: number;
+  complete: true;
+  content_sha256: string;
+  utf8_bytes: number;
+}
+
 export interface ChatAnswer {
+  record_id?: string | null;
+  created_at?: string | null;
   execution_mode?: 'rag' | 'agent';
   answer: string;
   citations: Citation[];
@@ -106,6 +121,57 @@ export interface ChatAnswer {
   } | null;
 }
 
+export interface SavedCitation {
+  evidence_id?: string | null;
+  path?: string | null;
+  summary?: string | null;
+  snippet?: string | null;
+  qualified_name?: string | null;
+  start_line?: number | null;
+  end_line?: number | null;
+}
+export type ReadableCitation = Citation | SavedCitation;
+export interface SavedCitationBinding {
+  evidence_id: string; project_id: string; repository_revision: string; path: string;
+  qualified_name: string; symbol_name: string; start_line: number; end_line: number;
+}
+export interface RecoveryMetadata {
+  format_version: 1;
+  citation_bindings: SavedCitationBinding[];
+  execution_mode?: ExecutionMode | null;
+  execution_summary?: ChatAnswer['execution_summary'];
+  answer_mode?: ChatAnswer['answer_mode'] | null;
+  grounding_status?: ChatAnswer['grounding_status'] | null;
+  warnings?: string[] | null;
+  metadata_truncated: boolean;
+}
+export interface ChatHistoryRecord {
+  record_id: string;
+  project_id: string;
+  repository_revision: string | null;
+  revision_source: 'saved' | 'snapshot_link' | 'unavailable';
+  identity_status: 'reliable' | 'missing' | 'conflict';
+  created_at: string | null;
+  question: string;
+  answer: string;
+  citations: SavedCitation[];
+  citations_status: 'available' | 'partial' | 'invalid';
+  recovery_metadata: RecoveryMetadata | null;
+  metadata_status: 'available' | 'missing' | 'invalid' | 'binding_conflict';
+  snapshot_status: 'active' | 'superseded';
+  is_current_snapshot: boolean;
+  full_file_available: boolean;
+  full_file_unavailable_reason: string | null;
+}
+export interface ChatHistoryPage {
+  workspace_id: string;
+  active_project_id: string;
+  repository_revision: string;
+  activation_version: number;
+  items: ChatHistoryRecord[];
+  next_cursor: string | null;
+}
+
 export type ExecutionMode = 'rag' | 'agent';
 export interface AskProgressEvent {
   request_id: string;
@@ -116,6 +182,7 @@ export interface AskProgressEvent {
   type: string;
   status?: string;
   tool?: string;
+  tool_target?: { symbol: string } | { path: string; start_line: number; end_line: number };
   reason?: string;
   new_evidence_count?: number;
   evidence_added?: number;

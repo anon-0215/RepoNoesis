@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from app.source_lines import source_lines as physical_source_lines
+
+from dataclasses import dataclass, field, replace
 import hashlib
 import json
 import time
@@ -158,6 +160,17 @@ class ToolContext:
     hierarchy_mode: str = HIERARCHY_MODE_OFF
     relation_mode: str = RELATION_MODE_OFF
     candidate_provenance: CandidateProvenance = "planner_search_code"
+    supplemental_admission_enabled: bool = False
+
+    def evidence_admission_policy(self) -> dict[str, int]:
+        """Keep IDs and total capacity fixed; supplement incrementally."""
+        reserved = min(2, max(0, self.evidence_store.capacity - 1)) if self.supplemental_admission_enabled else 0
+        remaining = max(0, self.evidence_store.capacity - len(self.evidence_store.all(self.request_id)))
+        return {"capacity": self.evidence_store.capacity, "remaining_capacity": remaining,
+                "reserved_for_directed": reserved,
+                "broad_search_remaining": max(0, remaining - reserved),
+                "max_new_per_supplement": 1 if self.supplemental_admission_enabled else self.evidence_store.capacity,
+                "max_new_per_read_source": 2 if self.supplemental_admission_enabled else self.evidence_store.capacity}
 
     def check_active(self) -> None:
         if self.cancellation.cancelled:
@@ -320,6 +333,8 @@ class ToolRegistry:
         started = time.monotonic()
         call.started_at = utc_now()
         call.status = "running"
+        call.execution_started = False
+        call.execution_stage = "pre_handler_checks"
         try:
             context.check_active()
             if spec is None:
@@ -330,6 +345,7 @@ class ToolRegistry:
                 raise ToolError("unsupported tool version")
             try:
                 parameters = spec.input_model.model_validate(call.parameters)
+                call.execution_stage = "parameters_validated"
             except ValidationError as exc:
                 return self._finish_error(
                     call,
@@ -338,7 +354,23 @@ class ToolRegistry:
                     "invalid_parameters",
                     _safe_validation_message(exc),
                 )
+            # Capture the handler's real limits, including schema defaults and
+            # normalization. The lookup locator window differs from its admission cap.
+            call.effective_parameters = parameters.model_dump(mode="json")
+            call.execution_limits = {}
+            if spec.name in {"search_code", "lookup_symbol"}:
+                limit = min(parameters.top_k, context.limits.max_search_results)
+                call.effective_parameters["top_k"] = limit
+                call.execution_limits["accepted_result_limit"] = limit
+                if spec.name == "lookup_symbol":
+                    call.execution_limits["locator_window_limit"] = SYMBOL_RETRIEVER_MAX_TOP_K
+            elif spec.name == "expand_relations":
+                call.effective_parameters["max_depth"] = min(parameters.max_depth, context.limits.max_relation_depth)
+                call.effective_parameters["per_node_limit"] = min(parameters.per_node_limit, context.limits.max_relation_neighbors_per_node)
+            call.execution_started = True
+            call.execution_stage = "handler_started"
             results, warnings, handler_truncated = spec.handler(context, parameters)
+            call.execution_stage = "handler_returned"
             context.check_active()
             handler_metrics: dict[str, int | float | str] = {}
             if isinstance(results, dict):
@@ -493,7 +525,11 @@ def build_m2_tool_registry(limits: AgentLimits) -> ToolRegistry:
         ToolSpec(
             name="read_source",
             version="1",
-            description="Read a bounded line range from the stored repository snapshot.",
+            description=(f"Read stored source; inclusive end_line-start_line+1 must be <= {limits.max_source_read_lines}. "
+                         f"Maximum read bytes: {limits.max_source_read_bytes}. Overlong ranges are rejected; "
+                         "choose a smaller range. Returned text is not Evidence until canonical promotion. "
+                         "Agent directed reads admit at most 2 new canonical Evidence within remaining capacity; "
+                         "unambiguous same-class static call syntax can prioritize validated candidates, never prove runtime binding."),
             input_model=ReadSourceInput,
             handler=_read_source,
             timeout_ms=limits.default_tool_timeout_ms,
@@ -633,6 +669,11 @@ def _search_code(
         outcome.results,
         provenance=context.candidate_provenance,
     )
+    supplemental = context.supplemental_admission_enabled and context.candidate_provenance != "deterministic_base_retrieval"
+    # A symbol filter or one dotted identifier is a directed locator query.
+    # This classifies the request, never claims that a runtime target exists.
+    directed = bool(values.symbol) or all(part.isidentifier() for part in values.query.strip().split("."))
+    policy = context.evidence_admission_policy()
     promotion = context.candidate_pool.promote(
         candidates,
         database=context.database,
@@ -640,6 +681,9 @@ def _search_code(
         project_id=context.project_id,
         repository_revision=context.repository_revision,
         retrieval_strategy_version=outcome.retrieval_strategy_version,
+        new_evidence_limit=1 if supplemental else None,
+        reserved_slots=policy["reserved_for_directed"] if supplemental and not directed else 0,
+        held_chunk_identities={item.chunk_identity for item in context.evidence_store.all(context.request_id)},
     )
     built = promotion.evidence
     context.check_active()
@@ -715,12 +759,14 @@ def _search_code(
             # retrieval hits remain available only in the explicit bounded
             # counters below.
             "result_count": len(added),
+            "raw_result_count": len(outcome.results),
             "retrieval_hit_count": len(outcome.results),
             "normalized_candidate_count": promotion.candidate_count,
             "valid_candidate_count": promotion.valid_candidate_count,
             "new_evidence_count": len(added),
             "rejected_candidate_count": sum(promotion.rejection_counts.values()),
             **rejection_metrics,
+            **_admission_metrics(context, promotion, len(added)),
         },
     }
     if context.retrieval_version != RETRIEVAL_VERSION_V1:
@@ -811,6 +857,7 @@ def _lookup_symbol(
         _ToolResultList(
             results,
             _candidate_observation_metrics(
+                context=context,
                 raw_result_count=len(ranked),
                 promotion=promotion,
                 new_evidence_count=len(added),
@@ -832,10 +879,15 @@ def _read_source(
         raise ToolError("end_line must not be less than start_line")
     requested_lines = values.end_line - values.start_line + 1
     if requested_lines > context.limits.max_source_read_lines:
-        raise ToolError("requested line range exceeds server limit")
+        error = ToolError(
+            f"requested {requested_lines} lines; maximum is {context.limits.max_source_read_lines}. "
+            f"Choose end_line <= start_line + {context.limits.max_source_read_lines - 1}."
+        )
+        error.code = "source_range_exceeded"
+        raise error
     context.check_active()
     before = _snapshot_file(context, values.path)
-    lines = str(before["content"]).splitlines(keepends=True)
+    lines = physical_source_lines(str(before["content"]), keepends=True)
     if values.start_line > len(lines) or values.end_line > len(lines):
         raise ToolError("requested line range exceeds stored source")
     content = "".join(lines[values.start_line - 1 : values.end_line])
@@ -854,8 +906,9 @@ def _read_source(
     mapping_candidate_count = 0
     mapping_considered_count = 0
     mapping_truncated = False
+    chunks: list[dict[str, Any]] = []
     if not truncated:
-        source_lines = str(before["content"]).splitlines(keepends=True)
+        source_lines = physical_source_lines(str(before["content"]), keepends=True)
         authoritative_content = "".join(
             source_lines[values.start_line - 1 : values.end_line]
         )
@@ -895,6 +948,11 @@ def _read_source(
         context,
         candidates,
         extra_rejection_counts=mapping_rejections,
+        directed_read_scope_chunks=chunks,
+    )
+    coverage_updates, associated_evidence = (
+        _complete_read_evidence(context, promotion.selected_candidates, values)
+        if not truncated and not mapping_rejections else ([], [])
     )
     return (
         {
@@ -906,7 +964,13 @@ def _read_source(
             "source_identity_hash": _file_identity(before),
             "content": content,
             "evidence": [_evidence_summary(item) for item in added],
+            "coverage_updates": coverage_updates,
+            # A read has one textual result; generic result-list truncation
+            # must not discard its bounded many-to-one canonical associations.
+            "associated_evidence": {item["evidence_id"]: item for item in associated_evidence},
+            "candidate_selection": promotion.selection_audit,
             "_observation_metrics": _candidate_observation_metrics(
+                context=context,
                 raw_result_count=mapping_candidate_count,
                 promotion=promotion,
                 new_evidence_count=len(added),
@@ -915,6 +979,11 @@ def _read_source(
                     "mapping_candidate_count": mapping_candidate_count,
                     "mapping_considered_count": mapping_considered_count,
                     "mapping_truncated": mapping_truncated,
+                    "coverage_updated_count": len(coverage_updates),
+                    "information_delta_bytes": sum(item["information_delta_bytes"] for item in coverage_updates),
+                    "admission_reason": "coverage_completed" if coverage_updates and not added else _admission_metrics(context, promotion, len(added))["admission_reason"],
+                    "max_new_per_supplement": 2 if context.supplemental_admission_enabled else context.evidence_store.capacity,
+                    "directed_priority_count": sum(item["selection_reason"] == "same_class_static_call_syntax" for item in promotion.selection_audit),
                 },
             ),
         },
@@ -925,6 +994,73 @@ def _read_source(
         else [],
         truncated,
     )
+
+
+def _complete_read_evidence(
+    context: ToolContext, candidates: list[Any], values: ReadSourceInput,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Validate read associations and extend owned prefixes without rebinding.
+
+    Candidates already passed canonical promotion. A fresh bounded chunk read
+    plus CitationValidator protects against changed source/identity between
+    promotion and completion. Raw read_source.content never becomes Evidence.
+    """
+    held = {item.chunk_identity: item for item in context.evidence_store.all(context.request_id)}
+    owned = [c for c in candidates if c.chunk_identity in held]
+    if not owned:
+        return [], []
+    chunks = {int(c["id"]): c for c in context.database.get_code_chunks_by_ids_bounded(
+        context.project_id, context.repository_revision,
+        sorted({c.code_chunk_id for c in owned}), limit=len(owned),
+    )}
+    validator = CitationValidator(context.database)
+    updates: list[dict[str, Any]] = []
+    associated: list[dict[str, Any]] = []
+    for candidate in owned:
+        context.check_active()
+        item = held[candidate.chunk_identity]
+        chunk = chunks.get(candidate.code_chunk_id)
+        verified = validator.validate(replace(item)) if chunk is not None else None
+        if verified is None or verified.validation_status != "valid":
+            continue
+        item.validation_status = verified.validation_status
+        item.invalid_reason = verified.invalid_reason
+        item._excerpt_coverage = verified._excerpt_coverage
+        # Canonical promotion may acquire more than the literal read range.
+        # Keep that same contract, bounded here by read lines/bytes, and expose
+        # the actual acquired prefix coverage independently of requested range.
+        end_line = min(item.end_line, values.end_line, item.start_line + context.limits.max_source_read_lines - 1)
+        if end_line < item.start_line or values.start_line > item.end_line:
+            continue
+        prefix = "".join(physical_source_lines(str(chunk["content"]), keepends=True)[:end_line-item.start_line+1])
+        prefix = prefix.encode("utf-8")[:context.limits.max_source_read_bytes].decode("utf-8", errors="ignore")
+        if len(prefix) > len(item.excerpt) and prefix.startswith(item.excerpt):
+            completed = validator.validate(replace(item, excerpt=prefix))
+            if completed.validation_status != "valid" or completed._planner_source_identity() != item._planner_source_identity():
+                continue
+            context.check_active()
+            delta = len(prefix.encode("utf-8")) - len(item.excerpt.encode("utf-8"))
+            # Only request-owned presentation/coverage changes. Old snapshots
+            # and persisted answers retain their previous excerpts.
+            item.excerpt = completed.excerpt
+            item._excerpt_coverage = completed._excerpt_coverage
+            item.validation_status = completed.validation_status
+            item.invalid_reason = completed.invalid_reason
+            updates.append({"evidence_id": item.evidence_id,
+                "excerpt_sha256": hashlib.sha256(item.excerpt.encode("utf-8")).hexdigest(),
+                "information_delta_bytes": delta})
+        # A legitimate read must deliver complete held Evidence too. This
+        # association is neither a new item nor a Store progress signal.
+        associated.append({"evidence_id": item.evidence_id,
+            "project_id": item.project_id, "repository_revision": item.repository_revision,
+            "chunk_identity": item.chunk_identity, "content_hash": item.content_hash,
+            "path": item.path, "qualified_name": item.qualified_name,
+            "start_line": item.start_line, "end_line": item.end_line,
+            "read_overlap_start_line": max(values.start_line, item.start_line),
+            "read_overlap_end_line": min(values.end_line, item.end_line),
+            "excerpt_sha256": hashlib.sha256(item.excerpt.encode("utf-8")).hexdigest(),
+            "excerpt_coverage": item.planner_excerpt_coverage()})
+    return updates, associated
 
 
 def _chunk_as_read_candidate(
@@ -1051,8 +1187,11 @@ def _promote_planner_candidates(
     *,
     extra_rejection_counts: dict[str, int] | None = None,
     accepted_limit: int | None = None,
+    directed_read_scope_chunks: list[dict[str, Any]] | None = None,
 ) -> tuple[Any, list[Evidence]]:
     project = context.bundle.get("project") or {}
+    directed_read = context.supplemental_admission_enabled and directed_read_scope_chunks is not None
+    held = context.evidence_store.all(context.request_id)
     promotion = context.candidate_pool.promote(
         candidates,
         database=context.database,
@@ -1061,6 +1200,10 @@ def _promote_planner_candidates(
         repository_revision=context.repository_revision,
         retrieval_strategy_version="weighted-rrf-v1",
         accepted_limit=accepted_limit,
+        new_evidence_limit=(2 if directed_read else 1) if context.supplemental_admission_enabled else None,
+        held_chunk_identities={item.chunk_identity for item in held},
+        directed_read_evidence=held if directed_read else None,
+        directed_read_scope_chunks=directed_read_scope_chunks if directed_read else None,
     )
     context.check_active()
     added = context.evidence_store.add(context.request_id, promotion.evidence)
@@ -1069,12 +1212,13 @@ def _promote_planner_candidates(
 
 def _candidate_observation_metrics(
     *,
+    context: ToolContext,
     raw_result_count: int,
     promotion: Any,
     new_evidence_count: int,
     extra_rejection_counts: dict[str, int] | None = None,
     extra_metrics: dict[str, int | bool] | None = None,
-) -> dict[str, int | bool]:
+) -> dict[str, int | bool | str]:
     rejection_counts = dict(promotion.rejection_counts)
     for code, count in (extra_rejection_counts or {}).items():
         rejection_counts[code] = rejection_counts.get(code, 0) + max(0, int(count))
@@ -1085,6 +1229,9 @@ def _candidate_observation_metrics(
         "new_evidence_count": max(0, int(new_evidence_count)),
         "rejected_candidate_count": sum(rejection_counts.values()),
         "result_count": max(0, int(new_evidence_count)),
+        "duplicate_candidate_count": int(promotion.duplicate_candidate_count),
+        "capacity_rejected_count": int(promotion.capacity_rejected_count),
+        "admission_deferred_count": int(promotion.admission_deferred_count),
     }
     metrics.update(
         {
@@ -1092,8 +1239,23 @@ def _candidate_observation_metrics(
             for code in CANDIDATE_REJECTION_CODES
         }
     )
+    metrics.update(_admission_metrics(context, promotion, new_evidence_count))
     metrics.update(extra_metrics or {})
+    if not new_evidence_count and sum((extra_rejection_counts or {}).values()) > 0:
+        metrics["admission_reason"] = "invalid_candidates"
     return metrics
+
+
+def _admission_metrics(context: ToolContext, promotion: Any, added_count: int) -> dict[str, int | str]:
+    policy = context.evidence_admission_policy()
+    reason = ("added" if added_count else "capacity_exhausted" if promotion.capacity_rejected_count
+              else "admission_deferred" if promotion.admission_deferred_count
+              else "duplicate" if promotion.duplicate_candidate_count
+              else "invalid_candidates" if promotion.rejection_counts else "no_hits")
+    return {**policy, "admission_reason": reason,
+            "duplicate_candidate_count": promotion.duplicate_candidate_count,
+            "capacity_rejected_count": promotion.capacity_rejected_count,
+            "admission_deferred_count": promotion.admission_deferred_count}
 
 
 def _validate_evidence(

@@ -36,7 +36,7 @@ class WorkspaceMigrationTests(unittest.TestCase):
         finally:
             conn.close()
 
-    def test_empty_v8_database_upgrades_through_workspace_versions_to_v11(self) -> None:
+    def test_empty_v8_database_upgrades_through_workspace_versions_to_v12(self) -> None:
         database = self._legacy_database()
         self._downgrade_to_v8(database)
         reopened = Database(self.path)
@@ -45,13 +45,13 @@ class WorkspaceMigrationTests(unittest.TestCase):
                 conn.execute(
                     "SELECT version FROM schema_versions WHERE key = 'database'"
                 ).fetchone()[0],
-                11,
+                12,
             )
             self.assertEqual(
                 conn.execute("SELECT COUNT(*) FROM repository_workspaces").fetchone()[0],
                 0,
             )
-        self.assertEqual(SCHEMA_VERSION, 11)
+        self.assertEqual(SCHEMA_VERSION, 12)
 
     def test_each_legacy_project_gets_an_independent_stable_workspace(self) -> None:
         database = self._legacy_database()

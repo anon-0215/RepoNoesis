@@ -12,6 +12,12 @@ MAX_LOGICAL_PROVIDER_CALLS = 1_000_000
 MAX_TOOL_ENTRIES = 16
 MAX_PROVIDER_ATTEMPT_DETAILS = 8
 MAX_PLANNER_ATTEMPTS = 10
+PROVIDER_USAGE_FIELDS = (
+    "prompt_tokens", "completion_tokens", "total_tokens", "reasoning_tokens",
+    "prompt_cache_hit_tokens", "prompt_cache_miss_tokens",
+)
+_CORE_USAGE_FIELDS = PROVIDER_USAGE_FIELDS[:3]
+_MAX_USAGE_PER_ATTEMPT = 1_000_000_000
 PUBLIC_DEADLINE_REASON_CODE = "deadline_exceeded"
 INTERNAL_DEADLINE_REASON_CODE = "deadline_exhausted"
 
@@ -164,7 +170,7 @@ BASE_RETRIEVAL_REJECTION_CODES = (
     "score_invalid",
 )
 _PROVIDER_ATTEMPT_OUTCOMES = frozenset(
-    {"success", "http_error", "timeout", "network_error", "invalid_response", "deadline"}
+    {"success", "http_error", "timeout", "network_error", "invalid_response", "deadline", "cancelled", "collection_error"}
 )
 _PLANNER_VALIDATION_STAGES = frozenset({"adapter", "parser", "schema", "semantic"})
 _PLANNER_VALIDATION_CODES = frozenset(
@@ -252,6 +258,10 @@ class SmokeDiagnosticsRecorder:
         self._provider_calls: list[dict[str, Any]] = []
         self._provider_logical_calls = 0
         self._provider_http_attempt_count = 0
+        self._provider_http_attempts_unknown = 0
+        self._provider_pending_usage: dict[int | None, dict[str, int]] = {}
+        self._usage_available_attempts = 0
+        self._usage_fields: dict[str, dict[str, int]] = {}
         self._provider_attempt_outcomes: list[str] = []
         self._provider_attempt_durations_ms: list[int] = []
         self._provider_attempt_timeouts_ms: list[int] = []
@@ -333,6 +343,7 @@ class SmokeDiagnosticsRecorder:
         )
         if len(self._provider_calls) >= MAX_PROVIDER_CALLS:
             self._truncated = True
+            self._provider_pending_usage[None] = {}
             return None
         self._provider_calls.append(
             {
@@ -341,11 +352,19 @@ class SmokeDiagnosticsRecorder:
                 "response_received": False,
             }
         )
-        return len(self._provider_calls) - 1
+        call_id = len(self._provider_calls) - 1
+        self._provider_pending_usage[call_id] = {}
+        return call_id
 
     def record_provider_response(
         self, call_id: int | None, metadata: dict[str, Any]
     ) -> None:
+        if call_id in self._provider_pending_usage:
+            # A response can be reported by the adapter and by its exception
+            # handler. Merge metadata; count it only when this attempt ends.
+            self._provider_pending_usage[call_id].update(
+                _safe_usage(metadata.get("usage"))
+            )
         if call_id is None or call_id < 0 or call_id >= len(self._provider_calls):
             return
         self._provider_calls[call_id].update(_safe_provider_metadata(metadata))
@@ -357,12 +376,32 @@ class SmokeDiagnosticsRecorder:
         outcome: str,
         duration_ms: int,
         timeout_ms: int,
+        network_state: str = "started",
+        local_reason: str | None = None,
     ) -> None:
         if outcome not in _PROVIDER_ATTEMPT_OUTCOMES:
             raise ValueError("unsupported provider attempt outcome")
-        self._provider_http_attempt_count = min(
-            MAX_LOGICAL_PROVIDER_CALLS, self._provider_http_attempt_count + 1
-        )
+        if network_state not in {"started", "not_started", "unknown"}:
+            raise ValueError("unsupported transport state")
+        if network_state == "started":
+            self._provider_http_attempt_count = min(
+                MAX_LOGICAL_PROVIDER_CALLS, self._provider_http_attempt_count + 1)
+        elif network_state == "unknown":
+            self._provider_http_attempts_unknown = min(
+                MAX_LOGICAL_PROVIDER_CALLS, self._provider_http_attempts_unknown + 1)
+        usage = self._provider_pending_usage.get(call_id, {})
+        if call_id in self._provider_pending_usage:
+            # A retry is a new HTTP attempt, even when it reuses the logical
+            # call id. Never carry usage from the preceding attempt into it.
+            self._provider_pending_usage[call_id] = {}
+        if usage and network_state == "started":
+            self._usage_available_attempts += 1
+            for name, amount in usage.items():
+                field = self._usage_fields.setdefault(
+                    name, {"known_subtotal": 0, "covered_attempts": 0}
+                )
+                field["known_subtotal"] += amount
+                field["covered_attempts"] += 1
         if len(self._provider_attempt_outcomes) < MAX_PROVIDER_ATTEMPT_DETAILS:
             self._provider_attempt_outcomes.append(outcome)
             self._provider_attempt_durations_ms.append(_bounded_duration(duration_ms))
@@ -372,8 +411,10 @@ class SmokeDiagnosticsRecorder:
         if call_id is not None and 0 <= call_id < len(self._provider_calls):
             self._provider_calls[call_id]["http_attempt_count"] = min(
                 MAX_PROVIDER_ATTEMPT_DETAILS,
-                int(self._provider_calls[call_id].get("http_attempt_count", 0)) + 1,
+                int(self._provider_calls[call_id].get("http_attempt_count", 0)) + (network_state == "started"),
             )
+            self._provider_calls[call_id]["transport_state"] = network_state
+            self._provider_calls[call_id]["local_stop_reason"] = local_reason
 
     def record_backoff(self, duration_ms: int) -> None:
         self._backoff_total_ms = _bounded_duration(
@@ -472,8 +513,12 @@ class SmokeDiagnosticsRecorder:
         evidence_added: int,
         reason_code: str | None,
         candidate_metrics: dict[str, Any] | None = None,
+        effective_parameters: dict[str, Any] | None = None,
     ) -> None:
         """Record one fixed-shape, content-free summary of a real tool execution."""
+
+        # Parameters are available to the live progress subclass only. Do not
+        # persist them in diagnostic snapshots or historical summaries.
 
         if len(self._tool_executions) >= MAX_TOOL_ENTRIES:
             self._truncated = True
@@ -741,10 +786,19 @@ class SmokeDiagnosticsRecorder:
 
     def snapshot(self) -> dict[str, Any]:
         payload: dict[str, Any] = dict(self._agent)
+        payload["provider_usage_summary"] = sanitize_provider_usage_summary({
+            "http_attempts": self._provider_http_attempt_count,
+            "usage_available_attempts": self._usage_available_attempts,
+            "fields": self._usage_fields,
+            **({"http_attempts_unknown": self._provider_http_attempts_unknown}
+               if self._provider_http_attempts_unknown else {}),
+        })
         if self._provider_logical_calls:
             payload["provider_logical_calls"] = self._provider_logical_calls
-        if self._provider_http_attempt_count:
+        if self._provider_logical_calls:
             payload["provider_http_attempt_count"] = self._provider_http_attempt_count
+            payload["provider_http_attempt_count_complete"] = self._provider_http_attempts_unknown == 0
+            payload["provider_http_attempts_unknown"] = self._provider_http_attempts_unknown
             payload["provider_attempt_outcomes"] = list(self._provider_attempt_outcomes)
             payload["provider_attempt_durations_ms"] = list(
                 self._provider_attempt_durations_ms
@@ -884,6 +938,7 @@ def _bounded_smoke_diagnostics(value: dict[str, Any]) -> dict[str, Any]:
                 "final_answer_repair_attempted",
                 "final_answer_repair_protocol_succeeded",
                 "final_answer_repair_succeeded",
+                "provider_usage_summary",
             )
             if key in payload
         }
@@ -931,6 +986,9 @@ def _minimal_smoke_diagnostics(value: dict[str, Any]) -> dict[str, Any]:
         "final_answer_repair_succeeded",
         "provider_logical_calls",
         "provider_http_attempt_count",
+        "provider_http_attempt_count_complete",
+        "provider_http_attempts_unknown",
+        "provider_usage_summary",
         "evidence_count",
         "citation_count",
         "citation_validation_passed",
@@ -948,6 +1006,9 @@ def _safe_smoke_diagnostics(value: Any) -> dict[str, Any]:
     if not isinstance(value, dict):
         return {}
     result: dict[str, Any] = {}
+    usage_summary = sanitize_provider_usage_summary(value.get("provider_usage_summary"))
+    if usage_summary is not None:
+        result["provider_usage_summary"] = usage_summary
     integer_keys = {
         "planner_requests_attempted",
         "planner_repair_attempts",
@@ -962,6 +1023,7 @@ def _safe_smoke_diagnostics(value: Any) -> dict[str, Any]:
         "elapsed_ms",
         "provider_logical_calls",
         "provider_http_attempt_count",
+        "provider_http_attempts_unknown",
         "route_elapsed_ms",
         "agent_elapsed_ms",
         "deadline_budget_ms",
@@ -974,6 +1036,7 @@ def _safe_smoke_diagnostics(value: Any) -> dict[str, Any]:
         "backoff_total_ms",
     }
     boolean_keys = {
+        "provider_http_attempt_count_complete",
         "planner_response_received",
         "planner_json_valid",
         "final_answer_attempted",
@@ -1243,6 +1306,15 @@ def _safe_provider_metadata(value: Any) -> dict[str, Any]:
     if not isinstance(value, dict):
         return {}
     result: dict[str, Any] = {}
+    if value.get("transport_state") in {"started", "not_started", "unknown"}:
+        result["transport_state"] = value["transport_state"]
+    if value.get("local_stop_reason") in {"slot_wait", "worker_start_failed", "local_admission",
+            "worker_state_unconfirmed", "network_api_entered", "response_headers", "before_network_failure"}:
+        result["local_stop_reason"] = value["local_stop_reason"]
+    for key in ("request_model", "response_model"):
+        model = value.get(key)
+        if isinstance(model, str) and re.fullmatch(r"[A-Za-z0-9._:/-]{1,128}", model):
+            result[key] = model
     purpose = value.get("purpose")
     if purpose in PROVIDER_PURPOSES:
         result["purpose"] = purpose
@@ -1408,19 +1480,68 @@ def _safe_repair_failure(value: Any) -> dict[str, Any]:
     return result
 
 
-def _safe_usage(value: Any) -> dict[str, int | float]:
+def _safe_usage(value: Any) -> dict[str, int]:
     if not isinstance(value, dict):
         return {}
-    result: dict[str, int | float] = {}
-    for key in ("prompt_tokens", "completion_tokens", "total_tokens", "reasoning_tokens"):
+    result: dict[str, int] = {}
+    for key in PROVIDER_USAGE_FIELDS:
         item = value.get(key)
         if (
-            isinstance(item, (int, float))
+            isinstance(item, int)
             and not isinstance(item, bool)
-            and 0 <= item <= 1_000_000_000
+            and 0 <= item <= _MAX_USAGE_PER_ATTEMPT
         ):
             result[key] = item
     return result
+
+
+def sanitize_provider_usage_summary(value: Any) -> dict[str, Any] | None:
+    """Keep known integer subtotals and their coverage, without inventing usage.
+
+    ``complete`` describes prompt/completion/total coverage only. Optional
+    reasoning and cache counters retain their own coverage counts.
+    """
+    if not isinstance(value, dict):
+        return None
+    attempts = value.get("http_attempts")
+    unknown = value.get("http_attempts_unknown", 0)
+    if type(unknown) is not int or not 0 <= unknown <= MAX_LOGICAL_PROVIDER_CALLS:
+        return None
+    available = value.get("usage_available_attempts")
+    if (not isinstance(attempts, int) or isinstance(attempts, bool)
+            or not 0 <= attempts <= MAX_LOGICAL_PROVIDER_CALLS
+            or not isinstance(available, int) or isinstance(available, bool)
+            or not 0 <= available <= attempts):
+        return None
+    raw_fields = value.get("fields")
+    if not isinstance(raw_fields, dict):
+        return None
+    fields: dict[str, dict[str, int]] = {}
+    for name in PROVIDER_USAGE_FIELDS:
+        item = raw_fields.get(name)
+        if not isinstance(item, dict):
+            continue
+        subtotal = item.get("known_subtotal")
+        covered = item.get("covered_attempts")
+        if (isinstance(covered, int) and not isinstance(covered, bool)
+                and 1 <= covered <= available
+                and isinstance(subtotal, int) and not isinstance(subtotal, bool)
+                and 0 <= subtotal <= covered * _MAX_USAGE_PER_ATTEMPT):
+            fields[name] = {"known_subtotal": subtotal, "covered_attempts": covered}
+    if unknown:
+        status = "partial" if available and fields else "unknown"
+    elif attempts == 0:
+        status = "not_attempted"
+    elif available == 0 or not fields:
+        status = "unknown"
+    elif all(fields.get(name, {}).get("covered_attempts") == attempts
+             for name in _CORE_USAGE_FIELDS):
+        status = "complete"
+    else:
+        status = "partial"
+    return {"status": status, "http_attempts": attempts,
+            "usage_available_attempts": available, "fields": fields,
+            **({"http_attempts_unknown": unknown} if unknown else {})}
 
 
 def _safe_tool_name(value: Any) -> bool:

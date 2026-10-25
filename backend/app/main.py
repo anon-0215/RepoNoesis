@@ -6,6 +6,7 @@ from collections.abc import Iterator, Mapping, Sequence, Set
 import json
 import logging
 import math
+import os
 from pathlib import Path
 from threading import RLock
 import time
@@ -27,14 +28,24 @@ from pydantic import (
 from app.config import (
     get_agent_limits,
     get_embedding_settings,
+    get_embedding_startup_timeout_seconds,
     get_env_value,
     get_product_config_status,
     get_repository_settings,
 )
-from app.database import Database, SCHEMA_VERSION
+from app.database import Database, SCHEMA_VERSION, SourceFileError
+from app.exploration_api import create_router as create_exploration_router
+from app.services.exploration_sources import read_material_file
 from app.services.analyzer import analyze_snapshot
 from app.services.agent_core import run_bounded_agent, validate_non_blank_question
 from app.services.ask_progress import ProgressRecorder
+from app.services.chat_history import (
+    BaseRetrievalSummaryResponse,
+    ChatHistoryError,
+    ChatHistoryPage,
+    ExecutionSummaryResponse,
+    prepare_recovery_metadata,
+)
 from app.services.agent_contracts import (
     RequestBudget,
     normalize_repository_relative_path,
@@ -52,6 +63,7 @@ from app.services.code_chunker import extract_python_code_chunks_from_files
 from app.services.embedding_indexer import EmbeddingIndexer
 from app.services.embedding_service import (
     CODE_CHUNK_TEXT_FORMAT_VERSION,
+    EmbeddingError,
     EmbeddingService,
     build_code_chunk_embedding_input_hash,
 )
@@ -73,7 +85,10 @@ from app.services.learning_contracts import (
 )
 from app.services.learning_service import LearningError, LearningService
 from app.services.llm_client import LLMClient, ProviderError
-from app.services.smoke_diagnostics import SmokeDiagnosticsRecorder
+from app.services.smoke_diagnostics import (
+    SmokeDiagnosticsRecorder,
+    sanitize_provider_usage_summary,
+)
 from app.services.repository_import import (
     RepositoryImportError,
     import_repository,
@@ -249,6 +264,9 @@ def _ask_execution_summary(result: dict[str, Any], snapshot: dict[str, Any]) -> 
         if isinstance(value, int) and not isinstance(value, bool) and 0 <= value <= 1_000_000:
             summary[key] = value
     budget = result.get("budget_usage")
+    usage = sanitize_provider_usage_summary(snapshot.get("provider_usage_summary"))
+    if usage is not None:
+        summary["provider_usage_summary"] = usage
     if isinstance(budget, dict):
         for source, target in (("steps_used", "steps_used"), ("tool_calls_used", "tool_calls_used"), ("elapsed_ms", "agent_elapsed_ms")):
             value = budget.get(source)
@@ -281,9 +299,30 @@ async def app_lifespan(_app: FastAPI):
     _initialize_runtime_value(learning_service)
     WorkspaceUpdateService(database, repository_settings, embedding_service).recover_interrupted_runs()
     LearningContinuityService(database).recover_interrupted()
-    yield
+    try:
+        try:
+            preparation = embedding_service.start_preparation()
+            if preparation is not None:
+                pending = asyncio.wrap_future(preparation)
+                # A native task can fail after startup stops waiting. Consume
+                # its exception; retain safe service runtime diagnostics.
+                pending.add_done_callback(
+                    lambda done: done.exception() if not done.cancelled() else None
+                )
+                await asyncio.wait_for(
+                    asyncio.shield(pending),
+                    timeout=get_embedding_startup_timeout_seconds(),
+                )
+        except asyncio.TimeoutError:
+            logger.warning("embedding_startup_wait_timed_out")
+        except (EmbeddingError, OSError, RuntimeError) as exc:
+            logger.warning("embedding_startup_failed type=%s", type(exc).__name__)
+        yield
+    finally:
+        embedding_service.close()
 
 app = FastAPI(title="源鉴 RepoNoesis API", version="0.1.0", lifespan=app_lifespan)
+app.include_router(create_exploration_router(lambda: db, repository_settings.runtime_dir))
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
@@ -316,7 +355,10 @@ class AskRequest(BaseModel):
     path: str | None = None
     language: str | None = None
     symbol: str | None = None
-    evidence_count: int = Field(default=5, ge=1, le=8)
+    evidence_count: int = Field(
+        default_factory=lambda: 8, ge=1, le=8,
+        description="Total evidence hard cap; omission defaults to Agent 8 / RAG 5. Explicit null is invalid.",
+    )
     retrieval_version: Literal["v1", "v2"] = "v1"
     hierarchy_mode: Literal["off", "normalize_v1"] = "off"
     relation_mode: Literal["off", "expand_v1"] = "off"
@@ -335,6 +377,10 @@ class AskRequest(BaseModel):
 
     @model_validator(mode="after")
     def validate_retrieval_hierarchy_pair(self) -> "AskRequest":
+        if "evidence_count" not in self.model_fields_set:
+            # Keep a concrete value for request serialization, without treating
+            # an explicit five as omission or enlarging a caller's hard cap.
+            object.__setattr__(self, "evidence_count", 8 if self.execution_mode == "agent" else 5)
         validate_hierarchy_mode(
             self.hierarchy_mode,
             retrieval_version=self.retrieval_version,
@@ -396,45 +442,12 @@ class EvidenceChainResponse(BaseModel):
     truncated: bool
 
 
-class BaseRetrievalSummaryResponse(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    attempted: bool
-    status: str
-    new_evidence_count: int = Field(ge=0)
-    retrieval_detail: dict[str, int | str] | None = None
-
-
-class ExecutionSummaryResponse(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    status: str
-    answer_mode: str
-    evidence_count: int = Field(ge=0)
-    citation_count: int = Field(ge=0)
-    base_retrieval: BaseRetrievalSummaryResponse | None = None
-    planner_requests_attempted: int | None = Field(default=None, ge=0)
-    planner_repair_attempts: int | None = Field(default=None, ge=0)
-    provider_logical_calls: int | None = Field(default=None, ge=0)
-    provider_http_attempt_count: int | None = Field(default=None, ge=0)
-    tool_calls_attempted: int | None = Field(default=None, ge=0)
-    tool_calls_succeeded: int | None = Field(default=None, ge=0)
-    tool_calls_failed: int | None = Field(default=None, ge=0)
-    steps_used: int | None = Field(default=None, ge=0)
-    tool_calls_used: int | None = Field(default=None, ge=0)
-    agent_elapsed_ms: int | None = Field(default=None, ge=0)
-    planner_duration_ms: int | None = Field(default=None, ge=0)
-    tool_duration_ms: int | None = Field(default=None, ge=0)
-    finalization_duration_ms: int | None = Field(default=None, ge=0)
-    planner_termination_reason: str | None = None
-    citation_validation_passed: bool | None = None
-    relation_validation_passed: bool | None = None
-    post_generation_validation_passed: bool | None = None
-    diagnostics_truncated: bool | None = None
-
-
 class AskResponse(BaseModel):
     model_config = ConfigDict(hide_input_in_errors=True)
 
     request_id: str = Field(..., min_length=1, max_length=64)
+    record_id: str | None = Field(default=None, pattern=r"^[1-9]\d*$")
+    created_at: str | None = None
     execution_mode: Literal["rag", "agent"] = "agent"
     answer: str
     citations: list[CitationResponse]
@@ -657,22 +670,29 @@ def health() -> dict[str, Any]:
     embedding_identity = embedding_service.get_model_identity()
     return {
         "ok": True,
+        "startup_instance_id": os.environ.get("REPONOESIS_STARTUP_ID", ""),
         "llm_available": llm.available,
         "github_token_configured": bool(get_env_value("GITHUB_TOKEN")),
         "embedding_enabled": embedding_service.settings.enabled,
         "embedding_available": embedding_service.is_available(),
+        "embedding_ready": embedding_service.runtime_status()["ready"],
+        "embedding_runtime": embedding_service.runtime_status(),
         "embedding_model": embedding_identity.model_name,
         "embedding_model_revision": embedding_identity.model_revision,
         "embedding_device": embedding_identity.device,
         "database": str(Path(db.path)),
         "database_schema_version": SCHEMA_VERSION,
-        "configuration": get_product_config_status(),
+        "configuration": configuration_status(),
     }
 
 
 @app.get("/api/config/status")
 def configuration_status() -> dict[str, Any]:
-    return get_product_config_status()
+    status = get_product_config_status()
+    status["embedding"]["configured_ready"] = status["embedding"]["ready"]
+    status["embedding"]["model_ready"] = embedding_service.runtime_status()["ready"]
+    status["embedding"]["runtime"] = embedding_service.runtime_status()
+    return status
 
 
 @app.get("/api/workspaces", response_model=WorkspaceListResponse)
@@ -729,6 +749,24 @@ def get_workspace(workspace_id: str) -> dict[str, Any]:
                 "retryable": False,
             },
         ) from exc
+
+
+@app.get("/api/workspaces/{workspace_id}/chat-history", response_model=ChatHistoryPage)
+def get_chat_history(
+    workspace_id: str,
+    active_project_id: str = Query(..., min_length=1),
+    revision: str = Query(...),
+    activation_version: int | None = Query(default=None, ge=1),
+    limit: int = Query(default=20, ge=1, le=50),
+    cursor: str | None = Query(default=None, max_length=2048),
+) -> dict[str, Any]:
+    try:
+        return db.read_chat_history(workspace_id, active_project_id, revision, limit=limit,
+                                    cursor=cursor, activation_version=activation_version)
+    except ChatHistoryError as exc:
+        raise HTTPException(status_code=exc.status_code, detail={
+            "code": exc.code, "message": "Saved answer history is unavailable.", "retryable": False,
+        }) from exc
 
 
 def _update_service() -> WorkspaceUpdateService:
@@ -1228,6 +1266,34 @@ def get_project_map(project_id: str) -> dict[str, Any]:
     }
 
 
+class SourceFileResponse(BaseModel):
+    project_id: str
+    revision: str
+    path: str
+    workspace_id: str
+    activation_version: int
+    content: str
+    total_lines: int
+    complete: Literal[True]
+    content_sha256: str
+    utf8_bytes: int
+
+
+@app.get("/api/projects/{project_id}/source-file", response_model=SourceFileResponse)
+def get_source_file(project_id: str, revision: str = Query(...), path: str = Query(...)) -> dict[str, Any]:
+    try:
+        try:
+            return db.read_source_file(project_id, revision, path)
+        except SourceFileError as missing:
+            if missing.code != "source_file_not_found":
+                raise
+            return read_material_file(db, repository_settings.runtime_dir, project_id, revision, path)
+    except SourceFileError as exc:
+        raise HTTPException(status_code=exc.status_code, detail={
+            "code": exc.code, "message": "Saved snapshot source is unavailable.", "retryable": False,
+        }) from exc
+
+
 @app.get("/api/projects/{project_id}/learning-path")
 def get_learning_path(project_id: str) -> dict[str, Any]:
     bundle = _bundle_or_404(project_id)
@@ -1257,6 +1323,8 @@ def _execute_ask(
     bundle = _bundle_or_404(project_id)
     if request.repository_revision is not None and bundle["project"].get("repository_revision") != request.repository_revision:
         raise HTTPException(status_code=409, detail="项目版本已变化，请重新打开项目。")
+    # Freeze this execution's original snapshot. Never re-read the active revision at save time.
+    saved_revision = bundle["project"].get("repository_revision", "")
     product_project = bundle["project"].get("source_type") in {"local", "git_url"}
     if product_project:
         try:
@@ -1408,6 +1476,7 @@ def _execute_ask(
         serialized_response = initially_validated_response.model_dump_json()
         validated_response = AskResponse.model_validate_json(serialized_response)
         validated_payload = json.loads(validated_response.model_dump_json())
+        recovery_metadata = prepare_recovery_metadata(validated_payload, project_id, saved_revision)
     except Exception as exc:
         now = time.monotonic()
         recorder.record_route_elapsed(int((now - started) * 1000))
@@ -1469,11 +1538,13 @@ def _execute_ask(
         _log_ask_failure(detail)
         raise HTTPException(status_code=504, detail=detail)
     try:
-        db.save_chat_answer(
+        saved_identity = db.save_chat_answer(
             project_id,
             request.question,
             validated_payload["answer"],
             validated_payload["citations"],
+            repository_revision=saved_revision,
+            recovery_metadata=recovery_metadata,
         )
     except Exception as exc:
         recorder.record_route_elapsed(int((time.monotonic() - started) * 1000))
@@ -1493,6 +1564,8 @@ def _execute_ask(
         # Persistence is the business terminal boundary. Logging handlers,
         # filters, formatters, and serializers are best-effort after it.
         pass
+    # Trusted SQLite primitives only. All fallible recovery validation happened before the INSERT.
+    validated_payload.update(saved_identity)
     return validated_payload
 
 
