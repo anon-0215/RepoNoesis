@@ -1,6 +1,6 @@
 # RepoNoesis：安装、配置与首次使用
 
-适用范围：Windows 本地单用户、中小型 Python Git 仓库。请在**解压后的 RepoNoesis 根目录**打开 PowerShell；下面的相对路径均以此为起点。无需克隆本项目 GitHub，源码包已经包含当前交付实现。
+适用范围：Windows 本地单用户、中小型 Python Git 仓库。请在**Git 检出或源码包解压后的 RepoNoesis 根目录**打开 PowerShell；下面的相对路径均以此为起点。已有独立源码包无需再次克隆本项目；Git 检出不含前端构建产物、模型和私人数据，具体区别见 [Git 源码说明](GIT_SOURCE_STATE.md)。
 
 ## 1. 准备运行环境
 

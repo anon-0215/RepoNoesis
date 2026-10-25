@@ -16,9 +16,11 @@ RepoNoesis 是面向陌生 Python 仓库的本地源码阅读工作台。用户�
 
 [使用入口](START_HERE.md) → [安装与首次使用](docs/DELIVERY_FIRST_USE.md) → [核验环境版本](docs/DELIVERY_ENVIRONMENT.md)。
 
-使用收到的源码 ZIP，不必先克隆本项目远端。包内包含尚未提交到 Git 的产品修复；精确版本由 `DELIVERY_VERSION.json` 和逐文件哈希确定。
+通过 Git 使用本项目时，克隆仓库并选择要使用的分支或提交，随后按首次使用说明准备依赖、模型和私有配置。运行 `git rev-parse HEAD` 可查看当前提交身份；完整源码状态还需结合 `git status --short` 核对。
 
-在解压后的 `RepoNoesis` 目录运行以下 PowerShell 命令，可核对文件完整性：
+Git 仓库不保存 `frontend/dist`，安装前端依赖后可在 `frontend` 目录运行 `npm run build` 生成。模型、真实配置和数据库也不随 Git 提供，详见 [Git 源码与本地成果的边界](docs/GIT_SOURCE_STATE.md)。
+
+如果使用已有的独立源码 ZIP，以该包自带的版本记录为准，不必再次克隆。仅当包内提供 `DELIVERY_VERSION.json` 和 `SHA256SUMS.txt` 时，可在解压后的 `RepoNoesis` 目录运行以下命令核对包内文件；这些清单不是 Git 检出的必备文件，旧包也不会随开发分支自动更新。
 
 ```powershell
 Get-Content SHA256SUMS.txt | ForEach-Object {
@@ -36,7 +38,7 @@ Get-Content SHA256SUMS.txt | ForEach-Object {
 | `backend/app` | FastAPI、索引、检索、RAG/Agent、源码探索和存储 |
 | `backend/tests` | 产品相关自动化测试 |
 | `frontend/src` | React 工作台和源码阅读器 |
-| `frontend/dist` | 随包前端构建产物；正常开发启动仍需要 Node.js 与前端依赖 |
+| `frontend/dist` | 本地构建产物，不入 Git；部分独立源码 ZIP 附带，开发启动仍需 Node.js 与前端依赖 |
 | `scripts`、`start_all.bat` | Windows 本地启动和运行时查找 |
 | `.env.example` | 不含密钥的配置模板 |
 | `backend/requirements.txt`、`frontend/package-lock.json` | 后端依赖声明和前端依赖锁文件 |
@@ -44,7 +46,7 @@ Get-Content SHA256SUMS.txt | ForEach-Object {
 
 ## 开发检查
 
-完成产品依赖准备后，在包根目录可运行启动脚本测试：
+完成产品依赖准备后，在项目根目录可运行启动脚本测试：
 
 ```powershell
 python -B -m unittest discover -s backend/tests -p test_windows_startup_scripts.py -v

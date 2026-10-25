@@ -182,6 +182,7 @@ export interface AskProgressEvent {
   type: string;
   status?: string;
   tool?: string;
+  tool_target?: { symbol: string } | { path: string; start_line: number; end_line: number };
   reason?: string;
   new_evidence_count?: number;
   evidence_added?: number;

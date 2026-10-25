@@ -1,4 +1,4 @@
-# 源鉴 RepoNoesis：提交版使用入口
+# 源鉴 RepoNoesis：使用入口
 
 面向陌生 Python 仓库，提供三种读代码的入口：
 
@@ -10,7 +10,7 @@
 
 **首次使用请按 [安装、配置与使用说明](docs/DELIVERY_FIRST_USE.md) 顺序操作。**
 
-1. 解压本包，使用其中的 `RepoNoesis` 目录；本包不要求克隆本项目 GitHub。
+1. 通过 Git 获取源码并选择所需分支或提交，或解压已有独立源码包；在对应的 `RepoNoesis` 根目录操作。
 2. 准备 Python、Node.js、Git 和产品依赖；获取本地 BGE-M3 模型。
 3. 复制 `.env.example` 为私有 `.env`，填写本机模型路径。问答再配置生成 API。
 4. 运行 `start_all.bat`，进入项目管理，导入干净的 Python Git 仓库，等待索引完成。
@@ -18,11 +18,11 @@
 
 已有索引与源码材料时，报错定位、用例对照及源码阅读无需生成 API；全新数据仍需先完成原有 BGE 导入流程。首次索引与之后提问是两个阶段，不要因等待较久重复提交导入。
 
-包内提供完整应用源码、相关测试、启动脚本、依赖声明、前端锁文件及构建产物。模型权重、API 密钥、私人数据库和已安装依赖不随包提供。
+Git 仓库提供应用源码、相关测试、启动脚本、依赖声明和前端锁文件。安装前端依赖后，在 `frontend` 目录运行 `npm run build` 生成构建产物；部分独立源码包附带已构建文件。模型权重、API 密钥、私人数据库和已安装依赖需自行准备。
 
 - [环境版本记录](docs/DELIVERY_ENVIRONMENT.md)
 - [源码探索详细说明](docs/SOURCE_EXPLORATION.md)
 - [文件校验与项目结构](README.md)
 - [第三方来源与分发事项](docs/DELIVERY_DISTRIBUTION_REVIEW.md)
 
-实际交付内容由 `DELIVERY_VERSION.json` 与 `SHA256SUMS.txt` 确定。Git HEAD 为开发基准，不代替包内文件身份。
+Git 版本用提交身份和工作区状态核对。已有独立源码包若包含 `DELIVERY_VERSION.json` 与 `SHA256SUMS.txt`，则使用包内清单核对；它们不是 Git 检出的必备文件。详见 [Git 源码与本地成果的边界](docs/GIT_SOURCE_STATE.md)。

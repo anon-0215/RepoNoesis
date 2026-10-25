@@ -123,3 +123,15 @@ describe('ask progress stream', () => {
     }
   });
 });
+
+
+it('delivers optional tool targets once and rejects another request target', async () => {
+  const detail = { tool: 'lookup_symbol', status: 'succeeded', tool_target: { symbol: 'Context.close' } };
+  const onProgress = vi.fn();
+  vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(
+    frame(1, 'tool_completed', detail) + frame(1, 'tool_completed', detail) +
+    frame(2, 'tool_completed', { ...detail, request_id: 'another-request' }), { status: 200 })));
+  await expect(askProjectStream('p', revision, 'question', 'rag', 'local-1', onProgress)).rejects.toThrow('请求身份不匹配');
+  expect(onProgress).toHaveBeenCalledTimes(1);
+  expect(onProgress.mock.calls[0][0].tool_target).toEqual({ symbol: 'Context.close' });
+});

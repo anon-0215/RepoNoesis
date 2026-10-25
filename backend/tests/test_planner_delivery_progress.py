@@ -200,8 +200,8 @@ class PlannerDeliveryProgressTests(unittest.TestCase):
         for stop in ['cancel','deadline','reserve','tokens','steps','tools']:
             with self.subTest(stop=stop):
                 limits=replace(AgentLimits(),**({'max_agent_steps':2} if stop=='steps' else {'max_tool_calls':2} if stop=='tools' else {}))
-                def inject(state,action,observation):
-                    original(state,action,observation)
+                def inject(state,action,observation,tool_request=None):
+                    original(state,action,observation,tool_request)
                     if action!='read_source':return
                     if stop=='cancel':state.context.cancellation.cancel()
                     if stop=='deadline':state.budget=replace(state.budget,request_deadline_at=time.monotonic()-1)
@@ -291,8 +291,8 @@ class PlannerDeliveryProgressTests(unittest.TestCase):
         self.assertFalse(any(r['symbol']==c['qualified_name'] for r in model.final_rows()))
         self.assertFalse(any(r['qualified_name']==c['qualified_name'] for r in result['citations']))
         c=self.flow.chunks['PacketVault.open']; original_update=agent_core._update_state_from_observation
-        def corrupt_after_validation(state,action,observation):
-            original_update(state,action,observation)
+        def corrupt_after_validation(state,action,observation,tool_request=None):
+            original_update(state,action,observation,tool_request)
             if action=='read_source':
                 held=next(e for e in state.context.evidence_store.all(state.request_id) if e.qualified_name==c['qualified_name'])
                 self.assertEqual(held.validation_status,'valid')

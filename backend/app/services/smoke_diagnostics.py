@@ -513,8 +513,12 @@ class SmokeDiagnosticsRecorder:
         evidence_added: int,
         reason_code: str | None,
         candidate_metrics: dict[str, Any] | None = None,
+        effective_parameters: dict[str, Any] | None = None,
     ) -> None:
         """Record one fixed-shape, content-free summary of a real tool execution."""
+
+        # Parameters are available to the live progress subclass only. Do not
+        # persist them in diagnostic snapshots or historical summaries.
 
         if len(self._tool_executions) >= MAX_TOOL_ENTRIES:
             self._truncated = True

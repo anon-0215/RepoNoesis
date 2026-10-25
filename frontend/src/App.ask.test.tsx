@@ -453,6 +453,8 @@ describe('App ask request gate integration', () => {
         await Promise.resolve();
       });
       expect(askProjectStream).toHaveBeenCalledTimes(1);
+      expect(container.querySelector<HTMLTextAreaElement>('form.ask-form textarea')?.value).toBe('');
+      expect(vi.mocked(askProjectStream).mock.calls[0][2]).toBe('first question');
 
       form = container.querySelector<HTMLFormElement>('form.ask-form');
       submit = form?.querySelector<HTMLButtonElement>('button[type="submit"]');
@@ -464,6 +466,11 @@ describe('App ask request gate integration', () => {
       expect(askProjectStream).toHaveBeenCalledTimes(1);
 
       await act(async () => {
+        setInputValue(container.querySelector<HTMLTextAreaElement>('form.ask-form textarea')!, 'new unsent draft');
+        await flushPromises();
+      });
+
+      await act(async () => {
         rejectFirst(new ApiError('safe failure', 500, failure));
         await flushPromises();
       });
@@ -472,6 +479,13 @@ describe('App ask request gate integration', () => {
       input = form?.querySelector<HTMLTextAreaElement>('textarea');
       submit = form?.querySelector<HTMLButtonElement>('button[type="submit"]');
       expect(errorCard?.textContent).toContain('tool_timeout');
+      expect(input?.value).toBe('new unsent draft');
+      const restore = buttonWithText(container, '恢复到输入框');
+      expect(restore.disabled).toBe(true);
+      await act(async () => { setInputValue(input!, ''); await flushPromises(); });
+      await act(async () => { restore.click(); await flushPromises(); });
+      expect(input?.value).toBe('first question');
+      expect(askProjectStream).toHaveBeenCalledTimes(1);
       expect(submit?.disabled).toBe(false);
       expect(container.querySelector('.wb-notification')).toBeNull();
       await act(async () => { buttonWithText(container, '项目地图').click(); await flushPromises(); });

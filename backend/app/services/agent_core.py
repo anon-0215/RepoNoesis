@@ -2346,6 +2346,7 @@ def _execute_agent_tool(
                 ),
                 evidence_added=max(0, evidence_after - evidence_before),
                 reason_code=(observation.error or {}).get("code"),
+                effective_parameters=call.effective_parameters,
                 candidate_metrics=(
                     _safe_candidate_metrics(observation.metrics)
                     if action in {"lookup_symbol", "read_source"}

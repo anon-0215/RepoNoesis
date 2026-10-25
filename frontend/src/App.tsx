@@ -597,6 +597,8 @@ export default function App() {
     if (!token) return;
     const submittedQuestion = question.trim();
     const submittedMode = executionMode;
+    // The request owns this text snapshot; later edits belong to the next draft.
+    setQuestion('');
     const connection = new AbortController();
     activeAskConnection.current = connection;
     const entryId = `${token.context.workspaceId}:${token.context.projectId}:${token.context.revision}:${token.requestId}`;
@@ -626,7 +628,6 @@ export default function App() {
         ? { ...entry, status: 'success', result, recordId: isRecordId(result.record_id) ? result.record_id : undefined,
             createdAt: result.created_at ?? undefined }
         : entry));
-      setQuestion('');
       setMessage('回答已生成，注意查看引用文件。');
     } catch (error) {
       if (!requestGate.current.isCurrent(token)) return;

@@ -63,6 +63,48 @@ beforeEach(() => {
 afterEach(async () => { await act(async () => root.unmount()); vi.resetAllMocks(); vi.unstubAllGlobals(); window.localStorage.clear(); host.remove(); });
 
 describe('database history integration', () => {
+  it('clears only an accepted submission and preserves a new draft on completion', async () => {
+    const stream = deferred<ChatAnswer>(); vi.mocked(askProjectStream).mockReturnValue(stream.promise);
+    await mount(); await draft('   '); await submit();
+    expect(askProjectStream).not.toHaveBeenCalled();
+    expect(host.querySelector('textarea')!.value).toBe('   ');
+    await draft('submitted question'); await submit();
+    expect(host.querySelector('textarea')!.value).toBe('');
+    expect(vi.mocked(askProjectStream).mock.calls[0][2]).toBe('submitted question');
+    await draft('next draft'); await submit();
+    expect(askProjectStream).toHaveBeenCalledTimes(1);
+    expect(host.querySelector('textarea')!.value).toBe('next draft');
+    await act(async () => { stream.resolve(answer()); await flush(); });
+    expect(host.querySelector('textarea')!.value).toBe('next draft');
+    expect(host.querySelector('.wb-question')?.textContent).toContain('submitted question');
+  });
+  it.each(['project', 'revision'])('rejects stale failure recovery after a %s change', async change => {
+    const stream = deferred<ChatAnswer>(); vi.mocked(askProjectStream).mockReturnValue(stream.promise);
+    await mount(); await draft('old request'); await submit(); await draft('new draft');
+    if (change === 'revision') version = 'rev-b';
+    await click(change === 'project' ? 'project 2' : 'project 1');
+    await act(async () => { stream.reject(new Error('old failure')); await flush(); });
+    expect(host.querySelector('textarea')!.value).toBe('new draft');
+    expect(host.textContent).not.toContain('old failure');
+    expect(host.textContent).not.toContain('恢复到输入框');
+    expect(vi.mocked(askProjectStream).mock.calls[0][6]?.aborted).toBe(true);
+  });
+  it('does not replace even a whitespace draft when recovering a failed question', async () => {
+    vi.mocked(askProjectStream).mockRejectedValue(new Error('fixture failure'));
+    await mount(); await draft('recover me'); await submit(); await draft('  ');
+    expect(button('恢复到输入框').disabled).toBe(true);
+    expect(host.querySelector('textarea')!.value).toBe('  ');
+    await draft(''); await click('恢复到输入框');
+    expect(host.querySelector('textarea')!.value).toBe('recover me');
+  });
+  it('keeps the draft when no usable project is selected and submission is rejected', async () => {
+    await mount(); await draft('unsent before project failure');
+    vi.mocked(getProject).mockRejectedValueOnce(new Error('fixture project unavailable'));
+    await click('project 2'); await submit();
+    expect(host.querySelector('textarea')!.value).toBe('unsent before project failure');
+    expect(host.querySelector<HTMLTextAreaElement>('textarea')!.disabled).toBe(true);
+    expect(askProjectStream).not.toHaveBeenCalled();
+  });
   it('opens QA without fetching optional map, learning or report data', async () => {
     vi.mocked(getLearningPath).mockRejectedValue(new Error('learning unavailable'));
     vi.mocked(getReport).mockRejectedValue(new Error('report unavailable'));
@@ -135,6 +177,8 @@ describe('database history integration', () => {
     await act(async () => { history.resolve(page([record('88', { question: 'same question' })])); await flush(); });
     await act(async () => { stream.reject(error); await flush(); });
     expect(host.querySelectorAll('.wb-answer')).toHaveLength(2); expect(host.querySelector('.wb-error')).not.toBeNull();
+    expect(host.querySelector('textarea')!.value).toBe('');
+    await click('恢复到输入框');
     expect(host.querySelector('textarea')!.value).toBe('same question'); expect(askProjectStream).toHaveBeenCalledTimes(1);
   });
   it('keeps two independent successes with identical questions', async () => {
