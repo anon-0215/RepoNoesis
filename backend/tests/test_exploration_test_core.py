@@ -67,6 +67,44 @@ class StaticExtractionTests(unittest.TestCase):
         repo,data,_=self.make(test)
         self.assertEqual(repo.scenarios,[])
 
+    def test_indirect_parameterization_never_becomes_direct_inputs(self):
+        for options in [', indirect=True', ', indirect=["value"]', ', True', ', ["value"]']:
+            with self.subTest(options=options):
+                test=('import pytest\nimport package\n'
+                      '@pytest.fixture\ndef value(request):\n    return 99\n'
+                      '@pytest.mark.parametrize("value", [1, 2]'+options+')\n'
+                      'def test_values(value):\n    assert package.render(value) == 99\n')
+                repo,data,_=self.make(test)
+                self.assertEqual(repo.scenarios,[])
+                self.assertEqual(data['comparisons'],[])
+                self.assertIn('indirect',data['unsupported'][0]['reason'])
+
+    def test_unknown_indirect_and_expanded_parameter_options_are_rejected(self):
+        for options in [', indirect=setting', ', setting', ', indirect=choose_mode()',
+                        ', **options', ', **{"indirect": True}', ', **{"ids": ["a", "b"]}']:
+            with self.subTest(options=options):
+                test=('import pytest\nimport package\n'
+                      '@pytest.mark.parametrize("value", [1, 2]'+options+')\n'
+                      'def test_values(value):\n    assert package.render(value) == 99\n')
+                repo,data,_=self.make(test)
+                self.assertEqual(repo.scenarios,[])
+                self.assertEqual(data['comparisons'],[])
+                self.assertTrue(data['unsupported'])
+
+    def test_explicit_direct_parameterization_keeps_inputs_and_origins(self):
+        for options in ['', ', indirect=False', ', indirect=[]', ', False', ', []']:
+            with self.subTest(options=options):
+                test=('import pytest\nimport package\n'
+                      '@pytest.mark.parametrize("value", [1, 2]'+options+')\n'
+                      'def test_values(value):\n    assert package.render(value) == 99\n')
+                repo,data,_=self.make(test)
+                self.assertEqual(len(data['comparisons']),1)
+                pair=data['comparisons'][0]
+                self.assertEqual(pair['status'],'supported')
+                self.assertEqual([s['inputs'][0]['text'] for s in pair['scenarios']],['1','2'])
+                self.assertTrue(all(s['inputs'][0]['source']['start']==3 for s in pair['scenarios']))
+                self.assertEqual(data['unsupported'],[])
+
     def test_automatic_fixture_is_reported_even_without_test_parameters(self):
         repo,data,_=self.make('import package\ndef test_a():\n    assert package.render("a")=="a"\ndef test_b():\n    assert package.render("b")=="b"\n')
         (repo.root/'tests/conftest.py').write_text('import pytest\n@pytest.fixture(autouse=True)\ndef clear_env():\n    raise RuntimeError("never execute")\n',encoding='utf-8')

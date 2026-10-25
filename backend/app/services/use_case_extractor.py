@@ -230,6 +230,18 @@ class Repository:
                 raise Unknown('非简单常量参数化装饰器')
             name=dotted(deco.func).split('.')[0]
             if aliases.get(name)!='pytest' or len(deco.args)<2: raise Unknown('参数化导入或参数不明确')
+            # Indirect values feed request.param, not the tested call. Do not
+            # project them as concrete inputs without resolving the fixture.
+            if any(kw.arg is None for kw in deco.keywords):
+                raise Unknown('参数化 ** 选项未解析，无法确认 indirect 或直接输入')
+            indirect_nodes=deco.args[2:3]+[kw.value for kw in deco.keywords if kw.arg=='indirect']
+            if len(indirect_nodes)>1: raise Unknown('参数化 indirect 重复指定，不能确认输入')
+            if indirect_nodes:
+                try: indirect=constant(indirect_nodes[0],{})
+                except (Unknown,TypeError,ValueError):
+                    raise Unknown('参数化 indirect 无法静态确认，fixture 输入未解析') from None
+                if not (indirect is False or isinstance(indirect,(list,tuple)) and not indirect):
+                    raise Unknown('参数化 indirect 依赖未解析的 fixture，不是被测调用的直接输入')
             names=constant(deco.args[0],{})
             if isinstance(names,str): names=[x.strip() for x in names.split(',')]
             values=constant(deco.args[1],{})

@@ -16,7 +16,7 @@ from app.services.use_case_extractor import Repository
 from app.services.use_case_selection import choose_representatives
 from app.services import traceback_link
 
-ALGORITHM = 'source-exploration-2-physical-lines'
+ALGORITHM = 'source-exploration-3-direct-parametrization'
 _cache: OrderedDict[tuple, dict[str, Any]] = OrderedDict()
 _lock = RLock()
 
