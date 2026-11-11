@@ -47,3 +47,8 @@ artifacts/retrieval_v2_phase6/
 /docs/aic/
 /backend/tests/test_final_answer_fence_compat.py
 /backend/tests/fixtures/final_answer_fenced_outputs.json
+
+# Local desktop runtime and personal configuration; source lives in desktop/.
+/runtime/
+/user-data/
+/desktop-config.json

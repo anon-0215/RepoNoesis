@@ -136,7 +136,9 @@ def read_sources(db: Any, runtime: Path, project_id: str, revision: str) -> dict
 def git(root: Path, *args: str, limit: int = MAX_TOTAL_BYTES) -> bytes:
     # No target code, hooks, shell, network, checkout or dependency installation.
     with subprocess.Popen(['git','--no-replace-objects','-c',f'safe.directory={root.as_posix()}', '-C',str(root),*args],
-                          stdout=subprocess.PIPE, stderr=subprocess.DEVNULL) as process:
+                          stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                          creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0),
+                          stdin=subprocess.DEVNULL) as process:
         import threading
         timer = threading.Timer(30, process.kill); timer.start()
         try:

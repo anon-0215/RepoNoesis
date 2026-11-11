@@ -232,6 +232,8 @@ def import_public_git_repository(
             capture_output=True,
             timeout=settings.clone_timeout_seconds,
             env=env,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            stdin=subprocess.DEVNULL,
         )
         revision = _git(temporary, "rev-parse", "HEAD").strip()
         stable = clone_root / f"{hashlib.sha256(url.encode()).hexdigest()[:16]}-{revision[:12]}"
@@ -526,6 +528,8 @@ def _git(root: Path, *arguments: str, allow_failure: bool = False) -> str:
         capture_output=True,
         timeout=30,
         env=_git_environment(),
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        stdin=subprocess.DEVNULL,
     )
     return result.stdout.decode("utf-8", errors="replace").strip()
 
@@ -537,6 +541,8 @@ def _git_bytes(root: Path, *arguments: str) -> bytes:
         capture_output=True,
         timeout=30,
         env=_git_environment(),
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        stdin=subprocess.DEVNULL,
     ).stdout
 
 

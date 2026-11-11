@@ -525,7 +525,8 @@ describe('App ask request gate integration', () => {
 });
 
 describe('App connection and import status integration', () => {
-  it('keeps the shared shell for an empty library and exposes import through project management', async () => {
+  it.each([false, true])('keeps the shared shell for an empty library and exposes import through project management (desktop=%s)', async (desktop) => {
+    vi.stubEnv('VITE_DESKTOP', desktop ? 'true' : 'false');
     vi.stubGlobal('IS_REACT_ACT_ENVIRONMENT', true);
     vi.mocked(getConfigStatus).mockResolvedValue({ embedding: { ready: true }, llm: { ready: true } } as never);
     vi.mocked(listWorkspaces).mockResolvedValue({ items: [], total: 0, limit: 20, offset: 0 } as never);
@@ -541,9 +542,11 @@ describe('App connection and import status integration', () => {
       expect(container.querySelector('form.analyze-form')).not.toBeNull();
       expect(container.textContent).toContain('首次导入需要预先准备本地 BGE-M3 权重');
       expect(container.textContent).toContain('不需要生成模型');
+      expect(container.textContent).toContain(desktop ? '按当前 Windows 用户加密保存在独立数据目录' : 'API Key 只保存在后端根目录 .env');
     } finally {
       if (root) await act(async () => root?.unmount());
       container.remove();
+      vi.unstubAllEnvs();
     }
   });
 

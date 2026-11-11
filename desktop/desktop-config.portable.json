@@ -1,0 +1,12 @@
+{
+  "model_directory": "",
+  "git_directory": "",
+  "api_base": "",
+  "api_model": "",
+  "device": "auto",
+  "batch_size": 1,
+  "max_length": 8192,
+  "port": 18771,
+  "hyde_enabled": true,
+  "rerank_enabled": true
+}
