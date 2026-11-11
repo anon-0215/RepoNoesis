@@ -310,6 +310,7 @@ class RetrievalV2Orchestrator:
         check_active: Callable[[], None] | None = None,
         diagnostics_recorder: SmokeDiagnosticsRecorder | None = None,
         semantic_deadline_at: float | None = None,
+        candidate_limit: int | None = None,
     ) -> RetrievalExecutionOutcome:
         _check(check_active)
         if not str(query).strip():
@@ -470,7 +471,8 @@ class RetrievalV2Orchestrator:
             self.config.max_final_top_k,
             max(1, int(evidence_count)),
         )
-        selected = merged[:limit]
+        pool_limit = limit if candidate_limit is None else min(40, max(limit, candidate_limit))
+        selected = merged[:pool_limit]
         normalized_results: list[HybridSearchResult] | None = None
         hierarchy_audit: dict[str, Any] | None = None
         if hierarchy_mode == HIERARCHY_MODE_NORMALIZE_V1:
@@ -563,6 +565,14 @@ class RetrievalV2Orchestrator:
                     "unexpected_error": type(exc).__name__,
                     "warnings": [warning],
                 }
+        if candidate_limit is not None and len(final_results) < pool_limit:
+            # Hierarchy/relation policies keep their existing final-size contract.
+            # Carry remaining real fused candidates to the first-search ranker.
+            seen = {_exact_chunk_identity(item) for item in final_results}
+            final_results = [*final_results, *[
+                item.to_hybrid_result() for item in merged
+                if item.chunk_identity not in seen
+            ]][:pool_limit]
         mode = (
             "hybrid" if any("dense" in item.source_records for item in selected) else "lexical"
         )
@@ -646,6 +656,7 @@ def retrieve_code(
     check_active: Callable[[], None] | None = None,
     diagnostics_recorder: SmokeDiagnosticsRecorder | None = None,
     semantic_deadline_at: float | None = None,
+    candidate_limit: int | None = None,
 ) -> RetrievalExecutionOutcome:
     _check(check_active)
     version = validate_retrieval_version(retrieval_version)
@@ -668,6 +679,7 @@ def retrieve_code(
             check_active=check_active,
             diagnostics_recorder=diagnostics_recorder,
             semantic_deadline_at=semantic_deadline_at,
+            candidate_limit=candidate_limit,
         )
         return RetrievalExecutionOutcome(
             results=outcome.results,
@@ -688,6 +700,7 @@ def retrieve_code(
         check_active=check_active,
         diagnostics_recorder=diagnostics_recorder,
         semantic_deadline_at=semantic_deadline_at,
+        candidate_limit=candidate_limit,
     )
 
 

@@ -3,6 +3,19 @@ import { describe, expect, it } from 'vitest';
 import type { AskFailure, ChatAnswer } from '../types';
 import { ExecutionSummary } from './ExecutionSummary';
 
+it('shows enhancement execution, fallback and timing from the saved summary', () => {
+  const markup = renderToStaticMarkup(<ExecutionSummary result={{ execution_summary: {
+    retrieval_enhancement: { hyde: { status: 'succeeded', elapsed_ms: 1700 },
+      rerank: { status: 'fallback', elapsed_ms: 2100, reason: 'deadline_exceeded' },
+      elapsed_ms: 3800, selection_changed: true }
+  } }} historical />);
+  expect(markup).toContain('HyDE 补充召回：已执行');
+  expect(markup).toContain('候选重排序：已回退');
+  expect(markup).toContain('deadline_exceeded');
+  expect(markup).toContain('3800');
+  expect(markup).toContain('最终证据选择已变化');
+});
+
 const answer: ChatAnswer = { answer: 'answer', citations: [], warnings: [], answer_mode: 'llm_grounded', grounding_status: 'grounded' };
 
 describe('execution summary projection', () => {

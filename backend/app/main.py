@@ -273,6 +273,8 @@ def _ask_execution_summary(result: dict[str, Any], snapshot: dict[str, Any]) -> 
             if isinstance(value, int) and not isinstance(value, bool) and 0 <= value <= 1_000_000:
                 summary[target] = value
     base = snapshot.get("base_retrieval")
+    if isinstance(snapshot.get("retrieval_enhancement"), dict):
+        summary["retrieval_enhancement"] = snapshot["retrieval_enhancement"]
     if isinstance(base, dict) and isinstance(base.get("attempted"), bool) and isinstance(base.get("status"), str):
         summary["base_retrieval"] = {
             "attempted": base["attempted"], "status": base["status"],
@@ -426,6 +428,7 @@ class EvidenceResponse(BaseModel):
     semantic_rank: int | None
     fusion_score: FiniteFloat
     fusion_rank: int
+    rerank_rank: int | None = Field(default=None, ge=1)
     selection_reason: str
     validation_status: Literal["valid", "invalid", "unvalidated"]
     invalid_reason: str | None

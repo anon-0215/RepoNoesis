@@ -100,6 +100,7 @@ class CandidateEvidence:
     derived_sentinel_source_shape: bool
     symbol_match_type: str | None = None
     match_reasons: tuple[str, ...] = ()
+    rerank_rank: int | None = None
 
 
 @dataclass(frozen=True)
@@ -178,6 +179,7 @@ class CandidateEvidencePool:
         held_chunk_identities: set[str] | None = None,
         directed_read_evidence: list[Evidence] | None = None,
         directed_read_scope_chunks: list[dict[str, object]] | None = None,
+        primary_excerpt_limit: int | None = None,
     ) -> CandidatePromotion:
         """Rebuild from canonical chunks before considering owned duplicates.
 
@@ -300,7 +302,7 @@ class CandidateEvidencePool:
             chunk = canonical_by_id[candidate.code_chunk_id]
             canonical = _canonical_retrieval_result(candidate, chunk)
             evidence.extend(
-                EvidenceBuilder().build(
+                EvidenceBuilder(primary_excerpt_limit=primary_excerpt_limit).build(
                     [canonical],
                     project,
                     retrieval_strategy_version=retrieval_strategy_version,
@@ -451,6 +453,7 @@ def _candidate_from_retrieval(
         semantic_rank=item.semantic_rank,
         fusion_score=item.fusion_score,
         fusion_rank=item.fusion_rank,
+        rerank_rank=item.rerank_rank,
         normalization_rejection=normalization_rejection,
         derived_sentinel_source_shape=derived_sentinel_source_shape,
     )
@@ -551,6 +554,8 @@ def _candidate_sort_key(candidate: CandidateEvidence) -> tuple[int, float, str]:
         if _valid_score(score, optional=False)
         else math.inf
     )
+    if _valid_rank(candidate.rerank_rank, optional=False):
+        rank = candidate.rerank_rank
     return (rank, score_key, str(candidate.chunk_identity))
 
 
@@ -626,6 +631,8 @@ def _bound_candidate_rejection(
 
 
 def _ranking_metadata_is_valid(candidate: CandidateEvidence) -> bool:
+    if not _valid_rank(candidate.rerank_rank, optional=True):
+        return False
     # Retrieval v2's hierarchy/relation phases use one explicit, frozen
     # sentinel for server-derived candidates: no source score/rank and
     # fusion=(0.0, 0). Accept only that complete shape. Direct retrieval
@@ -696,6 +703,7 @@ def _canonical_retrieval_result(
         semantic_rank=candidate.semantic_rank,
         fusion_score=candidate.fusion_score,
         fusion_rank=candidate.fusion_rank,
+        rerank_rank=candidate.rerank_rank,
     )
 
 

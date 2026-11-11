@@ -41,7 +41,7 @@ SmokeStage = Literal[
     "gate_assertion",
     "report_build",
 ]
-ProviderPurpose = Literal["planner", "final_answer"]
+ProviderPurpose = Literal["planner", "final_answer", "hyde", "rerank"]
 FallbackReasonCode = Literal[
     "llm_unavailable",
     "context_binding_failed",
@@ -581,6 +581,10 @@ class SmokeDiagnosticsRecorder:
     def record_retrieval_detail(self, detail: dict[str, Any]) -> None:
         self._retrieval_detail = _safe_retrieval_detail(detail)
 
+    def record_retrieval_enhancement(self, detail: dict[str, Any]) -> None:
+        # Program-produced IDs/status/timings only; no hypothesis or credentials.
+        self._agent["retrieval_enhancement"] = sanitize_retrieval_enhancement(detail)
+
     def record_evidence_promotion_ms(self, duration_ms: int) -> None:
         self._retrieval_detail["promotion_ms"] = _bounded_duration(duration_ms)
 
@@ -996,6 +1000,7 @@ def _minimal_smoke_diagnostics(value: dict[str, Any]) -> dict[str, Any]:
         "post_generation_validation_passed",
         "elapsed_ms",
         "base_retrieval",
+        "retrieval_enhancement",
     )
     result = {key: value[key] for key in keys if key in value}
     result["diagnostics_truncated"] = True
@@ -1006,6 +1011,8 @@ def _safe_smoke_diagnostics(value: Any) -> dict[str, Any]:
     if not isinstance(value, dict):
         return {}
     result: dict[str, Any] = {}
+    if isinstance(value.get("retrieval_enhancement"), dict):
+        result["retrieval_enhancement"] = sanitize_retrieval_enhancement(value["retrieval_enhancement"])
     usage_summary = sanitize_provider_usage_summary(value.get("provider_usage_summary"))
     if usage_summary is not None:
         result["provider_usage_summary"] = usage_summary
@@ -1199,6 +1206,32 @@ def _safe_smoke_diagnostics(value: Any) -> dict[str, Any]:
         safe_failure = _safe_repair_failure(value.get(key))
         if safe_failure:
             result[key] = safe_failure
+    return result
+
+
+def sanitize_retrieval_enhancement(value: dict[str, Any]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for name in ("hyde", "rerank"):
+        stage = value.get(name)
+        if not isinstance(stage, dict):
+            continue
+        safe = {"status": stage.get("status") if stage.get("status") in
+                {"disabled", "succeeded", "fallback"} else "fallback",
+                "elapsed_ms": _bounded_duration(stage.get("elapsed_ms", 0))}
+        reason = stage.get("reason")
+        if isinstance(reason, str) and re.fullmatch(r"[A-Za-z_]{1,80}", reason):
+            safe["reason"] = reason
+        if type(stage.get("added_candidates")) is int:
+            safe["added_candidates"] = max(0, min(40, stage["added_candidates"]))
+        if type(stage.get("appended_candidates")) is int:
+            safe["appended_candidates"] = max(0, min(20, stage["appended_candidates"]))
+        result[name] = safe
+    for key in ("original_selected_ids", "rerank_input_ids", "selected_ids"):
+        items = value.get(key)
+        if isinstance(items, list):
+            result[key] = [x for x in items[:40] if type(x) is int and x > 0]
+    result["elapsed_ms"] = _bounded_duration(value.get("elapsed_ms", 0))
+    result["selection_changed"] = value.get("selection_changed") is True
     return result
 
 

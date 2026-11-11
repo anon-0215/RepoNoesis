@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 import time
+from app.config import get_retrieval_enhancement_settings
 from pathlib import PurePosixPath
 from typing import Any, Callable
 
@@ -26,6 +27,7 @@ from app.services.hierarchy_normalization import HIERARCHY_MODE_OFF
 from app.services.llm_client import LLMClient, ProviderError, raise_if_provider_cancelled
 from app.services.smoke_diagnostics import SmokeDiagnosticsRecorder
 from app.services.retrieval_v2 import RETRIEVAL_VERSION_V1, retrieve_code
+from app.services.retrieval_enhancement import retrieve_initial_code
 from app.services.relation_retrieval import (
     RELATION_MODE_EXPAND_V1,
     RELATION_MODE_OFF,
@@ -112,11 +114,17 @@ def answer_question(
             "Relation expansion requires the bounded request Evidence/chain context; "
             "the frozen base retrieval path was preserved."
         )
-    outcome = retrieve_code(
+    enhancement_settings = get_retrieval_enhancement_settings()
+    enhanced = enhancement_settings.hyde_enabled or enhancement_settings.rerank_enabled
+    retrieve = retrieve_initial_code if enhanced else retrieve_code
+    enhancement_arguments = ({"llm": llm, "enhancement_deadline_at": work_deadline_at or (
+        request_deadline_at - 5.0 if request_deadline_at is not None else None)} if enhanced else {})
+    outcome = retrieve(
         database,
         embedding_service,
         project_id,
         question,
+        **enhancement_arguments,
         retrieval_version=retrieval_version,
         evidence_count=evidence_count,
         path=path,
@@ -131,7 +139,7 @@ def answer_question(
         ),
         diagnostics_recorder=diagnostics_recorder,
     )
-    built = EvidenceBuilder().build(
+    built = EvidenceBuilder(primary_excerpt_limit=8192 if enhanced else None).build(
         outcome.results,
         project,
         retrieval_strategy_version=outcome.retrieval_strategy_version,

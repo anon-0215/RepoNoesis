@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
 import os
+import math
 from pathlib import Path
 from typing import Any, Callable, Literal, cast
 from urllib.parse import urlsplit
@@ -120,6 +121,22 @@ class RepositorySettings:
     max_file_bytes: int = 1_000_000
     max_total_bytes: int = 50_000_000
     git_proxy: str | None = field(default=None, repr=False)
+
+
+@dataclass(frozen=True)
+class RetrievalEnhancementSettings:
+    hyde_enabled: bool = False
+    rerank_enabled: bool = False
+    budget_seconds: float = 15.0
+
+
+def get_retrieval_enhancement_settings() -> RetrievalEnhancementSettings:
+    seconds = _bounded_env_float("RETRIEVAL_ENHANCEMENT_SECONDS", 15.0, 0.1, 15.0)
+    return RetrievalEnhancementSettings(
+        hyde_enabled=_env_bool("RETRIEVAL_HYDE_ENABLED", False),
+        rerank_enabled=_env_bool("RETRIEVAL_RERANK_ENABLED", False),
+        budget_seconds=seconds if math.isfinite(seconds) else 15.0,
+    )
 
 
 _MAX_GIT_PROXY_LENGTH = 2048

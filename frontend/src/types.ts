@@ -108,6 +108,12 @@ export interface ChatAnswer {
   warnings: string[];
   evidence?: Array<{ evidence_id: string; project_id: string; repository_revision: string; path: string; qualified_name: string; symbol_name?: string; start_line: number; end_line: number }>;
   execution_summary?: {
+    retrieval_enhancement?: {
+      hyde?: { status: string; elapsed_ms: number; reason?: string; added_candidates?: number };
+      rerank?: { status: string; elapsed_ms: number; reason?: string; appended_candidates?: number };
+      elapsed_ms: number;
+      selection_changed: boolean;
+    } | null;
     status?: string | null; answer_mode?: string | null; evidence_count?: number | null; citation_count?: number | null;
     base_retrieval?: { attempted: boolean; status: string; new_evidence_count: number; retrieval_detail?: RetrievalDetail | null } | null;
     planner_requests_attempted?: number | null; planner_repair_attempts?: number | null;
