@@ -37,6 +37,15 @@ export function ExecutionSummary({ result, failure, mode, historical = false }: 
     <p>最终状态：{statusLabel[summary.status || ''] || '状态未提供'} · {summary.answer_mode === 'llm_grounded' ? '基于证据生成' : summary.answer_mode === 'deterministic' ? '确定性回答' : '回答方式未提供'}</p>
     {summary.base_retrieval && <p>基础检索：{summary.base_retrieval.attempted ? (baseLabel[summary.base_retrieval.status] || '状态已记录') : '未执行'}{summary.base_retrieval.attempted ? ` · 新增证据 ${summary.base_retrieval.new_evidence_count}` : ''}</p>}
     <RetrievalDiagnostics detail={summary.base_retrieval?.retrieval_detail} />
+    {summary.retrieval_enhancement && <>
+      {(['hyde', 'rerank'] as const).map((name) => {
+        const stage = summary.retrieval_enhancement?.[name];
+        if (!stage) return null;
+        const labels: Record<string, string> = { succeeded: '已执行', fallback: '已回退', disabled: '未启用' };
+        return <p key={name}>{name === 'hyde' ? 'HyDE 补充召回' : '候选重排序'}：{labels[stage.status] || '状态未提供'} · {stage.elapsed_ms} 毫秒{stage.reason && <small>（原因：{stage.reason}）</small>}</p>;
+      })}
+      <p>首次检索增强合计：{summary.retrieval_enhancement.elapsed_ms} 毫秒 · 最终证据选择{summary.retrieval_enhancement.selection_changed ? '已变化' : '保持不变'}</p>
+    </>}
     {(count(summary.evidence_count) !== null || count(summary.citation_count) !== null) && <p>最终证据 {count(summary.evidence_count) ?? '未提供'} 条 · 引用 {count(summary.citation_count) ?? '未提供'} 条</p>}
     {(count(summary.planner_requests_attempted) !== null || count(summary.tool_calls_used) !== null || count(summary.tool_calls_attempted) !== null) && <p>Planner 请求 {count(summary.planner_requests_attempted) ?? '未提供'} 次{count(summary.tool_calls_attempted) !== null ? ` · BASE 外工具执行尝试 ${summary.tool_calls_attempted} 次` : ''}{count(summary.tool_calls_used) !== null ? ` · BASE 外工具调用预算已用 ${summary.tool_calls_used} 次` : ''}{count(summary.planner_repair_attempts) !== null ? ` · 修复请求 ${summary.planner_repair_attempts} 次` : ''}</p>}
     {result.execution_mode === 'agent' && summary.tool_calls_attempted === 0 && <p>未调用补充工具。</p>}

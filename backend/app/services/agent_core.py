@@ -563,6 +563,7 @@ def _run_bounded_agent_stages(
             diagnostics_recorder=diagnostics_recorder,
         )
         context.supplemental_admission_enabled = execution_mode == "agent"
+        context.initial_retrieval_llm = llm
     except ValueError as exc:
         _record_unattempted_base_retrieval(
             diagnostics_recorder,

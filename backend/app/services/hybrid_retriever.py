@@ -42,6 +42,7 @@ class HybridSearchResult:
     semantic_rank: int | None = None
     fusion_score: float = 0.0
     fusion_rank: int = 0
+    rerank_rank: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -88,9 +89,12 @@ class HybridRetriever:
         check_active: Callable[[], None] | None = None,
         diagnostics_recorder: SmokeDiagnosticsRecorder | None = None,
         semantic_deadline_at: float | None = None,
+        candidate_limit: int | None = None,
     ) -> HybridSearchOutcome:
         _check(check_active)
         limit = min(MAXIMUM_EVIDENCE_COUNT, max(1, int(evidence_count)))
+        if candidate_limit is not None:
+            limit = min(40, max(limit, candidate_limit))
         lexical_started = time.monotonic()
         lexical = self.lexical_retriever.search(
             project_id,

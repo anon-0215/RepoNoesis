@@ -189,7 +189,7 @@ class LLMClient:
             self.settings.timeout_seconds,
             float(timeout_seconds or self.settings.timeout_seconds),
         )
-        attempts = self.settings.max_retries + 1
+        attempts = 1 if purpose in {"hyde", "rerank"} else self.settings.max_retries + 1
         logical_call_id = uuid.uuid4().hex
         http_status: int | None = None
         for attempt in range(attempts):

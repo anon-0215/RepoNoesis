@@ -8,7 +8,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from app.services.agent_contracts import normalize_repository_relative_path
-from app.services.smoke_diagnostics import sanitize_provider_usage_summary
+from app.services.smoke_diagnostics import sanitize_provider_usage_summary, sanitize_retrieval_enhancement
 
 
 class BaseRetrievalSummaryResponse(BaseModel):
@@ -45,6 +45,16 @@ class ExecutionSummaryResponse(BaseModel):
     relation_validation_passed: bool | None = None
     post_generation_validation_passed: bool | None = None
     diagnostics_truncated: bool | None = None
+    retrieval_enhancement: dict[str, Any] | None = None
+
+    @field_validator("retrieval_enhancement", mode="before")
+    @classmethod
+    def validate_retrieval_enhancement(cls, value: Any) -> dict[str, Any] | None:
+        if value is None:
+            return None
+        if not isinstance(value, dict):
+            raise ValueError("invalid retrieval enhancement summary")
+        return sanitize_retrieval_enhancement(value)
 
     @field_validator("provider_usage_summary", mode="before")
     @classmethod

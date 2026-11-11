@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from app.source_lines import source_lines as physical_source_lines
+from app.config import get_retrieval_enhancement_settings
 
 from dataclasses import dataclass, field, replace
 import hashlib
@@ -56,6 +57,7 @@ from app.services.retrieval_v2 import (
 )
 from app.services.symbol_retriever import MAX_TOP_K as SYMBOL_RETRIEVER_MAX_TOP_K, SymbolRetriever
 from app.services.smoke_diagnostics import SmokeDiagnosticsRecorder
+from app.services.retrieval_enhancement import retrieve_initial_code
 
 
 ToolHandler = Callable[["ToolContext", BaseModel], tuple[Any, list[str], bool]]
@@ -161,6 +163,7 @@ class ToolContext:
     relation_mode: str = RELATION_MODE_OFF
     candidate_provenance: CandidateProvenance = "planner_search_code"
     supplemental_admission_enabled: bool = False
+    initial_retrieval_llm: Any = None
 
     def evidence_admission_policy(self) -> dict[str, int]:
         """Keep IDs and total capacity fixed; supplement incrementally."""
@@ -646,7 +649,14 @@ def _search_code(
 ) -> tuple[Any, list[str], bool]:
     values = SearchCodeInput.model_validate(parameters)
     context.check_active()
-    outcome = retrieve_code(
+    enhancement_settings = get_retrieval_enhancement_settings()
+    initial = (context.candidate_provenance == "deterministic_base_retrieval"
+               and (enhancement_settings.hyde_enabled or enhancement_settings.rerank_enabled))
+    retrieve = retrieve_initial_code if initial else retrieve_code
+    enhancement_arguments = ({"llm": context.initial_retrieval_llm,
+                              "enhancement_deadline_at": context.work_deadline_monotonic}
+                             if initial else {})
+    outcome = retrieve(
         context.database,
         context.embedding_service,
         context.project_id,
@@ -661,6 +671,7 @@ def _search_code(
         check_active=context.check_active,
         diagnostics_recorder=context.diagnostics_recorder,
         semantic_deadline_at=context.effective_deadline_monotonic,
+        **enhancement_arguments,
     )
     context.check_active()
     promotion_started = time.monotonic()
@@ -684,6 +695,7 @@ def _search_code(
         new_evidence_limit=1 if supplemental else None,
         reserved_slots=policy["reserved_for_directed"] if supplemental and not directed else 0,
         held_chunk_identities={item.chunk_identity for item in context.evidence_store.all(context.request_id)},
+        primary_excerpt_limit=min(8192, context.limits.max_source_read_bytes) if initial else None,
     )
     built = promotion.evidence
     context.check_active()

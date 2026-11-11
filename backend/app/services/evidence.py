@@ -61,6 +61,7 @@ class Evidence:
     fusion_score: float
     fusion_rank: int
     selection_reason: str
+    rerank_rank: int | None = None
     validation_status: str = "unvalidated"
     invalid_reason: str | None = None
     retrieval_strategy_version: str = RETRIEVAL_STRATEGY_VERSION
@@ -201,8 +202,9 @@ def _excerpt_coverage(
 
 
 class EvidenceBuilder:
-    def __init__(self, excerpt_limit: int = DEFAULT_EXCERPT_LIMIT) -> None:
+    def __init__(self, excerpt_limit: int = DEFAULT_EXCERPT_LIMIT, *, primary_excerpt_limit: int | None = None) -> None:
         self.excerpt_limit = max(1, int(excerpt_limit))
+        self.primary_excerpt_limit = primary_excerpt_limit
 
     def build(
         self,
@@ -215,6 +217,12 @@ class EvidenceBuilder:
         repository_url = str(project.get("repo_url", ""))
         evidence: list[Evidence] = []
         for index, candidate in enumerate(candidates, start=1):
+            limit = self.excerpt_limit
+            if (self.primary_excerpt_limit is not None and candidate.rerank_rank == 1
+                and candidate.chunk_type != "class"
+                and candidate.end_line - candidate.start_line < 200
+                and len(candidate.content.encode("utf-8")) <= min(8192, self.primary_excerpt_limit)):
+                limit = len(candidate.content)
             source_names = "+".join(candidate.retrieval_sources)
             hierarchy_only = candidate.retrieval_sources == ["hierarchy"]
             relation_only = candidate.retrieval_sources == ["relation"]
@@ -235,7 +243,7 @@ class EvidenceBuilder:
                     start_line=candidate.start_line,
                     end_line=candidate.end_line,
                     content_hash=candidate.content_hash,
-                    excerpt=candidate.content[: self.excerpt_limit],
+                    excerpt=candidate.content[:limit],
                     retrieval_sources=list(candidate.retrieval_sources),
                     lexical_score=candidate.lexical_score,
                     lexical_rank=candidate.lexical_rank,
@@ -243,6 +251,7 @@ class EvidenceBuilder:
                     semantic_rank=candidate.semantic_rank,
                     fusion_score=candidate.fusion_score,
                     fusion_rank=candidate.fusion_rank,
+                    rerank_rank=candidate.rerank_rank,
                     selection_reason=(
                         "Selected by versioned chunk hierarchy normalization from "
                         "a real stored chunk; no direct retrieval score was assigned."
@@ -259,7 +268,7 @@ class EvidenceBuilder:
                     ),
                     retrieval_strategy_version=retrieval_strategy_version,
                     _excerpt_coverage=_excerpt_coverage(
-                        candidate.content, candidate.content[: self.excerpt_limit],
+                        candidate.content, candidate.content[:limit],
                         candidate.start_line, candidate.end_line,
                     ),
                 )
