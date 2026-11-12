@@ -2,7 +2,7 @@
 from pathlib import Path
 import shutil
 
-DESKTOP_FILES = ('desktop_host.py', 'gui_settings.py', 'launcher.py', 'server.py', 'shell.html', 'acceptance.py')
+DESKTOP_FILES = ('desktop_host.py', 'gui_settings.py', 'launcher.py', 'server.py', 'shell.html', 'acceptance.py', 'settings_lifecycle.py')
 
 
 def copy_application(source: Path, target: Path, *, frontend_dist: Path | None = None):

@@ -28,6 +28,11 @@ RUNTIME_MODES = {
 }
 
 
+def enhancement_flags(config):
+    # Invalid legacy values fail closed. In particular, "false" is not True.
+    return {key: config.get(key, False) is True for key in ("hyde_enabled", "rerank_enabled")}
+
+
 def desktop_runtime(config):
     """Migrate missing settings without overriding explicit values or reading .env."""
     supplied = config.get("agent_runtime", {})
@@ -119,23 +124,35 @@ class SettingsStore:
                 if not isinstance(base, dict) or not isinstance(user, dict):
                     raise ValueError("agent_runtime must be an object")
                 result["agent_runtime"] = {**base, **user}
+            result.update(enhancement_flags(result))
             return result
-        return dict(self.defaults)
+        return {**self.defaults, **enhancement_flags(self.defaults)}
 
-    def public(self):
-        value = self.load()
+    def public(self, value=None):
+        value = self.load() if value is None else value
         return {key: value.get(key, "") for key in ("model_directory", "git_directory", "api_base", "api_model",
             "device", "batch_size", "max_length")} | {"data_directory": str(self.data),
-            "key_saved": bool(value.get("api_key_dpapi"))}
+            "key_saved": bool(value.get("api_key_dpapi")), **enhancement_flags(value)}
 
     def save(self, incoming):
+        current = self.prepare(incoming)
+        atomic_json(self.path, current)
+        return self.public(current)
+
+    def prepare(self, incoming):
+        """Validate/merge without writing, so the host can first secure a safe restart."""
         if not isinstance(incoming, dict):
             raise ValueError("设置格式不正确。")
         current = self.load()
         for key in ("model_directory", "git_directory", "api_base", "api_model", "api_key"):
             if not isinstance(incoming.get(key, ""), str):
                 raise ValueError("请填写文本格式的设置。")
-        api_base = incoming.get("api_base", "").strip().rstrip("/")
+        for key in ("hyde_enabled", "rerank_enabled"):
+            if key in incoming:
+                if type(incoming[key]) is not bool:
+                    raise ValueError("检索增强开关必须为布尔值。")
+                current[key] = incoming[key]
+        api_base = incoming.get("api_base", current.get("api_base", "")).strip().rstrip("/")
         if api_base:
             try:
                 url = urllib.parse.urlsplit(api_base)
@@ -146,9 +163,12 @@ class SettingsStore:
                 valid = False
             if not valid:
                 raise ValueError("API 地址需为 HTTP/HTTPS 地址，不能包含用户名、密钥、查询参数或片段。")
-        current.update(model_directory=incoming.get("model_directory", "").strip(),
-                       git_directory=git_directory(incoming.get("git_directory", "").strip()),
-                       api_base=api_base, api_model=incoming.get("api_model", "").strip())
+        for field in ("model_directory", "git_directory", "api_model"):
+            if field in incoming:
+                current[field] = (git_directory(incoming[field].strip()) if field == "git_directory"
+                                  else incoming[field].strip())
+        if "api_base" in incoming:
+            current["api_base"] = api_base
         if incoming.get("clear_key") is True:
             current.pop("api_key_dpapi", None)
         key = incoming.get("api_key", "").strip()
@@ -159,8 +179,7 @@ class SettingsStore:
                 raise ValueError("agent_runtime must be an object")
             current["agent_runtime"] = {**current.get("agent_runtime", {}), **incoming["agent_runtime"]}
         desktop_runtime(current)  # Reject invalid budgets before persistence.
-        atomic_json(self.path, current)
-        return self.public()
+        return current
 
     def runtime(self):
         config = self.load()

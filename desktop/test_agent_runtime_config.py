@@ -72,7 +72,7 @@ class AgentRuntimeTests(unittest.TestCase):
             store=SettingsStore(data,{})
             store.save({'api_base':saved['api_base'],'api_model':saved['api_model'],'api_key':''})
             current=store.load()
-            self.assertEqual(current,saved|{'model_directory':'','git_directory':'','port':18771})
+            self.assertEqual(current,saved|{'port':18771,'hyde_enabled':False,'rerank_enabled':False})
             runtime=desktop_runtime(current)
             self.assertEqual(runtime['LLM_PLANNER_MAX_GENERATION_TOKENS'],16384)
             self.assertEqual(runtime['LLM_PLANNER_REASONING_EFFORT'],'')
