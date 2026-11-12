@@ -75,6 +75,7 @@ export interface LearningStep {
 }
 
 export interface Citation {
+  source_kind?: 'code' | 'document';
   evidence_id?: string | null;
   path: string;
   summary: string;
@@ -106,7 +107,7 @@ export interface ChatAnswer {
   answer_mode: 'llm_grounded' | 'deterministic';
   grounding_status: 'grounded' | 'insufficient_evidence' | 'degraded';
   warnings: string[];
-  evidence?: Array<{ evidence_id: string; project_id: string; repository_revision: string; path: string; qualified_name: string; symbol_name?: string; start_line: number; end_line: number }>;
+  evidence?: Array<{ source_kind?: 'code' | 'document'; evidence_id: string; project_id: string; repository_revision: string; path: string; qualified_name: string; symbol_name?: string; start_line: number; end_line: number }>;
   execution_summary?: {
     retrieval_enhancement?: {
       hyde?: { status: string; elapsed_ms: number; reason?: string; added_candidates?: number };
@@ -128,6 +129,7 @@ export interface ChatAnswer {
 }
 
 export interface SavedCitation {
+  source_kind?: 'code' | 'document';
   evidence_id?: string | null;
   path?: string | null;
   summary?: string | null;
@@ -138,6 +140,7 @@ export interface SavedCitation {
 }
 export type ReadableCitation = Citation | SavedCitation;
 export interface SavedCitationBinding {
+  source_kind?: 'code' | 'document';
   evidence_id: string; project_id: string; repository_revision: string; path: string;
   qualified_name: string; symbol_name: string; start_line: number; end_line: number;
 }

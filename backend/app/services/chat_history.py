@@ -45,6 +45,16 @@ class ExecutionSummaryResponse(BaseModel):
     relation_validation_passed: bool | None = None
     post_generation_validation_passed: bool | None = None
     diagnostics_truncated: bool | None = None
+    tool_failures: list[dict[str, Any]] | None = Field(default=None, max_length=4)
+
+    @field_validator('tool_failures', mode='before')
+    @classmethod
+    def validate_tool_failures(cls, value: Any) -> Any:
+        if value is None:
+            return None
+        from app.services.tool_failure_receipts import sanitize_receipts
+        return sanitize_receipts(value)
+
     retrieval_enhancement: dict[str, Any] | None = None
 
     @field_validator("retrieval_enhancement", mode="before")
@@ -71,6 +81,7 @@ class ExecutionSummaryResponse(BaseModel):
 
 class SavedCitation(BaseModel):
     model_config = ConfigDict(extra="ignore", strict=True)
+    source_kind: Literal['code', 'document'] = 'code'
     evidence_id: str | None = None
     path: str | None = None
     summary: str | None = None
@@ -82,6 +93,7 @@ class SavedCitation(BaseModel):
 
 class SavedCitationBinding(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True, hide_input_in_errors=True)
+    source_kind: Literal['code', 'document'] = 'code'
     evidence_id: str = Field(pattern=r"^E[1-9]\d*$", max_length=32)
     project_id: str = Field(min_length=1, max_length=128)
     repository_revision: str = Field(min_length=1, max_length=256)
@@ -187,6 +199,7 @@ def bindings_match(metadata: RecoveryMetadata, citations: list[dict[str, Any]],
         item = by_id.get(evidence_id)
         start, end = citation.get("start_line"), citation.get("end_line")
         if (item is None or citation.get("path") != item.path
+                or citation.get("source_kind", "code") != item.source_kind
                 or citation.get("qualified_name") != (item.qualified_name or item.symbol_name)
                 or type(start) is not int or type(end) is not int
                 or start < item.start_line or end > item.end_line or end < start):
@@ -203,7 +216,7 @@ def prepare_recovery_metadata(payload: dict[str, Any], project_id: str,
                 if isinstance(original_warnings, list) else None)
     candidate = {
         "format_version": 1,
-        "citation_bindings": [{key: item[key] for key in keys} for item in payload["evidence"]],
+        "citation_bindings": [{key: item[key] for key in keys if key in item} for item in payload["evidence"]],
         **{key: payload.get(key) for key in (
             "execution_mode", "execution_summary", "answer_mode", "grounding_status")},
         "warnings": warnings,

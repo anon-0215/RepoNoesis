@@ -284,6 +284,7 @@ class LLMPlanner:
             "evidence_locators": state.get("evidence_locators", []),
             "planner_evidence_view": state.get("planner_evidence_view", {}),
             "direct_call_hints_may_be_incomplete": state.get("direct_call_hints_may_be_incomplete", True),
+            "stored_project_documents": state.get("stored_project_documents", {}),
             "known_symbols": state["known_symbols"],
             "known_symbol_ids": state["known_symbol_ids"],
         }
@@ -1384,12 +1385,17 @@ def _planner_state(state: AgentState) -> dict[str, Any]:
         expected_ids = {item.evidence_id for item in expected_evidence}
     # Recent summaries and canonical bodies share the existing observation cap.
     # Drop whole oldest summaries; never silently turn truncated parameters into exact ones.
+    from app.services.document_evidence import planner_document_inventory
+    inventory = planner_document_inventory(getattr(state.context, 'bundle', {}),
+        budget=min(2048, getattr(getattr(state, 'limits', None), 'max_observation_bytes', 65_536) // 8))
+    inventory_bytes = json_bytes(inventory) if inventory else 0
     observation_limit = min(16_384, getattr(getattr(state, "limits", None), "max_observation_bytes", 65_536))
+    observation_limit = max(0, observation_limit - inventory_bytes)
     selected_observations = observations[-5:]
     while selected_observations and json_bytes(selected_observations) > observation_limit:
         selected_observations = selected_observations[1:]
     observation_bytes = json_bytes(selected_observations)
-    remaining_bytes = max(0, getattr(getattr(state, "limits", None), "max_observation_bytes", 65_536) - observation_bytes)
+    remaining_bytes = max(0, getattr(getattr(state, "limits", None), "max_observation_bytes", 65_536) - observation_bytes - inventory_bytes)
     view = _planner_evidence_view(state, evidence, expected_ids, max_bytes=remaining_bytes)
     # Projection annotations also count. Conservatively retain the smallest
     # available body budget until the exact serialized summaries and rows fit.
@@ -1411,7 +1417,7 @@ def _planner_state(state: AgentState) -> dict[str, Any]:
         if observation_bytes > observation_limit and selected_observations:
             selected_observations = selected_observations[1:]
             continue
-        available = max(0, getattr(getattr(state, "limits", None), "max_observation_bytes", 65_536) - observation_bytes)
+        available = max(0, getattr(getattr(state, "limits", None), "max_observation_bytes", 65_536) - observation_bytes - inventory_bytes)
         if view["used_bytes"] <= available or not view["rows"]:
             break
         view = _planner_evidence_view(state, evidence, expected_ids, max_bytes=min(view["budget_bytes"], available))
@@ -1419,6 +1425,7 @@ def _planner_state(state: AgentState) -> dict[str, Any]:
         evidence, final_context_evidence_ids=expected_ids
     )
     payload = {
+        **({'stored_project_documents': inventory} if inventory else {}),
         "user_goal": state.user_goal,
         "remaining_budget": remaining_budget,
         "deadline_monotonic": state.budget.work_cutoff_at,
@@ -1714,6 +1721,8 @@ def _planner_evidence_view(state: AgentState, evidence: list[Evidence], expected
             "final_context_selection": "unknown" if expected_ids is None else (
                 "selected_by_byte_budget" if item.evidence_id in expected_ids else "excluded_by_byte_budget"),
             "citation_eligibility": "requires_final_context_inclusion_and_validation"}
+        if item.source_kind == 'document':
+            row['source_kind'] = 'document'
         if len(json.dumps(rows+[row], ensure_ascii=False, separators=(",", ":")).encode("utf-8")) > limit:
             omissions.append({"evidence_id": item.evidence_id, "reason": "projection_byte_budget"})
             continue
@@ -2619,7 +2628,7 @@ def _validated_relation_context(
         chains=candidate_chains,
         valid_evidence_ids=valid_ids,
         evidence_by_chunk_id={
-            item.code_chunk_id: item.evidence_id for item in valid_evidence
+            item.code_chunk_id: item.evidence_id for item in valid_evidence if item.source_kind == "code"
         },
     )
     _ensure_finalization_active(state.context.deadline_monotonic)
@@ -2751,7 +2760,7 @@ def _relation_answer_context(
     }
     evidence_by_chunk = {
         item.code_chunk_id: item.evidence_id
-        for item in state.context.evidence_store.all(state.request_id)
+        for item in state.context.evidence_store.all(state.request_id) if item.source_kind == "code"
     }
     node_ids = sorted(
         {node_id for chain in chains for node_id in chain.ordered_node_ids}

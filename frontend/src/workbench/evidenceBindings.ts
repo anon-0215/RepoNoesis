@@ -22,7 +22,9 @@ function bindCitations(citations: ReadableCitation[], identities: Array<Omit<Sav
     if (!id || !/^E[1-9]\d*$/.test(id)) return;
     const evidence = evidenceById.get(id);
     if (!evidence || evidence.project_id !== projectId || evidence.repository_revision !== revision ||
-        evidence.path !== citation.path || (evidence.qualified_name || evidence.symbol_name) !== citation.qualified_name ||
+        evidence.path !== citation.path ||
+        !['code', 'document'].includes(evidence.source_kind ?? 'code') ||
+        (evidence.source_kind ?? 'code') !== (citation.source_kind ?? 'code') || (evidence.qualified_name || evidence.symbol_name) !== citation.qualified_name ||
         !Number.isInteger(citation.start_line) || !Number.isInteger(citation.end_line) ||
         citation.start_line! < evidence.start_line || citation.end_line! > evidence.end_line ||
         citation.start_line! <= 0 || citation.end_line! < citation.start_line!) return;
