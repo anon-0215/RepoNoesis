@@ -345,6 +345,19 @@ def window_prerequisite_errors():
     return errors
 
 
+def shell_document(data, source=None):
+    """A content-addressed URL avoids reusing WebView's cached old shell.html."""
+    content = (source or HERE / "shell.html").read_bytes()
+    directory = data / "desktop-ui"
+    directory.mkdir(exist_ok=True)
+    document = directory / ("shell-" + hashlib.sha256(content).hexdigest() + ".html")
+    if not document.exists():
+        document.write_bytes(content)
+    elif document.read_bytes() != content:
+        raise RuntimeError("桌面界面文件校验失败，请检查用户目录权限后重开窗口。")
+    return document
+
+
 def main():
     global _dll
     parser = argparse.ArgumentParser()
@@ -375,7 +388,7 @@ def main():
         webview.logger.setLevel(logging.WARNING)
         if args.debug_port:
             webview.settings["REMOTE_DEBUGGING_PORT"] = args.debug_port
-        controller.window = webview.create_window("源鉴", url=str(HERE / "shell.html"),
+        controller.window = webview.create_window("源鉴", url=str(shell_document(data)),
             js_api=WindowApi(controller), width=1280, height=860, min_size=(940, 650), background_color="#f1f7f5")
         controller.window.events.before_show += keep_webview_in_client
         controller.window.events.shown += controller.start

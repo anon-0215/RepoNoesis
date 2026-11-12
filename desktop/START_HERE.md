@@ -14,6 +14,8 @@ Windows x64 可选桌面入口。网页版仍使用原启动脚本，HyDE 和重
 
 相关离线测试：`python -B -m unittest desktop.test_retrieval_enhancement_config desktop.test_settings_lifecycle desktop.test_gui_settings desktop.test_agent_runtime_config desktop.test_desktop_host desktop.test_build`。界面脚本测试为`node --test desktop/test_shell.cjs`，复用前端已安装的jsdom（需Node可解析frontend/node_modules，例如在测试子进程中设置NODE_PATH）。shell.html由窗口直接加载，修改它无需重新构建未变化的React生产前端。
 
+桌面壳页面按内容哈希写入用户目录desktop-ui/shell-<sha256>.html，以新URL载入更新后的设置，避免WebView缓存旧页面。只包含公开界面HTML，不复制设置或密钥，不清除WebView存储、历史和其他用户文件。
+
 ## 桌面 Agent 阶段参数
 
 桌面在子进程白名单中传递阶段配置，不读取项目 `.env`。可在发行 `desktop-config.json` 或用户数据 `desktop-settings.json` 的 `agent_runtime` 对象中设置下列环境变量同名字段。用户字段按键覆盖发行默认，其他设置与 DPAPI 密钥保留；保存普通设置不会丢弃这些字段。
