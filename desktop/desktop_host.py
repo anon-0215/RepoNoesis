@@ -11,6 +11,7 @@ import sys
 import threading
 import time
 import urllib.request
+import urllib.error
 import uuid
 
 HERE = Path(__file__).resolve().parent
@@ -81,17 +82,64 @@ class Controller:
         return self.store.public()
 
     def save_settings(self, value):
+        leased = False
+        written = False
+        lease_id = uuid.uuid4().hex
         try:
             with self.lock:
                 before = self.store.load()
-                result = self.store.save(value)
-                changed = self.store.load() != before
-            if changed:
-                self.reload_event.set()
+                prepared = self.store.prepare(value)
+                result = self.store.public(prepared)
+                changed = prepared != before
+                if changed:
+                    if self.child is not None and self.child.poll() is None:
+                        if not self._settings_restart("acquire", lease_id):
+                            self._settings_restart("release", lease_id)  # Lost acquire response may still own a lease.
+                            return {"ok": False, "message": "未保存：正在生成回答、应用设置或准备后台。请结束后再保存。"}
+                        leased = True
+                    atomic_json(self.store.path, prepared)
+                    written = True
+                    if leased and not self._settings_restart("acquire", lease_id):
+                        # A slow disk write can outlive the lease. Re-check before
+                        # restart so a newly admitted ask is never interrupted.
+                        atomic_json(self.store.path, before)
+                        written = False
+                        self._settings_restart("release", lease_id)
+                        return {"ok": False, "message": "未应用：后台状态已变化，原设置已恢复。请在回答结束后重试。"}
+                    self.state.update(phase="restarting", message="设置已保存，正在重启本地服务；就绪后生效。", backend_url=None)
+                    self.reload_event.set()
+                    try:
+                        self._status("restarting", "设置已保存，正在重启本地服务；就绪后生效。", backend_url=None)
+                    except OSError:
+                        # Settings are already durable. A diagnostic write failure
+                        # must not falsely report them as unsaved or retain a lease.
+                        self.state.update(phase="restarting", message="设置已保存，正在重启本地服务；就绪后生效。", backend_url=None)
             return {"ok": True, "settings": result, "changed": changed}
-        except (ValueError, OSError, RuntimeError):
+        except ValueError:
+            if leased:
+                self._settings_restart("release", lease_id)
+            return {"ok": False, "message": "未保存：请检查 API 地址、目录、检索增强布尔开关和 Agent 预算格式。"}
+        except (OSError, RuntimeError):
+            if leased:
+                self._settings_restart("release", lease_id)
             # Do not return input or raw filesystem/crypto exceptions to JS.
-            return {"ok": False, "message": "未保存：请检查 API 地址和目录格式，或重新输入本机密钥。"}
+            if written:
+                return {"ok": False, "message": "设置可能已保存但未应用，恢复旧设置失败。请重开窗口并读取设置后确认。"}
+            return {"ok": False, "message": "未保存：无法写入设置。请检查数据目录权限或可用空间。"}
+
+    def _settings_restart(self, action, lease_id):
+        """Acquire before writing: no new ask can race between idle check and restart."""
+        port = int(self.store.load().get("port", 18771))
+        request = urllib.request.Request(f"http://127.0.0.1:{port}/api/desktop/settings-restart",
+            data=json.dumps({"action": action, "lease_id": lease_id}).encode(), method="POST",
+            headers={"Content-Type": "application/json", "X-RepoNoesis-Instance": self.instance})
+        try:
+            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+            with opener.open(request, timeout=2) as response:
+                result = json.load(response)
+            return result.get("ok") is True and result.get("instance") == self.instance
+        except (OSError, ValueError):
+            return False
 
     def choose_folder(self, field):
         if field not in {"model_directory", "git_directory"}:
@@ -297,6 +345,19 @@ def window_prerequisite_errors():
     return errors
 
 
+def shell_document(data, source=None):
+    """A content-addressed URL avoids reusing WebView's cached old shell.html."""
+    content = (source or HERE / "shell.html").read_bytes()
+    directory = data / "desktop-ui"
+    directory.mkdir(exist_ok=True)
+    document = directory / ("shell-" + hashlib.sha256(content).hexdigest() + ".html")
+    if not document.exists():
+        document.write_bytes(content)
+    elif document.read_bytes() != content:
+        raise RuntimeError("桌面界面文件校验失败，请检查用户目录权限后重开窗口。")
+    return document
+
+
 def main():
     global _dll
     parser = argparse.ArgumentParser()
@@ -327,7 +388,7 @@ def main():
         webview.logger.setLevel(logging.WARNING)
         if args.debug_port:
             webview.settings["REMOTE_DEBUGGING_PORT"] = args.debug_port
-        controller.window = webview.create_window("源鉴", url=str(HERE / "shell.html"),
+        controller.window = webview.create_window("源鉴", url=str(shell_document(data)),
             js_api=WindowApi(controller), width=1280, height=860, min_size=(940, 650), background_color="#f1f7f5")
         controller.window.events.before_show += keep_webview_in_client
         controller.window.events.shown += controller.start

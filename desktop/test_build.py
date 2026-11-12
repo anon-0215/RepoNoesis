@@ -53,7 +53,7 @@ class ApplicationBuildTests(unittest.TestCase):
             frontend.mkdir()
             (frontend / 'index.html').write_text('built desktop UI', encoding='utf-8')
             build.copy_application(HERE.parent, target, frontend_dist=frontend)
-            for name in ('desktop_host.py', 'gui_settings.py', 'shell.html', 'launcher.py', 'server.py', 'acceptance.py'):
+            for name in ('desktop_host.py', 'gui_settings.py', 'shell.html', 'launcher.py', 'server.py', 'acceptance.py', 'settings_lifecycle.py'):
                 self.assertEqual((target / 'desktop' / name).read_bytes(), (HERE / name).read_bytes())
             self.assertIn('desktop_host.py', (target / 'Start.cmd').read_text())
             self.assertTrue((target / '源鉴.vbs').is_file())

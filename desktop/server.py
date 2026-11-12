@@ -46,7 +46,10 @@ import uvicorn
 from fastapi.staticfiles import StaticFiles
 from app.main import app
 import app.main as main
+from app.config import get_retrieval_enhancement_settings
+from settings_lifecycle import install as install_settings_lifecycle
 
+install_settings_lifecycle(app, main, os.environ.get("REPONOESIS_STARTUP_ID", ""))
 app.mount("/", StaticFiles(directory=ROOT / "frontend", html=True), name="desktop-ui")
 if os.environ.get("REPONOESIS_ACCEPTANCE_LEDGER"):
     from acceptance import install
@@ -60,6 +63,8 @@ def run():
                "app_file": main.__file__, "cwd": os.getcwd(),
                "packages": {name: importlib.metadata.version(name) for name in (
                    "fastapi", "uvicorn", "pydantic", "sentence-transformers", "torch", "transformers", "numpy")}}
+    flags = get_retrieval_enhancement_settings()
+    receipt["retrieval_enhancement_config"] = {"hyde_enabled": flags.hyde_enabled, "rerank_enabled": flags.rerank_enabled}
     Path("logs/runtime-identity.json").write_text(json.dumps(receipt, indent=2), encoding="utf-8")
     server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=int(sys.argv[1]), reload=False))
     _server = server

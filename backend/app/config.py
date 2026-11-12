@@ -417,7 +417,8 @@ def _quality_agent_limits() -> AgentLimits:
     return replace(
         limits,
         budget_profile="quality",
-        base_evidence_count=_strict_env_int("AGENT_BASE_EVIDENCE_COUNT", 5, 1, 8),
+        base_evidence_count=(None if get_env_value("AGENT_BASE_EVIDENCE_COUNT").strip() == "auto"
+                             else _strict_env_int("AGENT_BASE_EVIDENCE_COUNT", 5, 1, 8)),
     )
 
 

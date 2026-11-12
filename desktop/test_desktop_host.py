@@ -17,6 +17,20 @@ spec.loader.exec_module(host)
 
 
 class DesktopHostTests(unittest.TestCase):
+    def test_shell_content_change_has_new_url_without_clearing_user_data(self):
+        with tempfile.TemporaryDirectory() as folder:
+            data=Path(folder);source=data/'source.html';settings=data/'desktop-settings.json'
+            settings.write_bytes(b'preserved-private-state')
+            source.write_bytes(b'<html>old settings</html>')
+            old=host.shell_document(data,source)
+            source.write_bytes(b'<html>settings with enhancement switches</html>')
+            new=host.shell_document(data,source)
+            self.assertNotEqual(old,new)
+            self.assertEqual(new,host.shell_document(data,source))
+            self.assertEqual(old.read_bytes(),b'<html>old settings</html>')
+            self.assertEqual(new.read_bytes(),source.read_bytes())
+            self.assertEqual(settings.read_bytes(),b'preserved-private-state')
+
     def test_graceful_stop_closes_only_owned_child_and_job(self):
         with tempfile.TemporaryDirectory() as folder:
             controller = host.Controller(Path(folder), {})

@@ -12,6 +12,8 @@ import time
 import urllib.request
 import uuid
 import webbrowser
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from gui_settings import desktop_runtime, enhancement_flags
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -38,8 +40,8 @@ def child_environment(root: Path, config: dict, data: Path, instance: str) -> di
         "EMBEDDING_OFFLINE": "true", "EMBEDDING_DEVICE": config.get("device", "auto"),
         "EMBEDDING_BATCH_SIZE": str(config.get("batch_size", 1)),
         "EMBEDDING_MAX_LENGTH": str(config.get("max_length", 8192)),
-        "RETRIEVAL_HYDE_ENABLED": str(bool(config.get("hyde_enabled", False))).lower(),
-        "RETRIEVAL_RERANK_ENABLED": str(bool(config.get("rerank_enabled", False))).lower(),
+        "RETRIEVAL_HYDE_ENABLED": str(enhancement_flags(config)["hyde_enabled"]).lower(),
+        "RETRIEVAL_RERANK_ENABLED": str(enhancement_flags(config)["rerank_enabled"]).lower(),
         "RETRIEVAL_ENHANCEMENT_SECONDS": "15",
         "TOKENIZERS_PARALLELISM": "false", "GIT_CONFIG_NOSYSTEM": "1",
         "GIT_CONFIG_GLOBAL": os.devnull, "GIT_TERMINAL_PROMPT": "0",
@@ -48,6 +50,10 @@ def child_environment(root: Path, config: dict, data: Path, instance: str) -> di
     if llm:
         env.update(LLM_PROVIDER="openai_compatible", LLM_BASE_URL=llm.get("base_url", ""),
                    LLM_MODEL=llm.get("model", ""), LLM_API_KEY=llm.get("api_key", ""))
+    env.update({key: str(value) for key, value in desktop_runtime(config).items() if value != ""})
+    # Reuse strict budget parsing, retaining the original tool/step limits.
+    env.update(AGENT_BUDGET_PROFILE="quality", AGENT_MAX_STEPS="5", AGENT_MAX_TOOL_CALLS="8",
+               AGENT_BASE_EVIDENCE_COUNT="auto")  # Preserve existing Agent/RAG BASE selection.
     return env
 
 

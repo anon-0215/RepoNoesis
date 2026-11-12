@@ -2,6 +2,40 @@
 
 Windows x64 可选桌面入口。网页版仍使用原启动脚本，HyDE 和重排仍默认关闭。桌面沿用主仓库后端、React 工作台、检索和问答协议，没有单独维护一套检索实现。
 
+## 检索增强设置
+
+桌面设置中“生成 API”之后有“检索增强”区域，提供“HyDE 辅助检索”和“检索结果重排序”两个独立开关。显示发行默认与用户覆盖合并后的有效布尔值；旧配置缺字段时保持原默认，非法字符串不视为开启。普通网页仍默认关闭。
+
+“保存并应用”后会重启本地服务；等待顶部“本地服务已就绪”后，下次问答使用新配置。正在生成回答时保存会被拒绝，提示“未保存”，不会中断问答。打开/保存设置本身不调用生成API；重启按原流程准备本地模型。读取失败时禁止保存，保存无变化时不重启；重开设置与退出重启均重新读取持久化值。
+
+开关仅代表配置选择。每次回答沿用既有执行摘要，分别记录成功、关闭或失败回退，不会因开关开启就显示成功。只改开关时保留阶段预算、密钥、模型、资源路径及其他设置。桌面启动诊断logs/runtime-identity.json中的retrieval_enhancement_config记录后端实际解析值，作为配置记录，不是执行成功记录。
+
+设置重启使用实例及请求ID绑定的短租约，问答worker退出前不重启（包括流连接已断开而后台仍在运行）。响应丢失时补偿释放，租约最多30秒；落盘后再次核对空闲状态，过期后有新问答则还原设置并拒绝重启。恢复文件也失败时明确提示“可能已保存但未应用”，请重开窗口确认。
+
+相关离线测试：`python -B -m unittest desktop.test_retrieval_enhancement_config desktop.test_settings_lifecycle desktop.test_gui_settings desktop.test_agent_runtime_config desktop.test_desktop_host desktop.test_build`。界面脚本测试为`node --test desktop/test_shell.cjs`，复用前端已安装的jsdom（需Node可解析frontend/node_modules，例如在测试子进程中设置NODE_PATH）。shell.html由窗口直接加载，修改它无需重新构建未变化的React生产前端。
+
+桌面壳页面按内容哈希写入用户目录desktop-ui/shell-<sha256>.html，以新URL载入更新后的设置，避免WebView缓存旧页面。只包含公开界面HTML，不复制设置或密钥，不清除WebView存储、历史和其他用户文件。
+
+## 桌面 Agent 阶段参数
+
+桌面在子进程白名单中传递阶段配置，不读取项目 `.env`。可在发行 `desktop-config.json` 或用户数据 `desktop-settings.json` 的 `agent_runtime` 对象中设置下列环境变量同名字段。用户字段按键覆盖发行默认，其他设置与 DPAPI 密钥保留；保存普通设置不会丢弃这些字段。
+
+| 配置 | 缺省桌面值 |
+| --- | --- |
+| `LLM_PLANNER_MAX_GENERATION_TOKENS` / `LLM_ANSWER_MAX_GENERATION_TOKENS` | 各8192，包含思考与正文 |
+| `LLM_TIMEOUT_SECONDS` | 单次90秒 |
+| `AGENT_TOTAL_DEADLINE_MS` / `AGENT_FINAL_ANSWER_RESERVE_MS` | 总计300000 / 回答预留90000毫秒 |
+| `AGENT_MAX_PLANNER_TOKENS_PER_STEP` / `AGENT_MAX_TOTAL_PLANNER_TOKENS` | 可见决策每步1024 / 累计8192 |
+| `AGENT_MAX_FINAL_ANSWER_TOKENS` | 可见回答4096 |
+
+桌面复用后端严格预算配置，仍为5步、8次工具调用；用 `AGENT_BASE_EVIDENCE_COUNT=auto` 保持既有首检策略（Agent最多5条，RAG按请求证据容量），不改基础召回和补查容量。quality模式未配置auto时仍沿用原默认5条。取消、有限重试和结构化校验保留。回答预留须覆盖一个API时限，总时限须大于预留。额度不足导致供应商截断仍报错，不接受空正文。
+
+官方 `api.deepseek.com` 的 `deepseek-flash` / `deepseek-v4-pro` 缺省明确使用 `LLM_PLANNER_THINKING`、`LLM_ANSWER_THINKING` 为 `enabled`，两个 `REASONING_EFFORT` 为 `high`。这用于明确兼容参数，不代表模型效果最优。其他端点默认省略这四个扩展字段；有已验证兼容协议时才显式配置。`thinking=disabled` 时不发送 effort，已保存值保留。不要把按供应商推导的模式默认值固化为通用配置，以免切换供应商后遗留参数。普通网页默认不变。
+
+`agent_runtime` 数字使用JSON整数，思考为 `enabled` / `disabled` / 空字符串，effort为 `low` / `high` / `max` / 空字符串（空字符串表示省略）。例如仅提高Planner生成额度：`"agent_runtime": {"LLM_PLANNER_MAX_GENERATION_TOKENS": 16384}`。不更改模型、资源目录、设备、缓存身份或增强开关。
+
+后端 `provider_request_parameters` 日志仅记录每次实际请求的阶段、模型、额度、模式、强度及时限，不记录密钥、地址、提示词或思考正文。离线贯穿检查：`python -B -m unittest desktop.test_agent_runtime_config desktop.test_gui_settings desktop.test_launcher desktop.test_retrieval_enhancement_config desktop.test_desktop_host`；后端另有阶段额度、正文限制、截断、取消和绝对截止时间回归。
+
 ## 目录与入口
 
 | 文件 | 职责 |
@@ -10,7 +44,8 @@ Windows x64 可选桌面入口。网页版仍使用原启动脚本，HyDE 和重
 | `gui_settings.py` | 独立设置、Windows 当前用户 DPAPI 加密密钥 |
 | `launcher.py` | 子进程环境白名单、端口检查和 Windows Job Object；其浏览器启动 main 是早期调试入口，当前 Start.cmd 不走它 |
 | `server.py` | 同源托管生产前端及既有 FastAPI，控制管道关闭后清理后台 |
-| `app_files.py` | 初始构建和刷新共用的六个窗口模块与启动文件复制清单 |
+| `app_files.py` | 初始构建和刷新共用的窗口模块与启动文件复制清单 |
+| `settings_lifecycle.py` | 桌面设置重启租约，问答未完成时拒绝保存，避免中断生成 |
 | `build_frontend.py` | 在构建子进程中设置空API地址和桌面标记，不改父终端或.env |
 | `build.py` | 从选定、已准备的 Conda Python 环境复制可重定位运行库及应用 |
 | `refresh_app.py` | 显式刷新停止运行的开发副本，仅替换应用文件，保留运行库和已有发行配置 |
