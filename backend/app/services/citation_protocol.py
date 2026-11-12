@@ -43,6 +43,7 @@ class CanonicalCitationDescriptor:
     symbol: str
     language: str
     excerpt: str
+    source_kind: str = 'code'
 
     @classmethod
     def from_evidence(cls, alias: str, evidence: Evidence) -> "CanonicalCitationDescriptor":
@@ -61,6 +62,7 @@ class CanonicalCitationDescriptor:
             symbol=evidence.qualified_name or evidence.symbol_name,
             language=evidence.language,
             excerpt=evidence.excerpt,
+            source_kind=evidence.source_kind,
         )
 
     def canonical_token(self) -> str:
@@ -79,12 +81,15 @@ class CanonicalCitationDescriptor:
     def prompt_evidence(self) -> dict[str, Any]:
         """Expose source content and alias, but not model-writable location fields."""
 
-        return {
+        value = {
             "alias": self.alias,
             "symbol": self.symbol,
             "language": self.language,
             "untrusted_source_excerpt": self.excerpt,
         }
+        if self.source_kind == 'document':
+            value.update(source_kind='document', scope='author documentation; not proof of implementation')
+        return value
 
 
 class FinalAnswerPart(BaseModel):

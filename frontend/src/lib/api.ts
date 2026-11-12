@@ -541,6 +541,17 @@ export async function getLearningPath(projectId: string): Promise<{ steps: Learn
   return request(`/api/projects/${projectId}/learning-path`);
 }
 
+export function validEvidenceKinds(value: Record<string, unknown>): boolean {
+  const validKind = (item: unknown): boolean => isRecord(item) &&
+    (item.source_kind == null || item.source_kind === 'code' || item.source_kind === 'document');
+  if (!Array.isArray(value.citations) || !value.citations.every(validKind)) return false;
+  if (value.evidence == null) return !value.citations.some(item => isRecord(item) && item.source_kind === 'document');
+  if (!Array.isArray(value.evidence)) return false;
+  return value.evidence.every(item => validKind(item) && (!isRecord(item) || item.source_kind !== 'document' ||
+    (item.code_chunk_id === null && item.chunk_type === 'document' && item.language === 'text' &&
+     Number.isInteger(item.document_file_id) && (item.document_file_id as number) > 0)));
+}
+
 export async function askProject(projectId: string, question: string): Promise<ChatAnswer> {
   return request(`/api/projects/${projectId}/ask`, {
     method: 'POST',
@@ -584,6 +595,7 @@ export async function askProjectStream(
       terminal = true;
       if (!isRecord(value.result) || value.result.execution_mode !== mode) throw new ApiError('服务端执行模式与提交模式不一致，答案未展示。', 0);
       if (value.result.record_id != null && !isRecordId(value.result.record_id)) throw new ApiError('保存记录身份无效，最终状态未知。', 0);
+      if (!validEvidenceKinds(value.result)) throw new ApiError('文档或源码引用类型无效，答案未展示。', 0);
       return value.result as unknown as ChatAnswer;
     }
     if (value.type === 'failed') {

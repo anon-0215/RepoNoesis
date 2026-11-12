@@ -271,6 +271,7 @@ class ToolRegistry:
         call: ToolCall,
         spec: ToolSpec | None,
     ) -> ToolObservation:
+        context._execution_order = getattr(context, '_execution_order', 0) + 1
         started = time.monotonic()
         remaining_at_start = max(
             0, int((context.deadline_monotonic - started) * 1000)
@@ -325,6 +326,18 @@ class ToolRegistry:
                 remaining_ms=remaining_at_end,
                 overrun_ms=overrun_ms,
             )
+        if observation.status != 'succeeded':
+            from app.services.tool_failure_receipts import receipt
+            import logging
+            recorder = context.diagnostics_recorder
+            order = context._execution_order
+            failure = receipt(context.request_id, call.tool_name, call.call_id, order,
+                              call.effective_parameters or call.parameters,
+                              (observation.error or {}).get('code', 'tool_failed'))
+            logging.getLogger(__name__).warning(json.dumps(
+                {'event': 'agent_tool_failure', **failure}, ensure_ascii=False))
+            if recorder is not None:
+                recorder.record_tool_failure(failure)
         return observation
 
     def _execute_once(
@@ -698,6 +711,24 @@ def _search_code(
         primary_excerpt_limit=min(8192, context.limits.max_source_read_bytes) if initial else None,
     )
     built = promotion.evidence
+    document_hit_count = 0
+    from app.services.document_evidence import retrieve_documents, document_inventory
+    if not values.language and not values.symbol and document_inventory(context.bundle):
+        docs = retrieve_documents(context.database, context.project_id, context.repository_revision,
+                                  values.query, path=values.path)
+        document_hit_count = len(docs)
+        held = {item.chunk_identity for item in context.evidence_store.all(context.request_id)}
+        docs = [item for item in docs if item.chunk_identity not in held]
+        admission_limit = min(values.top_k, 1 if supplemental else context.evidence_store.capacity)
+        if supplemental:
+            admission_limit = min(admission_limit, policy['remaining_capacity'] -
+                                  (0 if directed else policy['reserved_for_directed']))
+        if docs and admission_limit > 0:
+            from app.services.document_evidence import is_project_document
+            # Preserve existing code order and IDs; documents use one bounded
+            # slot without duplicating a misindexed README as Python Evidence.
+            code = [e for e in built if not is_project_document(e.path)]
+            built = code[:max(0, admission_limit - len(docs))] + docs[:admission_limit]
     context.check_active()
     built = [
         item
@@ -759,9 +790,9 @@ def _search_code(
         "grounding": "unvalidated",
         "retrieval_metrics": {
             "candidate_count": len(outcome.results),
-            "retrieval_hit_count": len(outcome.results),
+            "retrieval_hit_count": len(outcome.results) + document_hit_count,
             "normalized_candidate_count": promotion.candidate_count,
-            "valid_candidate_count": promotion.valid_candidate_count,
+            "valid_candidate_count": promotion.valid_candidate_count + document_hit_count,
             "new_evidence_count": len(added),
             "rejected_candidate_count": sum(promotion.rejection_counts.values()),
             "candidate_rejection_counts": promotion.rejection_counts,
@@ -771,10 +802,11 @@ def _search_code(
             # retrieval hits remain available only in the explicit bounded
             # counters below.
             "result_count": len(added),
-            "raw_result_count": len(outcome.results),
-            "retrieval_hit_count": len(outcome.results),
+            "raw_result_count": len(outcome.results) + document_hit_count,
+            "document_hit_count": document_hit_count,
+            "retrieval_hit_count": len(outcome.results) + document_hit_count,
             "normalized_candidate_count": promotion.candidate_count,
-            "valid_candidate_count": promotion.valid_candidate_count,
+            "valid_candidate_count": promotion.valid_candidate_count + document_hit_count,
             "new_evidence_count": len(added),
             "rejected_candidate_count": sum(promotion.rejection_counts.values()),
             **rejection_metrics,
@@ -889,19 +921,24 @@ def _read_source(
         raise ToolError("unsafe repository path")
     if values.end_line < values.start_line:
         raise ToolError("end_line must not be less than start_line")
+    context.check_active()
+    before = _snapshot_file(context, values.path)
+    lines = physical_source_lines(str(before["content"]), keepends=True)
     requested_lines = values.end_line - values.start_line + 1
     if requested_lines > context.limits.max_source_read_lines:
         error = ToolError(
             f"requested {requested_lines} lines; maximum is {context.limits.max_source_read_lines}. "
-            f"Choose end_line <= start_line + {context.limits.max_source_read_lines - 1}."
+            f"Stored file has {len(lines)} lines. Choose end_line <= min({len(lines)}, "
+            f"start_line + {context.limits.max_source_read_lines - 1})."
         )
         error.code = "source_range_exceeded"
         raise error
     context.check_active()
-    before = _snapshot_file(context, values.path)
-    lines = physical_source_lines(str(before["content"]), keepends=True)
     if values.start_line > len(lines) or values.end_line > len(lines):
-        raise ToolError("requested line range exceeds stored source")
+        error = ToolError(f"Stored file has {len(lines)} lines; request a range within 1..{len(lines)}. "
+                          "Use stored_project_documents for saved document paths and lengths.")
+        error.code = 'source_line_out_of_range'
+        raise error
     content = "".join(lines[values.start_line - 1 : values.end_line])
     encoded = content.encode("utf-8")
     truncated = False
@@ -913,6 +950,66 @@ def _read_source(
     if _file_identity(before) != _file_identity(after):
         raise ToolError("stored source changed during read")
     context.check_active()
+    from app.services.document_evidence import is_project_document, build_document
+    if is_project_document(values.path):
+        if truncated:
+            error = ToolError('Document range exceeds read byte budget; request fewer lines.')
+            error.code = 'source_range_exceeded'
+            raise error
+        item = build_document(context.database, context.project_id, context.repository_revision,
+                              values.path, values.start_line, values.end_line,
+                              excerpt_limit=context.limits.max_source_read_bytes)
+        if item.validation_status != 'valid':
+            raise ToolError('document identity changed during read')
+        context.check_active()
+        available = []
+        for held in context.evidence_store.all(context.request_id):
+            if (held.source_kind == 'document' and held.document_file_id == item.document_file_id
+                    and held.repository_revision == item.repository_revision and held.path == item.path):
+                CitationValidator(context.database).validate(held)
+                complete_end = held.planner_excerpt_coverage().get('complete_end_line')
+                if (held.validation_status == 'valid' and type(complete_end) is int
+                        and complete_end >= item.start_line and held.start_line <= item.end_line):
+                    available.append((held.start_line, complete_end, held))
+        cursor = item.start_line
+        covered = []
+        for start, end, held in sorted(available, key=lambda row: (row[0], -row[1])):
+            if start > cursor:
+                break
+            if end >= cursor:
+                covered.append(held)
+                cursor = end + 1
+            if cursor > item.end_line:
+                break
+        if cursor <= item.end_line:
+            covered = []
+        if covered:
+            return ({'path': values.path, 'start_line': values.start_line, 'end_line': values.end_line,
+                     'source_kind': 'document', 'evidence': [],
+                     'associated_evidence': {e.evidence_id: _evidence_summary(e) for e in covered},
+                     '_observation_metrics': {'result_count': 0, 'new_evidence_count': 0,
+                                             'information_delta_bytes': 0}}, [], False)
+        existing = next((e for e in context.evidence_store.all(context.request_id)
+                         if e.chunk_identity == item.chunk_identity), None)
+        updates = []
+        if existing is not None:
+            CitationValidator(context.database).validate(existing)
+            if (existing.validation_status == 'valid' and item.excerpt.startswith(existing.excerpt)
+                    and len(item.excerpt) > len(existing.excerpt)):
+                delta = len(item.excerpt.encode('utf-8')) - len(existing.excerpt.encode('utf-8'))
+                existing.excerpt = item.excerpt
+                CitationValidator(context.database).validate(existing)
+                updates.append({**_evidence_summary(existing), 'information_delta_bytes': delta,
+                                'excerpt_sha256': hashlib.sha256(existing.excerpt.encode('utf-8')).hexdigest()})
+        added = context.evidence_store.add(context.request_id, [item])
+        return ({'path': values.path, 'start_line': values.start_line, 'end_line': values.end_line,
+                 'repository_revision': context.repository_revision, 'source_kind': 'document',
+                 'evidence': [_evidence_summary(e) for e in added],
+                 'coverage_updates': updates,
+                 'associated_evidence': {e.evidence_id: _evidence_summary(e) for e in (added or ([existing] if existing and existing.validation_status == 'valid' else []))},
+                 '_observation_metrics': {'result_count': len(added), 'new_evidence_count': len(added),
+                     'coverage_updated_count': len(updates),
+                     'information_delta_bytes': sum(len(e.excerpt.encode('utf-8')) for e in added) + sum(u['information_delta_bytes'] for u in updates)}}, [], False)
     mapping_rejections: dict[str, int] = {}
     mapped_candidates: list[HybridSearchResult] = []
     mapping_candidate_count = 0
@@ -1352,10 +1449,14 @@ def _expand_relations(
     )
     if len(owned) != len(set(values.seed_evidence_ids)):
         raise ToolError("one or more Evidence seeds are not owned by this request")
+    if any(item.source_kind != 'code' for item in owned):
+        error = ToolError('Document Evidence has no AST relations; choose a code Evidence or symbol seed.')
+        error.code = 'document_relation_unsupported'
+        raise error
     evidence_nodes = context.database.get_relation_nodes(
         context.project_id,
         context.repository_revision,
-        code_chunk_ids=[item.code_chunk_id for item in owned],
+        code_chunk_ids=[item.code_chunk_id for item in owned if item.source_kind == "code"],
     )
     symbol_nodes = context.database.get_relation_nodes(
         context.project_id,
@@ -1537,13 +1638,20 @@ def _snapshot_file(context: ToolContext, path: str) -> dict[str, Any]:
     bundle = context.database.get_bundle(context.project_id)
     if not bundle:
         raise ToolError("bound project no longer exists")
+    project = bundle.get('project') or {}
+    if project.get('repository_revision') != context.repository_revision:
+        error = ToolError('bound repository revision changed')
+        error.code = 'repository_revision_mismatch'
+        raise error
     chunks = bundle.get("code_chunks", [])
     revisions = {str(chunk.get("repository_revision", "")) for chunk in chunks}
-    if revisions != {context.repository_revision}:
+    if revisions and revisions != {context.repository_revision}:
         raise ToolError("bound repository revision changed")
     matches = [file for file in bundle.get("files", []) if file.get("path") == path]
     if len(matches) != 1:
-        raise ToolError("source file does not exist in the stored snapshot")
+        error = ToolError('File not found in saved snapshot. Use stored_project_documents paths or search_code/lookup_symbol locators; paths are case-sensitive.')
+        error.code = 'source_file_not_found'
+        raise error
     return matches[0]
 
 
@@ -1561,6 +1669,7 @@ def _file_identity(file: dict[str, Any]) -> str:
 
 def _evidence_summary(item: Evidence) -> dict[str, Any]:
     return {
+        "source_kind": item.source_kind,
         "evidence_id": item.evidence_id,
         "chunk_identity": item.chunk_identity,
         "path": item.path,

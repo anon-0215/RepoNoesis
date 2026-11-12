@@ -270,6 +270,7 @@ class SmokeDiagnosticsRecorder:
         self._registered_tools: set[str] = set()
         self._tool_calls: dict[str, dict[str, int | str]] = {}
         self._tool_executions: list[dict[str, Any]] = []
+        self._tool_failures: list[dict[str, Any]] = []
         self._base_retrieval: dict[str, Any] | None = None
         self._retrieval_detail: dict[str, Any] = {}
         self._planner_enhancement_termination: str | None = None
@@ -502,6 +503,10 @@ class SmokeDiagnosticsRecorder:
             item["succeeded" if succeeded else "failed"] = int(
                 item["succeeded" if succeeded else "failed"]
             ) + 1
+
+    def record_tool_failure(self, failure: dict[str, Any]) -> None:
+        from app.services.tool_failure_receipts import sanitize_receipts
+        self._tool_failures = sanitize_receipts([*self._tool_failures, failure])
 
     def record_tool_execution(
         self,
@@ -790,6 +795,8 @@ class SmokeDiagnosticsRecorder:
 
     def snapshot(self) -> dict[str, Any]:
         payload: dict[str, Any] = dict(self._agent)
+        if self._tool_failures:
+            payload["tool_failures"] = list(self._tool_failures)
         payload["provider_usage_summary"] = sanitize_provider_usage_summary({
             "http_attempts": self._provider_http_attempt_count,
             "usage_available_attempts": self._usage_available_attempts,
@@ -851,6 +858,16 @@ def _bounded_smoke_diagnostics(value: dict[str, Any]) -> dict[str, Any]:
     def oversized() -> bool:
         return _serialized_diagnostics_size(payload) > MAX_SMOKE_DIAGNOSTICS_BYTES
 
+    if payload.get('tool_failures'):
+        from app.services.tool_failure_receipts import sanitize_receipts
+        payload['tool_failures'] = sanitize_receipts(payload['tool_failures'])
+        for failure in payload['tool_failures']:
+            path = failure['target'].get('path', '')
+            if len(path.encode('utf-8')) > 120:
+                import hashlib
+                failure['target'].pop('path')
+                failure['target']['status'] = 'truncated'
+                failure['target']['path_sha256'] = hashlib.sha256(path.encode('utf-8')).hexdigest()
     while oversized() and payload.get("provider_calls"):
         payload["provider_calls"].pop(0)
         payload["diagnostics_truncated"] = True
@@ -935,6 +952,7 @@ def _bounded_smoke_diagnostics(value: dict[str, Any]) -> dict[str, Any]:
         payload = {
             key: payload[key]
             for key in (
+                "tool_failures",
                 "request_id",
                 "agent_failure_reason_code",
                 "planner_enhancement_termination_reason",
@@ -967,6 +985,7 @@ def _serialized_diagnostics_size(value: dict[str, Any]) -> int:
 
 def _minimal_smoke_diagnostics(value: dict[str, Any]) -> dict[str, Any]:
     keys = (
+        "tool_failures",
         "request_id",
         "agent_mode",
         "agent_status",
@@ -1096,6 +1115,10 @@ def _safe_smoke_diagnostics(value: Any) -> dict[str, Any]:
     request_id = value.get("request_id")
     if isinstance(request_id, str) and re.fullmatch(r"[A-Za-z0-9-]{1,64}", request_id):
         result["request_id"] = request_id
+    from app.services.tool_failure_receipts import sanitize_receipts
+    failures = sanitize_receipts(value.get('tool_failures'))
+    if failures:
+        result['tool_failures'] = failures
     provider_calls = value.get("provider_calls")
     if isinstance(provider_calls, list):
         safe_calls = []

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 from typing import Any
+from app.services.tool_failure_receipts import sanitize_receipts
 
 from app.services.smoke_diagnostics import (
     BASE_RETRIEVAL_REJECTION_CODES,
@@ -217,6 +218,7 @@ def build_ask_success_diagnostics(
         "finalization_duration_ms": _elapsed(
             recorder_snapshot.get("finalization_duration_ms")
         ),
+        "tool_failures": sanitize_receipts(recorder_snapshot.get('tool_failures')),
         "tool_executions": _safe_tool_executions(
             recorder_snapshot.get("tool_executions")
         ),
@@ -404,6 +406,7 @@ def build_ask_failure_detail(
         "backoff_total_ms": _elapsed(recorder_snapshot.get("backoff_total_ms")),
         "model_load_attempted": recorder_snapshot.get("model_load_attempted") is True,
         "query_encode_attempted": recorder_snapshot.get("query_encode_attempted") is True,
+        "tool_failures": sanitize_receipts(recorder_snapshot.get('tool_failures')),
         "tool_executions": _safe_tool_executions(
             recorder_snapshot.get("tool_executions")
         ),
@@ -946,6 +949,7 @@ def _bounded_payload(value: dict[str, Any]) -> dict[str, Any]:
         result["planner_attempts"].pop(0)
         result["diagnostics_truncated"] = True
     core = {
+        "tool_failures",
         "request_id",
         "agent_mode",
         "agent_status",
@@ -1058,6 +1062,7 @@ def _serialized_diagnostics_size(value: dict[str, Any]) -> int:
 
 def _minimal_ask_payload(value: dict[str, Any]) -> dict[str, Any]:
     keys = (
+        "tool_failures",
         "request_id",
         "agent_mode",
         "agent_status",
@@ -1108,6 +1113,9 @@ def _absolute_minimal_ask_payload(value: dict[str, Any]) -> dict[str, Any]:
     request_id = _request_id(value.get("request_id"))
     summary = sanitize_provider_usage_summary(value.get("provider_usage_summary"))
     usage_field = {"provider_usage_summary": summary} if summary is not None else {}
+    failures = sanitize_receipts(value.get('tool_failures'))
+    if failures:
+        usage_field['tool_failures'] = failures
     if "failure_reason_code" not in value:
         return {
             "request_id": request_id,

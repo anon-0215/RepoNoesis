@@ -232,7 +232,18 @@ class M3EvaluationTests(unittest.TestCase):
                 scripted.append(decision("answer"))
             else:
                 raise AssertionError(action)
-        return ScriptedPlanner(scripted)
+        class SourceSeedPlanner(ScriptedPlanner):
+            def decide(self, state, *, repair_hint=None):
+                value, usage = super().decide(state, repair_hint=repair_hint)
+                # Evidence IDs are request-owned, not frozen symbol IDs. A
+                # document discovered before this scripted lookup may be E1.
+                if value.get('action') == 'expand_relations' and 'seed_evidence_ids' in value.get('arguments', {}):
+                    found = [e['evidence_id'] for e in state.get('evidence_locators', [])
+                             if e['qualified_name'] == scenario['seed_symbol']]
+                    if len(found) == 1:
+                        value = {**value, 'arguments': {**value['arguments'], 'seed_evidence_ids': found}}
+                return value, usage
+        return SourceSeedPlanner(scripted)
 
 
 if __name__ == "__main__":

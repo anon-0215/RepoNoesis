@@ -44,7 +44,7 @@ class Evidence:
     repository_revision: str
     path: str
     language: str
-    code_chunk_id: int
+    code_chunk_id: int | None
     chunk_identity: str
     chunk_type: str
     symbol_name: str
@@ -61,6 +61,8 @@ class Evidence:
     fusion_score: float
     fusion_rank: int
     selection_reason: str
+    source_kind: str = 'code'
+    document_file_id: int | None = None
     rerank_rank: int | None = None
     validation_status: str = "unvalidated"
     invalid_reason: str | None = None
@@ -98,7 +100,7 @@ class Evidence:
         return (self.project_id, self.repository_id, self.repository_url,
                 self.repository_revision, self.path, self.language, self.code_chunk_id,
                 self.chunk_identity, self.chunk_type, self.symbol_name, self.qualified_name,
-                self.start_line, self.end_line, self.content_hash)
+                self.start_line, self.end_line, self.content_hash, self.source_kind, self.document_file_id)
 
     def _bind_planner_source(self) -> None:
         if self._excerpt_coverage is not None:
@@ -368,7 +370,12 @@ class CitationValidator:
         return valid, warnings
 
     def _invalid_reason(self, evidence: Evidence) -> str | None:
-        if evidence.project_id == "" or evidence.code_chunk_id < 1:
+        if evidence.source_kind == "document":
+            from app.services.document_evidence import validate_document
+            return validate_document(self.database, evidence)
+        if evidence.source_kind != "code" or evidence.chunk_type == "document" or evidence.document_file_id is not None:
+            return "invalid source kind"
+        if evidence.project_id == "" or type(evidence.code_chunk_id) is not int or evidence.code_chunk_id < 1:
             return "invalid chunk identity"
         if not _is_safe_relative_path(evidence.path):
             return "unsafe repository path"

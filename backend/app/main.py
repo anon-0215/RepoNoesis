@@ -263,6 +263,8 @@ def _ask_execution_summary(result: dict[str, Any], snapshot: dict[str, Any]) -> 
         value = snapshot.get(key)
         if isinstance(value, int) and not isinstance(value, bool) and 0 <= value <= 1_000_000:
             summary[key] = value
+    if snapshot.get("tool_failures"):
+        summary["tool_failures"] = snapshot["tool_failures"]
     budget = result.get("budget_usage")
     usage = sanitize_provider_usage_summary(snapshot.get("provider_usage_summary"))
     if usage is not None:
@@ -399,6 +401,7 @@ class CitationResponse(BaseModel):
     path: str
     summary: str
     snippet: str
+    source_kind: Literal['code', 'document'] = 'code'
     qualified_name: str = ""
     start_line: int = 0
     end_line: int = 0
@@ -412,7 +415,9 @@ class EvidenceResponse(BaseModel):
     repository_revision: str
     path: str
     language: str
-    code_chunk_id: int
+    code_chunk_id: int | None
+    source_kind: Literal['code', 'document'] = 'code'
+    document_file_id: int | None = None
     chunk_identity: str
     chunk_type: str
     symbol_name: str

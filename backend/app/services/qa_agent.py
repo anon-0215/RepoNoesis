@@ -144,6 +144,15 @@ def answer_question(
         project,
         retrieval_strategy_version=outcome.retrieval_strategy_version,
     )
+    from app.services.document_evidence import retrieve_documents, document_inventory
+    if not language and not symbol and document_inventory(bundle):
+        docs = retrieve_documents(database, project_id, str(project.get('repository_revision', '')), question, path=path)
+        from app.services.document_evidence import is_project_document
+        if docs:
+            code = [e for e in built if not is_project_document(e.path)]
+            built = code[:max(0, evidence_count - len(docs))] + docs[:evidence_count]
+        for number, item in enumerate(built, 1):
+            item.evidence_id = f'E{number}'
     return answer_from_evidence(
         question,
         built,
@@ -491,6 +500,7 @@ def _m1_response(
         {
             "evidence_id": item.evidence_id,
             "path": item.path,
+            "source_kind": item.source_kind,
             "summary": item.qualified_name or item.symbol_name,
             "snippet": item.excerpt,
             "qualified_name": item.qualified_name or item.symbol_name,
@@ -757,6 +767,12 @@ def _build_final_answer_messages(
         messages[1]['content'] += ('\n\nBOUNDED_SOURCE_DELIVERY_DIAGNOSTICS_BEGIN\n' + json.dumps(
             source_delivery_diagnostics, ensure_ascii=False, sort_keys=True, separators=(',', ':'))
             + '\nBOUNDED_SOURCE_DELIVERY_DIAGNOSTICS_END')
+    if any(item.source_kind == 'document' for item in descriptors):
+        messages[0]['content'] = (messages[0]['content']
+            .replace('Prompt version: m1-v3.', 'Prompt version: m1-v4-documents.')
+            .replace('Prompt version: m1-v6.', 'Prompt version: m1-v6-documents.'))
+        messages[0]['content'] += (' Document Evidence supports author descriptions, while code Evidence '
+                                  'supports implementation facts; distinguish them.')
     return messages
 
 
