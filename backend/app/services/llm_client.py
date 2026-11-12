@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import hashlib
 import re
 import time
@@ -208,6 +209,15 @@ class LLMClient:
                              "local_reason": "local_admission", "logical_call_id": logical_call_id,
                              "attempt_index": attempt + 1, "provider_call_id": provider_call_id,
                              "request_id": getattr(recorder, "_agent", {}).get("request_id", "UNKNOWN")}
+            # Safe serialized stage parameters only: no URL, headers, prompts,
+            # key, response text or hidden reasoning.
+            logging.getLogger("uvicorn.error").info(json.dumps({
+                "event": "provider_request_parameters", "request_id": attempt_audit["request_id"],
+                "logical_call_id": logical_call_id, "attempt": attempt + 1, "purpose": purpose,
+                "model": request_model, "max_tokens": payload["max_tokens"],
+                "thinking": thinking, "reasoning_effort": reasoning_effort,
+                "timeout_seconds": timeout,
+            }))
             try:
                 # urllib.request.urlopen's second positional argument is POST data,
                 # not the timeout. Keep this keyword-only so request.data remains JSON.

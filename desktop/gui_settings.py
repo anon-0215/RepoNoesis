@@ -8,6 +8,62 @@ from pathlib import Path
 import urllib.parse
 
 
+# Only these desktop settings may enter the isolated backend environment.
+# Provider generation capacity includes reasoning; Agent limits bound visible text.
+RUNTIME_INTS = {
+    "LLM_PLANNER_MAX_GENERATION_TOKENS": (8192, 1, 65536),
+    "LLM_ANSWER_MAX_GENERATION_TOKENS": (8192, 1, 65536),
+    "LLM_TIMEOUT_SECONDS": (90, 1, 300),
+    "AGENT_TOTAL_DEADLINE_MS": (300000, 1000, 300000),
+    "AGENT_FINAL_ANSWER_RESERVE_MS": (90000, 100, 120000),
+    "AGENT_MAX_PLANNER_TOKENS_PER_STEP": (1024, 64, 4096),
+    "AGENT_MAX_TOTAL_PLANNER_TOKENS": (8192, 64, 32768),
+    "AGENT_MAX_FINAL_ANSWER_TOKENS": (4096, 128, 16384),
+}
+RUNTIME_MODES = {
+    "LLM_PLANNER_THINKING": {"enabled", "disabled", ""},
+    "LLM_ANSWER_THINKING": {"enabled", "disabled", ""},
+    "LLM_PLANNER_REASONING_EFFORT": {"low", "high", "max", ""},
+    "LLM_ANSWER_REASONING_EFFORT": {"low", "high", "max", ""},
+}
+
+
+def desktop_runtime(config):
+    """Migrate missing settings without overriding explicit values or reading .env."""
+    supplied = config.get("agent_runtime", {})
+    if not isinstance(supplied, dict):
+        raise ValueError("agent_runtime must be an object")
+    result = {}
+    for key, (default, minimum, maximum) in RUNTIME_INTS.items():
+        value = supplied.get(key, default)
+        if type(value) is not int or not minimum <= value <= maximum:
+            raise ValueError(f"Invalid desktop setting: {key}")
+        result[key] = value
+    # Known official Thinking API only. Other endpoints keep extension fields omitted
+    # unless their compatibility has explicitly been configured by the user.
+    llm = config.get("llm", {})
+    host = urllib.parse.urlsplit(config.get("api_base", llm.get("base_url", ""))).hostname
+    model = config.get("api_model", llm.get("model", ""))
+    deepseek = host == "api.deepseek.com" and model in {"deepseek-flash", "deepseek-v4-pro"}
+    for key, choices in RUNTIME_MODES.items():
+        default = ("enabled" if key.endswith("THINKING") else "high") if deepseek else ""
+        value = supplied.get(key, default)
+        if not isinstance(value, str) or value not in choices:
+            raise ValueError(f"Invalid desktop setting: {key}")
+        result[key] = value
+    for stage in ("PLANNER", "ANSWER"):
+        if result[f"LLM_{stage}_THINKING"] == "disabled":
+            # Preserve saved effort, but never send it alongside disabled thinking.
+            result[f"LLM_{stage}_REASONING_EFFORT"] = ""
+    if result["AGENT_FINAL_ANSWER_RESERVE_MS"] < result["LLM_TIMEOUT_SECONDS"] * 1000:
+        raise ValueError("Final answer reserve must cover one API timeout")
+    if result["AGENT_TOTAL_DEADLINE_MS"] <= result["AGENT_FINAL_ANSWER_RESERVE_MS"]:
+        raise ValueError("Total deadline must exceed final answer reserve")
+    if result["AGENT_MAX_TOTAL_PLANNER_TOKENS"] < result["AGENT_MAX_PLANNER_TOKENS_PER_STEP"]:
+        raise ValueError("Total visible Planner budget must cover one step")
+    return result
+
+
 def protect(value: str, *, decrypt=False) -> str:
     class Blob(ctypes.Structure):
         _fields_ = [("size", wintypes.DWORD), ("data", ctypes.POINTER(ctypes.c_ubyte))]
@@ -56,7 +112,14 @@ class SettingsStore:
 
     def load(self):
         if self.path.exists():
-            return {**self.defaults, **json.loads(self.path.read_text(encoding="utf-8"))}
+            saved = json.loads(self.path.read_text(encoding="utf-8"))
+            result = {**self.defaults, **saved}
+            if "agent_runtime" in self.defaults or "agent_runtime" in saved:
+                base, user = self.defaults.get("agent_runtime", {}), saved.get("agent_runtime", {})
+                if not isinstance(base, dict) or not isinstance(user, dict):
+                    raise ValueError("agent_runtime must be an object")
+                result["agent_runtime"] = {**base, **user}
+            return result
         return dict(self.defaults)
 
     def public(self):
@@ -91,6 +154,11 @@ class SettingsStore:
         key = incoming.get("api_key", "").strip()
         if key:
             current["api_key_dpapi"] = protect(key)
+        if "agent_runtime" in incoming:
+            if not isinstance(incoming["agent_runtime"], dict):
+                raise ValueError("agent_runtime must be an object")
+            current["agent_runtime"] = {**current.get("agent_runtime", {}), **incoming["agent_runtime"]}
+        desktop_runtime(current)  # Reject invalid budgets before persistence.
         atomic_json(self.path, current)
         return self.public()
 

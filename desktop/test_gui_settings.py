@@ -60,8 +60,11 @@ class SettingsTests(unittest.TestCase):
         env = child_environment(root, config, Path("C:/data"), "instance")
         self.assertEqual(env["LLM_API_KEY"], "placeholder")
         self.assertEqual(env["LLM_MODEL"], "test")
+        # Unknown providers receive no automatic DeepSeek extension fields.
         self.assertNotIn("LLM_PLANNER_THINKING", env)
         self.assertNotIn("LLM_ANSWER_THINKING", env)
+        self.assertEqual(env["LLM_PLANNER_MAX_GENERATION_TOKENS"], "8192")
+        self.assertEqual(env["LLM_ANSWER_MAX_GENERATION_TOKENS"], "8192")
 
 
 if __name__ == "__main__":

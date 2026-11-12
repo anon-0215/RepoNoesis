@@ -2,6 +2,26 @@
 
 Windows x64 可选桌面入口。网页版仍使用原启动脚本，HyDE 和重排仍默认关闭。桌面沿用主仓库后端、React 工作台、检索和问答协议，没有单独维护一套检索实现。
 
+## 桌面 Agent 阶段参数
+
+桌面在子进程白名单中传递阶段配置，不读取项目 `.env`。可在发行 `desktop-config.json` 或用户数据 `desktop-settings.json` 的 `agent_runtime` 对象中设置下列环境变量同名字段。用户字段按键覆盖发行默认，其他设置与 DPAPI 密钥保留；保存普通设置不会丢弃这些字段。
+
+| 配置 | 缺省桌面值 |
+| --- | --- |
+| `LLM_PLANNER_MAX_GENERATION_TOKENS` / `LLM_ANSWER_MAX_GENERATION_TOKENS` | 各8192，包含思考与正文 |
+| `LLM_TIMEOUT_SECONDS` | 单次90秒 |
+| `AGENT_TOTAL_DEADLINE_MS` / `AGENT_FINAL_ANSWER_RESERVE_MS` | 总计300000 / 回答预留90000毫秒 |
+| `AGENT_MAX_PLANNER_TOKENS_PER_STEP` / `AGENT_MAX_TOTAL_PLANNER_TOKENS` | 可见决策每步1024 / 累计8192 |
+| `AGENT_MAX_FINAL_ANSWER_TOKENS` | 可见回答4096 |
+
+桌面复用后端严格预算配置，仍为5步、8次工具调用；用 `AGENT_BASE_EVIDENCE_COUNT=auto` 保持既有首检策略（Agent最多5条，RAG按请求证据容量），不改基础召回和补查容量。quality模式未配置auto时仍沿用原默认5条。取消、有限重试和结构化校验保留。回答预留须覆盖一个API时限，总时限须大于预留。额度不足导致供应商截断仍报错，不接受空正文。
+
+官方 `api.deepseek.com` 的 `deepseek-flash` / `deepseek-v4-pro` 缺省明确使用 `LLM_PLANNER_THINKING`、`LLM_ANSWER_THINKING` 为 `enabled`，两个 `REASONING_EFFORT` 为 `high`。这用于明确兼容参数，不代表模型效果最优。其他端点默认省略这四个扩展字段；有已验证兼容协议时才显式配置。`thinking=disabled` 时不发送 effort，已保存值保留。不要把按供应商推导的模式默认值固化为通用配置，以免切换供应商后遗留参数。普通网页默认不变。
+
+`agent_runtime` 数字使用JSON整数，思考为 `enabled` / `disabled` / 空字符串，effort为 `low` / `high` / `max` / 空字符串（空字符串表示省略）。例如仅提高Planner生成额度：`"agent_runtime": {"LLM_PLANNER_MAX_GENERATION_TOKENS": 16384}`。不更改模型、资源目录、设备、缓存身份或增强开关。
+
+后端 `provider_request_parameters` 日志仅记录每次实际请求的阶段、模型、额度、模式、强度及时限，不记录密钥、地址、提示词或思考正文。离线贯穿检查：`python -B -m unittest desktop.test_agent_runtime_config desktop.test_gui_settings desktop.test_launcher desktop.test_retrieval_enhancement_config desktop.test_desktop_host`；后端另有阶段额度、正文限制、截断、取消和绝对截止时间回归。
+
 ## 目录与入口
 
 | 文件 | 职责 |
