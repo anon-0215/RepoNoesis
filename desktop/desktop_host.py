@@ -18,7 +18,7 @@ HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
 sys.path.insert(0, str(HERE))
 _dll = None  # Register packaged native DLLs only when launching, not during source tests.
-from gui_settings import SettingsStore, atomic_json
+from gui_settings import SettingsStore, SettingsValidationError, atomic_json
 from launcher import OwnedJob, child_environment, reserve_port
 
 
@@ -95,7 +95,7 @@ class Controller:
                     if self.child is not None and self.child.poll() is None:
                         if not self._settings_restart("acquire", lease_id):
                             self._settings_restart("release", lease_id)  # Lost acquire response may still own a lease.
-                            return {"ok": False, "message": "未保存：正在生成回答、应用设置或准备后台。请结束后再保存。"}
+                            return {"ok": False, "message": "未保存：正在问答、导入项目、应用设置或准备后台。请结束后再保存。"}
                         leased = True
                     atomic_json(self.store.path, prepared)
                     written = True
@@ -115,6 +115,10 @@ class Controller:
                         # must not falsely report them as unsaved or retain a lease.
                         self.state.update(phase="restarting", message="设置已保存，正在重启本地服务；就绪后生效。", backend_url=None)
             return {"ok": True, "settings": result, "changed": changed}
+        except SettingsValidationError as exc:
+            if leased:
+                self._settings_restart("release", lease_id)
+            return {"ok": False, "message": "未保存：" + exc.message}
         except ValueError:
             if leased:
                 self._settings_restart("release", lease_id)

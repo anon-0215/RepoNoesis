@@ -27,6 +27,38 @@ def post(app, path, headers, body):
 
 
 class RestartTests(unittest.TestCase):
+    def test_actual_import_worker_and_pending_background_update_block_settings(self):
+        app=FastAPI();entered=threading.Event();finish=threading.Event()
+        def analyze_project():entered.set();finish.wait(3);return {'ok':True}
+        app.post('/api/projects/analyze')(analyze_project)
+        pending=[False]
+        class Connection:
+            def __enter__(self):return self
+            def __exit__(self,*args):pass
+            def execute(self,*args):return self
+            def fetchone(self):return (1,) if pending[0] else None
+        main=types.SimpleNamespace(_execute_ask=lambda:None,analyze_project=analyze_project,db=types.SimpleNamespace(connect=Connection))
+        service=types.SimpleNamespace(start_refresh=lambda:None,retry_run=lambda:None,
+            execute_run=lambda:(entered.set(),finish.wait(3)))
+        main._update_service=lambda:service
+        gate=install(app,main,'test-import')
+        route=next(r for r in app.routes if getattr(r,'path',None)=='/api/projects/analyze')
+        worker=threading.Thread(target=route.dependant.call);worker.start()
+        try:
+            self.assertTrue(entered.wait(1));self.assertFalse(gate.acquire('lease'))
+        finally:finish.set();worker.join(3)
+        pending[0]=True
+        self.assertFalse(gate.acquire('lease'))  # Enqueued, execute has not started.
+        pending[0]=False;finish.clear();entered.clear()
+        worker=threading.Thread(target=main._update_service().execute_run);worker.start()
+        try:
+            self.assertTrue(entered.wait(1));self.assertFalse(gate.acquire('lease')) # Even after DB status is no longer pending.
+        finally:finish.set();worker.join(3)
+        self.assertTrue(gate.acquire('lease'))
+        with self.assertRaises(HTTPException):route.dependant.call()
+        with self.assertRaises(HTTPException):service.start_refresh()
+        gate.release('lease')
+
     def test_actual_worker_blocks_restart_until_finished_including_detached_stream_worker(self):
         gate=SettingsRestartGate();entered=threading.Event();finish=threading.Event()
         def work():entered.set();finish.wait(3)

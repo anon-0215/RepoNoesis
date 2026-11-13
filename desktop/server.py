@@ -65,6 +65,7 @@ def run():
                    "fastapi", "uvicorn", "pydantic", "sentence-transformers", "torch", "transformers", "numpy")}}
     flags = get_retrieval_enhancement_settings()
     receipt["retrieval_enhancement_config"] = {"hyde_enabled": flags.hyde_enabled, "rerank_enabled": flags.rerank_enabled}
+    receipt["rerank_provider"] = flags.rerank_provider
     Path("logs/runtime-identity.json").write_text(json.dumps(receipt, indent=2), encoding="utf-8")
     server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=int(sys.argv[1]), reload=False))
     _server = server

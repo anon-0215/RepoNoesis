@@ -111,7 +111,7 @@ export interface ChatAnswer {
   execution_summary?: {
     retrieval_enhancement?: {
       hyde?: { status: string; elapsed_ms: number; reason?: string; added_candidates?: number };
-      rerank?: { status: string; elapsed_ms: number; reason?: string; appended_candidates?: number };
+      rerank?: { status: string; elapsed_ms: number; reason?: string; appended_candidates?: number; provider?: 'generation' | 'deepseek' | 'bailian'; model?: string; region?: string };
       elapsed_ms: number;
       selection_changed: boolean;
     } | null;

@@ -1242,12 +1242,32 @@ def sanitize_retrieval_enhancement(value: dict[str, Any]) -> dict[str, Any]:
                 {"disabled", "succeeded", "fallback"} else "fallback",
                 "elapsed_ms": _bounded_duration(stage.get("elapsed_ms", 0))}
         reason = stage.get("reason")
-        if isinstance(reason, str) and re.fullmatch(r"[A-Za-z_]{1,80}", reason):
+        if isinstance(reason, str) and re.fullmatch(r"[A-Za-z_0-9]{1,80}", reason):
             safe["reason"] = reason
         if type(stage.get("added_candidates")) is int:
             safe["added_candidates"] = max(0, min(40, stage["added_candidates"]))
         if type(stage.get("appended_candidates")) is int:
             safe["appended_candidates"] = max(0, min(20, stage["appended_candidates"]))
+        if name == "rerank" and stage.get("provider") in {"generation", "deepseek", "bailian"}:
+            safe["provider"] = stage["provider"]
+            model = stage.get("model")
+            if isinstance(model, str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_./:@-]{0,127}", model):
+                safe["model"] = model
+            if stage["provider"] == "bailian":
+                safe.update(model="qwen3-rerank", region="cn-beijing")
+            if stage.get("excerpt_policy") == "source-prefix-1600-characters-v1":
+                safe["excerpt_policy"] = stage["excerpt_policy"]
+            truncated = stage.get("truncated_candidate_ids")
+            if isinstance(truncated, list):
+                safe["truncated_candidate_ids"] = [x for x in truncated[:20] if type(x) is int and x > 0]
+            scores = stage.get("scores")
+            if isinstance(scores, list):
+                safe["scores"] = [{"id": x["id"], "index": x["index"], "relevance_score": x["relevance_score"]}
+                    for x in scores[:20] if isinstance(x, dict)
+                    and type(x.get("id")) is int and x["id"] > 0
+                    and type(x.get("index")) is int and 0 <= x["index"] < 20
+                    and type(x.get("relevance_score")) in {int, float}
+                    and 0 <= x["relevance_score"] <= 1]
         result[name] = safe
     for key in ("original_selected_ids", "rerank_input_ids", "selected_ids"):
         items = value.get(key)
