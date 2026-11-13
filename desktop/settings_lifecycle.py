@@ -5,12 +5,13 @@ import time
 
 
 class SettingsRestartGate:
-    def __init__(self, clock=time.monotonic):
+    def __init__(self, clock=time.monotonic, busy=None):
         self.lock = threading.Lock()
         self.active = 0
         self.lease = None
         self.expires = 0
         self.clock = clock
+        self.busy = busy
 
     def _expire(self):
         if self.lease is not None and self.clock() >= self.expires:
@@ -19,7 +20,7 @@ class SettingsRestartGate:
     def acquire(self, lease):
         with self.lock:
             self._expire()
-            if self.active or (self.lease is not None and self.lease != lease):
+            if self.active or (self.busy is not None and self.busy()) or (self.lease is not None and self.lease != lease):
                 return False
             self.lease, self.expires = lease, self.clock() + 30
             return True
@@ -50,8 +51,33 @@ def install(app, main, instance):
     from fastapi import Header, HTTPException
     from pydantic import BaseModel, Field
     from typing import Literal
-    gate = SettingsRestartGate()
+    def pending_import():
+        if not hasattr(main, 'db'):
+            return False  # Lightweight offline fixtures have no repository store.
+        try:
+            with main.db.connect() as connection:
+                return connection.execute("SELECT 1 FROM repository_update_runs WHERE status IN ('pending','running') LIMIT 1").fetchone() is not None
+        except Exception:
+            return True  # An unreadable store cannot establish an idle state.
+    gate = SettingsRestartGate(busy=pending_import)
     main._execute_ask = gate.wrap(main._execute_ask)
+    # FastAPI retains the registered callable. Count the actual synchronous
+    # import worker from before cloning until it exits, even after disconnect.
+    if hasattr(main, 'analyze_project'):
+        original = main.analyze_project
+        main.analyze_project = gate.wrap(original)
+        for route in app.routes:
+            dependant = getattr(route, 'dependant', None)
+            if dependant is not None and dependant.call is original:
+                dependant.call = main.analyze_project
+    if hasattr(main, '_update_service'):
+        factory = main._update_service
+        def guarded_update_service():
+            service = factory()
+            for name in ('start_refresh', 'retry_run', 'execute_run'):
+                setattr(service, name, gate.wrap(getattr(service, name)))
+            return service
+        main._update_service = guarded_update_service
 
     class RestartRequest(BaseModel):
         action: Literal["acquire", "release"]
@@ -64,7 +90,7 @@ def install(app, main, instance):
         if request.action == "release":
             gate.release(request.lease_id)
         elif not gate.acquire(request.lease_id):
-            raise HTTPException(409, "正在生成回答或应用设置，请结束后再保存。")
+            raise HTTPException(409, "正在问答、导入项目或应用设置，请结束后再保存。")
         return {"ok": True, "instance": instance}
 
     return gate

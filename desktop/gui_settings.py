@@ -28,6 +28,73 @@ RUNTIME_MODES = {
 }
 
 
+BAILIAN_ENDPOINT = "https://dashscope.aliyuncs.com/api/v1/services/rerank/text-rerank/text-rerank"
+
+
+def bailian_environment_key():
+    key = os.environ.get("DASHSCOPE_API_KEY", "")
+    if not key:
+        try:
+            import winreg
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Environment") as registry:
+                key = winreg.QueryValueEx(registry, "DASHSCOPE_API_KEY")[0]
+        except (ImportError, OSError):
+            pass
+    return key if isinstance(key, str) else ""
+
+
+class SettingsValidationError(ValueError):
+    """Only fixed, safe Chinese messages may cross the desktop bridge."""
+    def __init__(self, message):
+        self.message = message
+        super().__init__(message)
+
+
+def rerank_config(config):
+    mode = config.get("rerank_mode")
+    if mode is None:
+        legacy = config.get("rerank_provider", "generation")
+        mode = {"generation": "generation", "deepseek": "generation", "bailian": "independent"}.get(legacy) if isinstance(legacy, str) else None
+    if mode not in ("generation", "independent"):
+        raise SettingsValidationError("请选择“使用当前生成模型”或“使用独立重排服务”。")
+    service = config.get("rerank_service", "bailian")
+    if service != "bailian":
+        raise SettingsValidationError("本轮独立重排仅支持阿里云百炼。")
+    endpoint = config.get("bailian_endpoint", BAILIAN_ENDPOINT)
+    model = config.get("bailian_model", "qwen3-rerank")
+    timeout = config.get("bailian_timeout_seconds", 7)
+    if not isinstance(endpoint, str):
+        raise SettingsValidationError("百炼 API 地址需为文本。")
+    try:
+        p = urllib.parse.urlsplit(endpoint)
+        host = p.hostname or ""
+        valid = (p.scheme == "https" and p.port in {None,443} and not (
+            p.username or p.password or p.query or p.fragment)
+            and (host == "dashscope.aliyuncs.com" or (
+                host.endswith(".cn-beijing.maas.aliyuncs.com")
+                and host.split('.')[0].replace('-', '').isalnum()))
+            and p.path == "/api/v1/services/rerank/text-rerank/text-rerank")
+    except ValueError:
+        valid = False
+    if not valid:
+        raise SettingsValidationError("百炼 API 地址须为受支持的北京官方 HTTPS 重排接口，不能包含密钥、用户名或查询参数。")
+    if model != "qwen3-rerank":
+        raise SettingsValidationError("本轮百炼重排仅支持模型 qwen3-rerank。")
+    if type(timeout) not in {int,float} or not .1 <= timeout <= 15:
+        raise SettingsValidationError("百炼超时需在0.1至15秒之间。")
+    return {"rerank_mode": mode, "rerank_service": service,
+            "rerank_provider": "bailian" if mode == "independent" else "generation",
+            "bailian_endpoint": endpoint, "bailian_model": model, "bailian_timeout_seconds": timeout}
+
+
+def rerank_key_source(value):
+    if value.get("bailian_api_key_dpapi"):
+        return "saved"
+    if os.environ.get("DASHSCOPE_API_KEY"):
+        return "process_environment"
+    return "windows_user_environment" if bailian_environment_key() else "missing"
+
+
 def enhancement_flags(config):
     # Invalid legacy values fail closed. In particular, "false" is not True.
     return {key: config.get(key, False) is True for key in ("hyde_enabled", "rerank_enabled")}
@@ -124,15 +191,31 @@ class SettingsStore:
                 if not isinstance(base, dict) or not isinstance(user, dict):
                     raise ValueError("agent_runtime must be an object")
                 result["agent_runtime"] = {**base, **user}
+            # A user's explicit legacy selection wins over new release defaults.
+            if "rerank_mode" not in saved and "rerank_provider" in saved:
+                result.pop("rerank_mode", None)
+            result.update(rerank_config(result))
             result.update(enhancement_flags(result))
             return result
-        return {**self.defaults, **enhancement_flags(self.defaults)}
+        return {**self.defaults, **enhancement_flags(self.defaults), **rerank_config(self.defaults)}
 
     def public(self, value=None):
         value = self.load() if value is None else value
+        source = rerank_key_source(value)
+        missing = []
+        if enhancement_flags(value)["rerank_enabled"]:
+            if rerank_config(value)["rerank_mode"] == "independent":
+                if source == "missing":
+                    missing.append("百炼 API Key")
+            else:
+                missing = [label for field, label in (("api_base", "生成 API 地址"), ("api_model", "生成模型名称"),
+                           ("api_key_dpapi", "生成 API Key")) if not value.get(field)]
         return {key: value.get(key, "") for key in ("model_directory", "git_directory", "api_base", "api_model",
             "device", "batch_size", "max_length")} | {"data_directory": str(self.data),
-            "key_saved": bool(value.get("api_key_dpapi")), **enhancement_flags(value)}
+            "key_saved": bool(value.get("api_key_dpapi")), **enhancement_flags(value),
+            **rerank_config(value), "bailian_key_saved": bool(value.get("bailian_api_key_dpapi")),
+            "bailian_environment_key_present": bool(bailian_environment_key()),
+            "bailian_key_source": source, "rerank_missing_fields": missing}
 
     def save(self, incoming):
         current = self.prepare(incoming)
@@ -178,6 +261,19 @@ class SettingsStore:
             if not isinstance(incoming["agent_runtime"], dict):
                 raise ValueError("agent_runtime must be an object")
             current["agent_runtime"] = {**current.get("agent_runtime", {}), **incoming["agent_runtime"]}
+        for field in ("rerank_mode", "rerank_service", "rerank_provider", "bailian_endpoint", "bailian_model", "bailian_timeout_seconds"):
+            if field in incoming:
+                current[field] = incoming[field]
+        if "rerank_provider" in incoming and "rerank_mode" not in incoming:
+            current.pop("rerank_mode", None)
+        current.update(rerank_config(current))
+        if incoming.get("bailian_clear_key") is True:
+            current.pop("bailian_api_key_dpapi", None)
+        bailian_key = incoming.get("bailian_api_key", "")
+        if not isinstance(bailian_key, str):
+            raise ValueError("百炼密钥需为文本。")
+        if bailian_key.strip():
+            current["bailian_api_key_dpapi"] = protect(bailian_key.strip())
         desktop_runtime(current)  # Reject invalid budgets before persistence.
         return current
 
@@ -185,6 +281,9 @@ class SettingsStore:
         config = self.load()
         key = protect(config["api_key_dpapi"], decrypt=True) if config.get("api_key_dpapi") else ""
         config["llm"] = {"base_url": config.get("api_base", ""), "model": config.get("api_model", ""), "api_key": key}
+        config["bailian_api_key"] = (protect(config["bailian_api_key_dpapi"], decrypt=True)
+                                     if config.get("bailian_api_key_dpapi") else bailian_environment_key())
+        config.update(rerank_config(config))
         return config
 
     def resource_errors(self):

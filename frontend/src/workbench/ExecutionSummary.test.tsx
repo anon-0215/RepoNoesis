@@ -3,6 +3,25 @@ import { describe, expect, it } from 'vitest';
 import type { AskFailure, ChatAnswer } from '../types';
 import { ExecutionSummary } from './ExecutionSummary';
 
+it('shows actual generic generation model and readable failure without inventing a fallback provider', () => {
+  const markup = renderToStaticMarkup(<ExecutionSummary result={{ execution_summary: {
+    retrieval_enhancement: { rerank: { status: 'fallback', elapsed_ms: 5, provider: 'generation', model: 'generic-rank-model', reason: 'provider_authentication_failed' },
+      elapsed_ms: 5, selection_changed: false }
+  } }} />);
+  expect(markup).toContain('生成 API');expect(markup).toContain('generic-rank-model');
+  expect(markup).toContain('认证失败');expect(markup).toContain('已回退');
+  expect(markup).not.toContain('DeepSeek');expect(markup).not.toContain('百炼');
+});
+
+it('shows dedicated Beijing reranker from saved execution data', () => {
+  const markup = renderToStaticMarkup(<ExecutionSummary result={{ execution_summary: {
+    retrieval_enhancement: { rerank: { status: 'succeeded', elapsed_ms: 123, provider: 'bailian' },
+      elapsed_ms: 123, selection_changed: true }
+  } }} historical />);
+  expect(markup).toContain('百炼 qwen3-rerank（北京）');
+  expect(markup).toContain('已执行');
+});
+
 it('shows enhancement execution, fallback and timing from the saved summary', () => {
   const markup = renderToStaticMarkup(<ExecutionSummary result={{ execution_summary: {
     retrieval_enhancement: { hyde: { status: 'succeeded', elapsed_ms: 1700 },

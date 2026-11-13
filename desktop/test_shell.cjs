@@ -64,3 +64,50 @@ test('invalid legacy strings are unchecked and load failure prevents saving',asy
     await d.getElementById('settings-form').onsubmit({preventDefault(){}});assert.equal(f.saves,0);
   }finally{f.dom.window.close();}
 });
+
+test('bailian selection persists independently and never echoes either key',async()=>{
+  const f=await fixture({rerank_mode:'generation',rerank_enabled:true,bailian_environment_key_present:true});
+  try{
+    const w=f.dom.window,d=w.document;await w.showSettings();
+    d.getElementById('rerank-mode').value='independent';w.renderRerank();
+    assert.equal(d.getElementById('bailian-options').hidden,false);
+    d.getElementById('bailian-key').value='independent-test-key';
+    await d.getElementById('settings-form').onsubmit({preventDefault(){}});
+    assert.equal(f.saved.rerank_mode,'independent');
+    assert.equal(f.saved.rerank_service,'bailian');
+    assert.equal(f.saved.bailian_api_key,'independent-test-key');
+    assert.equal(f.saved.api_model,'same-model');assert.equal(f.saved.api_key,'');
+    assert.equal(d.getElementById('bailian-key').value,'');
+    await w.showSettings();assert.equal(d.getElementById('rerank-mode').value,'independent');
+    assert.equal(d.getElementById('bailian-key').value,'');
+  }finally{f.dom.window.close();}
+});
+
+test('switches show only relevant settings and disabled rerank hides options',async()=>{
+  const f=await fixture({rerank_enabled:false,rerank_mode:'generation'});
+  try{
+    const w=f.dom.window,d=w.document;await w.showSettings();
+    assert.equal(d.getElementById('rerank-options').hidden,true);
+    d.getElementById('rerank-enabled').click();
+    assert.equal(d.getElementById('rerank-options').hidden,false);
+    assert.equal(d.getElementById('bailian-options').hidden,true);
+    d.getElementById('rerank-mode').value='independent';w.renderRerank();
+    d.getElementById('bailian-timeout').value='5';
+    assert.equal(d.getElementById('bailian-options').hidden,false);
+    d.getElementById('rerank-mode').value='generation';w.renderRerank();
+    assert.equal(d.getElementById('bailian-timeout').value,'5');
+    assert.equal(d.getElementById('bailian-options').hidden,true);
+    assert.ok(!html.includes('DeepSeek'));
+  }finally{f.dom.window.close();}
+});
+
+test('missing independent key is explicit and legacy bailian selection restores',async()=>{
+  const f=await fixture({rerank_enabled:true,rerank_provider:'bailian',bailian_key_source:'missing',rerank_missing_fields:['百炼 API Key']});
+  try{
+    const d=f.dom.window.document;
+    assert.equal(d.getElementById('rerank-mode').value,'independent');
+    assert.match(d.getElementById('bailian-key-state').textContent,/未配置/);
+    assert.match(d.getElementById('rerank-config-state').textContent,/百炼 API Key/);
+    assert.equal(d.getElementById('bailian-key').value,'');
+  }finally{f.dom.window.close();}
+});

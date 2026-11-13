@@ -23,6 +23,20 @@ const failureCode = (value?: { stable_code: string; violation_kind?: string } | 
 const repairCount = (attempted?: boolean | null) => attempted === true ? '1 次' : attempted === false ? '0 次（未尝试）' : '未提供';
 const repairResult = (value?: boolean | null) => value === true ? '通过' : value === false ? '未通过' : '未提供';
 
+function enhancementReason(code: string): string {
+  if (code === 'rerank_auth_failed' || code === 'provider_authentication_failed') return '认证失败，请检查密钥与地域';
+  if (code === 'rerank_auth_missing') return '未配置独立重排密钥';
+  if (['rerank_timeout', 'deadline_exceeded'].includes(code)) return '等待超时，保留基础排序';
+  if (code === 'budget_exhausted') return '增强时间额度已用完';
+  if (code === 'rerank_config_invalid' || code === 'rerank_provider_invalid') return '重排配置不受支持';
+  if (code === 'rerank_input_limit') return '输入超过重排限制';
+  if (code === 'provider_unavailable') return '生成服务不可用';
+  if (/rerank_(?:invalid|missing|duplicate)/.test(code) || ['ValidationError', 'ValueError'].includes(code)) return '服务返回结果不完整或格式不合法';
+  if (code === 'rerank_network') return '无法连接重排服务';
+  if (code.startsWith('rerank_http_')) return '重排服务返回错误';
+  return '增强服务异常';
+}
+
 export function ExecutionSummary({ result, failure, mode, historical = false }: { result?: { execution_summary?: ChatAnswer['execution_summary']; execution_mode?: ExecutionMode | null }; failure?: AskFailure; mode?: ExecutionMode; historical?: boolean }) {
   const summary = result?.execution_summary;
   if (failure) {
@@ -41,8 +55,9 @@ export function ExecutionSummary({ result, failure, mode, historical = false }: 
       {(['hyde', 'rerank'] as const).map((name) => {
         const stage = summary.retrieval_enhancement?.[name];
         if (!stage) return null;
+        const service = name === 'rerank' && 'provider' in stage ? (stage.provider === 'bailian' ? ' · 百炼 qwen3-rerank（北京）' : stage.provider === 'generation' ? ' · 生成 API' : stage.provider === 'deepseek' ? ' · 生成 API（历史记录）' : '') + ('model' in stage && stage.provider !== 'bailian' && stage.model ? ` · ${stage.model}` : '') : '';
         const labels: Record<string, string> = { succeeded: '已执行', fallback: '已回退', disabled: '未启用' };
-        return <p key={name}>{name === 'hyde' ? 'HyDE 补充召回' : '候选重排序'}：{labels[stage.status] || '状态未提供'} · {stage.elapsed_ms} 毫秒{stage.reason && <small>（原因：{stage.reason}）</small>}</p>;
+        return <p key={name}>{name === 'hyde' ? 'HyDE 补充召回' : '候选重排序'}{service}：{labels[stage.status] || '状态未提供'} · {stage.elapsed_ms} 毫秒{stage.reason && <small title={stage.reason}>（{enhancementReason(stage.reason)}）</small>}</p>;
       })}
       <p>首次检索增强合计：{summary.retrieval_enhancement.elapsed_ms} 毫秒 · 最终证据选择{summary.retrieval_enhancement.selection_changed ? '已变化' : '保持不变'}</p>
     </>}

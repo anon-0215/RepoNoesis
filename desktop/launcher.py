@@ -13,7 +13,7 @@ import urllib.request
 import uuid
 import webbrowser
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from gui_settings import desktop_runtime, enhancement_flags
+from gui_settings import desktop_runtime, enhancement_flags, rerank_config
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -46,6 +46,12 @@ def child_environment(root: Path, config: dict, data: Path, instance: str) -> di
         "TOKENIZERS_PARALLELISM": "false", "GIT_CONFIG_NOSYSTEM": "1",
         "GIT_CONFIG_GLOBAL": os.devnull, "GIT_TERMINAL_PROMPT": "0",
     })
+    rerank = rerank_config(config)
+    env.update(RETRIEVAL_RERANK_MODE=rerank["rerank_mode"], RETRIEVAL_RERANK_SERVICE=rerank["rerank_service"],
+               RETRIEVAL_RERANK_PROVIDER=rerank["rerank_provider"],
+               BAILIAN_RERANK_ENDPOINT=rerank["bailian_endpoint"], BAILIAN_RERANK_MODEL=rerank["bailian_model"],
+               BAILIAN_RERANK_TIMEOUT_SECONDS=str(rerank["bailian_timeout_seconds"]),
+               DASHSCOPE_API_KEY=config.get("bailian_api_key", ""))
     llm = config.get("llm", {})
     if llm:
         env.update(LLM_PROVIDER="openai_compatible", LLM_BASE_URL=llm.get("base_url", ""),

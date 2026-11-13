@@ -128,14 +128,40 @@ class RetrievalEnhancementSettings:
     hyde_enabled: bool = False
     rerank_enabled: bool = False
     budget_seconds: float = 15.0
+    rerank_provider: str = "generation"
+
+
+@dataclass(frozen=True)
+class BailianRerankSettings:
+    # Dedicated credentials: never borrow LLM_API_KEY.
+    api_key: str = field(default="", repr=False)
+    endpoint: str = "https://dashscope.aliyuncs.com/api/v1/services/rerank/text-rerank/text-rerank"
+    model: str = "qwen3-rerank"
+    timeout_seconds: float = 7.0
+
+
+def get_bailian_rerank_settings() -> BailianRerankSettings:
+    return BailianRerankSettings(
+        api_key=get_env_value("DASHSCOPE_API_KEY"),
+        endpoint=get_env_value("BAILIAN_RERANK_ENDPOINT", BailianRerankSettings.endpoint).strip(),
+        model=get_env_value("BAILIAN_RERANK_MODEL", "qwen3-rerank").strip(),
+        timeout_seconds=_bounded_env_float("BAILIAN_RERANK_TIMEOUT_SECONDS", 7.0, 0.1, 15.0),
+    )
 
 
 def get_retrieval_enhancement_settings() -> RetrievalEnhancementSettings:
     seconds = _bounded_env_float("RETRIEVAL_ENHANCEMENT_SECONDS", 15.0, 0.1, 15.0)
+    mode = get_env_value("RETRIEVAL_RERANK_MODE", "").strip()
+    legacy = get_env_value("RETRIEVAL_RERANK_PROVIDER", "generation").strip()
+    if not mode:
+        mode = {"generation": "generation", "deepseek": "generation", "bailian": "independent"}.get(legacy, "invalid")
+    service = get_env_value("RETRIEVAL_RERANK_SERVICE", "bailian").strip()
+    provider = "generation" if mode == "generation" else "bailian" if mode == "independent" and service == "bailian" else "invalid"
     return RetrievalEnhancementSettings(
         hyde_enabled=_env_bool("RETRIEVAL_HYDE_ENABLED", False),
         rerank_enabled=_env_bool("RETRIEVAL_RERANK_ENABLED", False),
         budget_seconds=seconds if math.isfinite(seconds) else 15.0,
+        rerank_provider=provider,
     )
 
 
